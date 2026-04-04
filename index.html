@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DITHER</title>
+  <link rel="stylesheet" href="style.css?v=9">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>DITHER</h1>
+      <div class="header-actions">
+        <button id="btn-randomize-all" class="btn-fun" title="Randomize everything">Shuffle</button>
+        <button id="btn-upload" class="btn-primary">Upload Image</button>
+        <button id="btn-export" class="btn-secondary" disabled>Export</button>
+        <button id="btn-reset" class="btn-ghost" disabled>Reset</button>
+        <span class="undo-redo-group">
+          <button id="btn-undo" class="btn-icon" disabled title="Undo (Alt+Z)">Undo</button>
+          <button id="btn-redo" class="btn-icon" disabled title="Redo (Alt+Shift+Z)">Redo</button>
+        </span>
+      </div>
+    </header>
+
+    <main>
+      <div id="drop-zone" class="drop-zone">
+        <div class="drop-zone-content">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <p>Drop an image here or click Upload</p>
+          <span class="drop-zone-hint">PNG, JPG, WebP, BMP — any size</span>
+        </div>
+      </div>
+
+      <div id="workspace" class="workspace hidden">
+        <div class="canvas-container">
+          <div class="canvas-header">
+            <span id="image-info" class="image-info"></span>
+            <div class="zoom-controls">
+              <button id="btn-fit" class="btn-icon" title="Fit to view">Fit</button>
+              <button id="btn-1x" class="btn-icon" title="100%">1:1</button>
+              <span id="zoom-level" class="zoom-label">100%</span>
+            </div>
+          </div>
+          <div id="canvas-wrapper" class="canvas-wrapper">
+            <canvas id="canvas-preview"></canvas>
+          </div>
+        </div>
+
+        <aside id="sidebar" class="sidebar">
+
+          <!-- STYLE PRESETS -->
+          <div class="sidebar-section">
+            <div class="section-header">
+              <h2>Style Presets</h2>
+            </div>
+            <div class="param-group">
+              <select id="style-preset">
+                <option value="">— None —</option>
+                <option value="underpainting">Underpainting</option>
+                <option value="painterly">Painterly</option>
+                <option value="expressive">Expressive</option>
+                <option value="dynamic">Dynamic</option>
+                <option value="technical">Technical</option>
+                <option value="illustrated">Illustrated</option>
+                <option value="woodcut">Woodcut</option>
+                <option value="engraving">Engraving</option>
+                <option value="newsprint">Newsprint</option>
+                <option value="retro-digital">Retro Digital</option>
+                <option value="film-noir">Film Noir</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- COLOR SECTION -->
+          <div class="sidebar-section">
+            <div class="section-header">
+              <h2>Color</h2>
+              <button class="btn-dice" data-randomize="color" title="Randomize colors">Dice</button>
+            </div>
+
+            <div class="param-group">
+              <label>
+                <span class="param-label">Mode</span>
+                <select id="color-mode">
+                  <option value="bw">Black & White</option>
+                  <option value="duo">Duotone</option>
+                  <option value="palette">Palette</option>
+                  <option value="color">Full Color (per-channel)</option>
+                </select>
+              </label>
+            </div>
+
+            <div id="duo-controls" class="sub-controls">
+              <div class="param-group">
+                <span class="param-label">Dark / Light</span>
+                <div class="color-pair">
+                  <input type="color" id="color-dark" value="#000000" title="Dark color">
+                  <input type="color" id="color-light" value="#ffffff" title="Light color">
+                </div>
+              </div>
+            </div>
+
+            <div id="palette-controls" class="sub-controls hidden">
+              <div class="param-group">
+                <label>
+                  <span class="param-label">Preset</span>
+                  <select id="palette-preset"></select>
+                </label>
+              </div>
+              <div class="param-group">
+                <span class="param-label">Max Colors</span>
+                <div class="slider-row">
+                  <input type="range" id="max-colors" min="2" max="64" value="16" step="1">
+                  <span class="param-value" data-for="max-colors">16</span>
+                </div>
+              </div>
+              <div class="param-group">
+                <button id="btn-extract-palette" class="btn-small">Extract from Image</button>
+              </div>
+              <div id="palette-swatches" class="palette-swatches"></div>
+            </div>
+          </div>
+
+          <!-- ADJUSTMENTS -->
+          <div class="sidebar-section">
+            <div class="section-header">
+              <h2>Adjustments</h2>
+              <button class="btn-dice" data-randomize="adjustments" title="Randomize adjustments">Dice</button>
+            </div>
+            <div class="param-group">
+              <label>
+                <span class="param-label">Grayscale Method</span>
+                <select id="grayscale-mode">
+                  <option value="luminance">Luminance (BT.709)</option>
+                  <option value="average">Average</option>
+                  <option value="desaturation">Desaturation</option>
+                </select>
+              </label>
+            </div>
+            <div class="param-group">
+              <span class="param-label">Brightness</span>
+              <div class="slider-row">
+                <input type="range" id="pre-brightness" min="-100" max="100" value="0" step="1">
+                <span class="param-value" data-for="pre-brightness">0</span>
+              </div>
+            </div>
+            <div class="param-group">
+              <span class="param-label">Contrast</span>
+              <div class="slider-row">
+                <input type="range" id="pre-contrast" min="-100" max="100" value="0" step="1">
+                <span class="param-value" data-for="pre-contrast">0</span>
+              </div>
+            </div>
+            <div class="param-group">
+              <span class="param-label">Gamma</span>
+              <div class="slider-row">
+                <input type="range" id="pre-gamma" min="0.1" max="3.0" value="1.0" step="0.05">
+                <span class="param-value" data-for="pre-gamma">1.0</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- TONE LOCK -->
+          <div class="sidebar-section">
+            <div class="section-header">
+              <h2>Tone Lock</h2>
+            </div>
+            <p class="sidebar-hint">Lock tonal ranges to protect them from effects.</p>
+            <div class="param-group tone-lock-group">
+              <label class="tone-lock-label">
+                <input type="checkbox" id="lock-shadows">
+                <span class="tone-lock-chip shadows">Shadows</span>
+              </label>
+              <label class="tone-lock-label">
+                <input type="checkbox" id="lock-midtones">
+                <span class="tone-lock-chip midtones">Midtones</span>
+              </label>
+              <label class="tone-lock-label">
+                <input type="checkbox" id="lock-highlights">
+                <span class="tone-lock-chip highlights">Highlights</span>
+              </label>
+            </div>
+            <div class="param-group">
+              <span class="param-label">Shadow / Midtone Boundary</span>
+              <div class="slider-row">
+                <input type="range" id="tone-shadow-mid" min="30" max="120" value="64" step="1">
+                <span class="param-value" data-for="tone-shadow-mid">64</span>
+              </div>
+            </div>
+            <div class="param-group">
+              <span class="param-label">Midtone / Highlight Boundary</span>
+              <div class="slider-row">
+                <input type="range" id="tone-mid-highlight" min="130" max="230" value="192" step="1">
+                <span class="param-value" data-for="tone-mid-highlight">192</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- ALGORITHMS -->
+          <div class="sidebar-section">
+            <div class="section-header">
+              <h2>Algorithms</h2>
+              <button class="btn-dice" data-randomize="algorithms" title="Randomize algorithm">Dice</button>
+            </div>
+            <p class="sidebar-hint">Select one or more — they chain in order. Drag to reorder.</p>
+
+            <div class="algo-category" data-cat="classic">
+              <div class="algo-category-header">Classic Error Diffusion</div>
+              <div class="algorithm-list" data-category="classic"></div>
+            </div>
+            <div class="algo-category" data-cat="ordered">
+              <div class="algo-category-header">Ordered & Pattern</div>
+              <div class="algorithm-list" data-category="ordered"></div>
+            </div>
+            <div class="algo-category" data-cat="halftone">
+              <div class="algo-category-header">Halftone & Screen</div>
+              <div class="algorithm-list" data-category="halftone"></div>
+            </div>
+            <div class="algo-category" data-cat="lines">
+              <div class="algo-category-header">Lines & Hatching</div>
+              <div class="algorithm-list" data-category="lines"></div>
+            </div>
+            <div class="algo-category" data-cat="artistic">
+              <div class="algo-category-header">Artistic & Painterly</div>
+              <div class="algorithm-list" data-category="artistic"></div>
+            </div>
+            <div class="algo-category" data-cat="reconstructive">
+              <div class="algo-category-header">Reconstructive</div>
+              <div class="algorithm-list" data-category="reconstructive"></div>
+            </div>
+            <div class="algo-category" data-cat="sketch">
+              <div class="algo-category-header">Sketch & Drawing</div>
+              <div class="algorithm-list" data-category="sketch"></div>
+            </div>
+            <div class="algo-category" data-cat="exotic">
+              <div class="algo-category-header">Exotic & Rare</div>
+              <div class="algorithm-list" data-category="exotic"></div>
+            </div>
+            <div class="algo-category" data-cat="digital">
+              <div class="algo-category-header">Digital & Glitch</div>
+              <div class="algorithm-list" data-category="digital"></div>
+            </div>
+            <div class="algo-category" data-cat="effects">
+              <div class="algo-category-header">Effects & Transforms</div>
+              <div class="algorithm-list" data-category="effects"></div>
+            </div>
+          </div>
+
+          <!-- ALGORITHM PARAMS -->
+          <div id="params-container" class="params-container"></div>
+
+        </aside>
+      </div>
+    </main>
+  </div>
+
+  <input type="file" id="file-input" accept="image/*" hidden>
+
+  <!-- Export Modal -->
+  <div id="export-modal" class="modal-overlay hidden">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h2>Export Image</h2>
+        <button id="export-modal-close" class="modal-close">&times;</button>
+      </div>
+      <div class="modal-layout">
+        <!-- Preview pane -->
+        <div class="export-preview-pane">
+          <canvas id="export-preview-canvas"></canvas>
+          <div class="export-preview-info" id="export-preview-info">Preview</div>
+        </div>
+
+        <!-- Settings pane -->
+        <div class="export-settings-pane">
+          <!-- Output Size -->
+          <div class="modal-section">
+            <h3>Output Size</h3>
+            <p class="modal-hint" id="export-size-info"></p>
+            <div class="export-scale-grid">
+              <button class="export-scale-btn selected" data-scale="1">1x<span class="scale-sub">Original</span></button>
+              <button class="export-scale-btn" data-scale="2">2x</button>
+              <button class="export-scale-btn" data-scale="4">4x</button>
+              <button class="export-scale-btn" data-scale="8">8x</button>
+              <button class="export-scale-btn" data-scale="16">16x</button>
+              <button class="export-scale-btn" data-scale="32">32x</button>
+            </div>
+            <p class="modal-hint modal-dim-readout" id="export-dim-readout"></p>
+          </div>
+
+          <!-- File Format -->
+          <div class="modal-section">
+            <h3>Format</h3>
+            <div class="export-format-row">
+              <label class="export-format-label"><input type="radio" name="export-format" value="png" checked> PNG</label>
+              <label class="export-format-label"><input type="radio" name="export-format" value="webp"> WebP</label>
+              <label class="export-format-label"><input type="radio" name="export-format" value="jpeg"> JPEG</label>
+            </div>
+          </div>
+
+          <!-- Compress File -->
+          <div class="modal-section">
+            <label class="export-format-label">
+              <input type="checkbox" id="export-compress-toggle">
+              <span style="font-weight:600;">Compress file</span>
+            </label>
+          </div>
+
+          <!-- Compression controls (hidden until checked) -->
+          <div id="export-compress-section" style="display:none;">
+            <div class="modal-section">
+              <h3>Quality</h3>
+              <div class="slider-row">
+                <input type="range" id="export-quality" min="1" max="100" value="92" step="1">
+                <span class="param-value" id="export-quality-val">92</span>
+              </div>
+            </div>
+
+            <div class="modal-section">
+              <h3>Artifact Intensity</h3>
+              <p class="modal-hint">Lower values = more visible compression artifacts.</p>
+              <div class="slider-row">
+                <input type="range" id="export-artifact-intensity" min="1" max="50" value="15" step="1">
+                <span class="param-value" id="export-artifact-val">15</span>
+              </div>
+            </div>
+
+            <div class="modal-section">
+              <h3>Re-compress Passes</h3>
+              <p class="modal-hint">Stacks compression on itself for heavier degradation.</p>
+              <div class="slider-row">
+                <input type="range" id="export-recompress-passes" min="1" max="10" value="1" step="1">
+                <span class="param-value" id="export-recompress-val">1</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+      <div class="modal-footer">
+        <span class="export-file-estimate" id="export-estimate"></span>
+        <button id="export-cancel" class="btn-ghost">Cancel</button>
+        <button id="export-confirm" class="btn-primary">Export</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="dither.js?v=9"></script>
+  <script src="engine.js?v=9"></script>
+  <script src="app.js?v=9"></script>
+</body>
+</html>
