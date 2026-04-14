@@ -1198,23 +1198,14 @@
 
   async function renderExportPreview() {
     const opts = getExportOpts();
-    let imageData;
-    if (PaintEngine.hasStrokes()) {
-      // Use the canvas pixels directly (includes paint strokes)
-      imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    } else {
-      imageData = DitherEngine.process(buildPipeline(), buildGlobals(), EXPORT_PREVIEW_MAX);
-      if (!imageData) return;
-      if (grainLayers.length > 0) imageData = GrainEngine.applyGrainLayers(imageData, buildAllGrainOpts());
-    }
+    // Always use exactly what's on the canvas — WYSIWYG
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
     const tmp = document.createElement('canvas');
     tmp.width = imageData.width; tmp.height = imageData.height;
     tmp.getContext('2d').putImageData(imageData, 0, 0);
 
-    // Estimate file size scaled up: area ratio × preview size
-    const src = DitherEngine.getSourceSize();
-    const scaleRatio = src ? (src.width * opts.scale * src.height * opts.scale) / (imageData.width * imageData.height) : 1;
+    const scaleRatio = opts.scale * opts.scale;
 
     if (opts.artisticMode && opts.format !== 'png') {
       const mimeType = opts.format === 'jpeg' ? 'image/jpeg' : 'image/webp';
@@ -1345,21 +1336,12 @@
     const progressDetail = overlay.querySelector('.export-progress-detail');
 
     const opts = getExportOpts();
-    let blob;
-    if (PaintEngine.hasStrokes()) {
-      // Export canvas pixels directly (includes paint strokes)
-      const canvasData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      blob = await DitherEngine.exportImageData(canvasData, opts, (msg, detail) => {
-        progressText.textContent = msg;
-        progressDetail.textContent = detail || '';
-      });
-    } else {
-      const gOpts = grainLayers.length > 0 ? buildAllGrainOpts() : null;
-      blob = await DitherEngine.exportWithOptions(buildPipeline(), buildGlobals(), opts, (msg, detail) => {
-        progressText.textContent = msg;
-        progressDetail.textContent = detail || '';
-      }, gOpts);
-    }
+    // Always export exactly what's on the canvas — WYSIWYG
+    const canvasData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const blob = await DitherEngine.exportImageData(canvasData, opts, (msg, detail) => {
+      progressText.textContent = msg;
+      progressDetail.textContent = detail || '';
+    });
 
     if (blob) {
       progressText.textContent = 'Downloading\u2026';
