@@ -509,6 +509,46 @@ const DitherEngine = (() => {
     });
   }
 
+  // Export from raw ImageData (for exporting canvas with paint strokes)
+  function exportImageData(imageData, opts, progressCb) {
+    const scale = opts.scale || 1;
+    const format = opts.format || 'png';
+    const quality = (opts.quality || 92) / 100;
+    const artisticMode = opts.artisticMode || false;
+    const artifactIntensity = opts.artifactIntensity || 10;
+    const recompressPasses = opts.recompressPasses || 1;
+
+    return new Promise(resolve => {
+      setTimeout(async () => {
+        const c = document.createElement('canvas');
+        if (scale > 1) {
+          if (progressCb) progressCb('Upscaling\u2026', `${scale}x nearest-neighbor`);
+          const tmp = document.createElement('canvas');
+          tmp.width = imageData.width; tmp.height = imageData.height;
+          tmp.getContext('2d').putImageData(imageData, 0, 0);
+          c.width = imageData.width * scale;
+          c.height = imageData.height * scale;
+          const cctx = c.getContext('2d');
+          cctx.imageSmoothingEnabled = false;
+          cctx.drawImage(tmp, 0, 0, c.width, c.height);
+        } else {
+          c.width = imageData.width; c.height = imageData.height;
+          c.getContext('2d').putImageData(imageData, 0, 0);
+        }
+        const mimeType = format === 'jpeg' ? 'image/jpeg'
+          : format === 'webp' ? 'image/webp' : 'image/png';
+        if (artisticMode && format !== 'png') {
+          if (progressCb) progressCb('Compressing\u2026', `${recompressPasses} pass${recompressPasses > 1 ? 'es' : ''}`);
+          const artQ = Math.max(0.01, artifactIntensity / 100);
+          resolve(await doArtisticCompress(c, mimeType, artQ, recompressPasses, quality));
+        } else {
+          if (progressCb) progressCb('Encoding\u2026', format.toUpperCase());
+          c.toBlob(blob => resolve(blob), mimeType, format === 'png' ? undefined : quality);
+        }
+      }, 50);
+    });
+  }
+
   function doArtisticCompress(canvas, mimeType, artQuality, passes, finalQuality) {
     // Iteratively compress at low quality to build up artifacts
     return new Promise(async resolve => {
@@ -565,7 +605,7 @@ const DitherEngine = (() => {
   }
 
   return {
-    loadImage, getSourceSize, bake, bakeImageData, process, exportFullSize, exportWithOptions,
+    loadImage, getSourceSize, bake, bakeImageData, process, exportFullSize, exportWithOptions, exportImageData,
     hexToRgb, rgbToHex, clampByte,
     getPalettePresets, getPalette, extractPalette, medianCut, nearestColor
   };

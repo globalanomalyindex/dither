@@ -1134,31 +1134,14 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
   gap: 8px;
   justify-content: flex-end;
 }
-.btn-secondary {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  padding: 6px 16px;
-  border-radius: 6px;
-  cursor: pointer;
+/* Modal button overrides */
+.modal-panel .btn-secondary {
   font-size: 13px;
-}
-.btn-secondary:hover {
-  border-color: var(--text-dim);
-  color: var(--text);
-}
-.btn-primary {
-  background: var(--accent);
-  border: none;
-  color: #fff;
   padding: 6px 16px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 600;
 }
-.btn-primary:hover {
-  filter: brightness(1.15);
+.modal-panel .btn-primary {
+  font-size: 13px;
+  padding: 6px 16px;
 }
 
 /* ── Responsive ── */

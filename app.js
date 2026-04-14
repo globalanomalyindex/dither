@@ -212,6 +212,11 @@
     state.processing = true;
     showProcessing(true);
 
+    // Save paint state before re-render if strokes exist
+    const hasPaint = PaintEngine.hasStrokes();
+    const paintedState = hasPaint ? PaintEngine.getPaintedState() : null;
+    const paintBase = hasPaint ? PaintEngine.getBaseSnapshot() : null;
+
     requestAnimationFrame(() => {
       let result = DitherEngine.process(buildPipeline(), buildGlobals(), PREVIEW_MAX);
       if (result) {
@@ -223,10 +228,9 @@
         canvas.height = result.height;
         ctx.putImageData(result, 0, 0);
         updateCanvasTransform();
-        // Clear paint strokes since the base image changed
-        if (PaintEngine.hasStrokes()) {
-          PaintEngine.clearStrokes();
-          updateStrokeCount();
+        // Re-apply paint strokes over the new base
+        if (hasPaint && paintedState && paintBase) {
+          PaintEngine.applyPaintDelta(paintedState, paintBase);
         }
       }
       state.processing = false;
@@ -1194,9 +1198,15 @@
 
   async function renderExportPreview() {
     const opts = getExportOpts();
-    let imageData = DitherEngine.process(buildPipeline(), buildGlobals(), EXPORT_PREVIEW_MAX);
-    if (!imageData) return;
-    if (grainLayers.length > 0) imageData = GrainEngine.applyGrainLayers(imageData, buildAllGrainOpts());
+    let imageData;
+    if (PaintEngine.hasStrokes()) {
+      // Use the canvas pixels directly (includes paint strokes)
+      imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    } else {
+      imageData = DitherEngine.process(buildPipeline(), buildGlobals(), EXPORT_PREVIEW_MAX);
+      if (!imageData) return;
+      if (grainLayers.length > 0) imageData = GrainEngine.applyGrainLayers(imageData, buildAllGrainOpts());
+    }
 
     const tmp = document.createElement('canvas');
     tmp.width = imageData.width; tmp.height = imageData.height;
@@ -1335,11 +1345,21 @@
     const progressDetail = overlay.querySelector('.export-progress-detail');
 
     const opts = getExportOpts();
-    const gOpts = grainLayers.length > 0 ? buildAllGrainOpts() : null;
-    const blob = await DitherEngine.exportWithOptions(buildPipeline(), buildGlobals(), opts, (msg, detail) => {
-      progressText.textContent = msg;
-      progressDetail.textContent = detail || '';
-    }, gOpts);
+    let blob;
+    if (PaintEngine.hasStrokes()) {
+      // Export canvas pixels directly (includes paint strokes)
+      const canvasData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      blob = await DitherEngine.exportImageData(canvasData, opts, (msg, detail) => {
+        progressText.textContent = msg;
+        progressDetail.textContent = detail || '';
+      });
+    } else {
+      const gOpts = grainLayers.length > 0 ? buildAllGrainOpts() : null;
+      blob = await DitherEngine.exportWithOptions(buildPipeline(), buildGlobals(), opts, (msg, detail) => {
+        progressText.textContent = msg;
+        progressDetail.textContent = detail || '';
+      }, gOpts);
+    }
 
     if (blob) {
       progressText.textContent = 'Downloading\u2026';

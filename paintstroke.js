@@ -13,6 +13,9 @@ const PaintEngine = (() => {
   const undoStack = [];
   const MAX_UNDO = 20;
 
+  // Pre-paint base snapshot for overlay persistence
+  let baseSnapshot = null;
+
   // Tool & settings
   let tool = 'smudge';
   let size = 30;
@@ -604,7 +607,10 @@ const PaintEngine = (() => {
   // ── Undo ──
   function pushPaintUndo() {
     if (!canvas) return;
-    undoStack.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    const snap = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    // Capture the pre-paint base on the very first stroke
+    if (!baseSnapshot) baseSnapshot = snap;
+    undoStack.push(snap);
     if (undoStack.length > MAX_UNDO) undoStack.shift();
   }
 
@@ -620,6 +626,52 @@ const PaintEngine = (() => {
     undoStack.length = 0;
     strokeCount = 0;
     hasPickup = false;
+    baseSnapshot = null;
+  }
+
+  // Re-apply paint modifications over a new base image.
+  // Computes which pixels were changed by paint (current vs baseSnapshot),
+  // then applies those changes on top of the new base already on the canvas.
+  function reapplyPaintOver() {
+    if (!canvas || !baseSnapshot || strokeCount === 0) return false;
+    const painted = undoStack.length > 0
+      ? ctx.getImageData(0, 0, canvas.width, canvas.height)
+      : null;
+    // If the canvas was already overwritten by runProcess, we need the
+    // painted state from before that. We store it in the call site.
+    return false; // caller handles this via reapplyPaintDelta
+  }
+
+  // Apply a pre-computed paint delta onto the current canvas
+  function applyPaintDelta(paintedData, baseData) {
+    if (!canvas || !paintedData || !baseData) return;
+    const newBase = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const nb = newBase.data;
+    const pd = paintedData.data;
+    const bd = baseData.data;
+    const len = nb.length;
+    // If canvas size changed, can't re-apply
+    if (pd.length !== len || bd.length !== len) return;
+    for (let i = 0; i < len; i += 4) {
+      // Check if this pixel was modified by paint
+      if (pd[i] !== bd[i] || pd[i+1] !== bd[i+1] || pd[i+2] !== bd[i+2]) {
+        nb[i]   = pd[i];
+        nb[i+1] = pd[i+1];
+        nb[i+2] = pd[i+2];
+      }
+    }
+    ctx.putImageData(newBase, 0, 0);
+    // Update base snapshot to current new base (so future diffs work)
+    baseSnapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    // Rebuild undo stack with just the current state
+    undoStack.length = 0;
+    undoStack.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+  }
+
+  function getBaseSnapshot() { return baseSnapshot; }
+  function getPaintedState() {
+    if (!canvas) return null;
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
   }
 
   function hasStrokes() { return strokeCount > 0; }
@@ -744,6 +796,7 @@ const PaintEngine = (() => {
   return {
     init, beginStroke, continueStroke, endStroke,
     undoStroke, clearStrokes, hasStrokes, getStrokeCount,
+    getBaseSnapshot, getPaintedState, applyPaintDelta,
     setTool, setSize, setSpacing, setStrength, setOpacity,
     setSmudgeDecay, setPushDistance, setScatterRadius, setSwirlAngle,
     setLiquifySmooth, setBlendKernel, setSpreadAmount,
