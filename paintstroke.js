@@ -1,0 +1,697 @@
+/**
+ * PAINTSTROKE.js — Paint engine with brush system, 7 displacement tools, stroke recording
+ */
+
+const PaintEngine = (() => {
+  // ── State ──
+  let canvas = null, ctx = null;
+  let painting = false;
+  let lastX = 0, lastY = 0;
+  let strokeCount = 0;
+
+  // Undo stack (ImageData snapshots)
+  const undoStack = [];
+  const MAX_UNDO = 20;
+
+  // Tool & settings
+  let tool = 'smudge';
+  let size = 30;
+  let spacing = 25;     // % of brush size
+  let strength = 50;    // 0-100
+  let opacity = 100;    // 0-100
+
+  // Tool-specific params
+  let smudgeDecay = 70;   // % — how much pickup retains (high = long smear)
+  let pushDistance = 20;   // px displacement
+  let scatterRadius = 30;  // px random offset
+  let swirlAngle = 45;     // degrees
+  let liquifySmooth = 0.6; // distance falloff exponent
+  let blendKernel = 3;     // blur kernel radius
+  let spreadAmount = 50;   // stretch intensity
+
+  // Active brush mask
+  let activeMask = null;
+  let activeMaskSize = 0;
+
+  // Stroke direction (normalized, canvas pixel space)
+  let prevStampX = 0, prevStampY = 0;
+  let strokeDirX = 0, strokeDirY = 0;
+
+  // Smudge pickup buffers
+  let pickupR = null, pickupG = null, pickupB = null;
+  let hasPickup = false;
+
+  // Brush library
+  const brushLibrary = [];
+  let selectedBrush = 0;
+
+  // ── Init ──
+  function init(canvasEl) {
+    canvas = canvasEl;
+    ctx = canvas.getContext('2d');
+    if (brushLibrary.length === 0) initDefaultBrushes();
+    selectBrush(0);
+  }
+
+  // ── Brush Generation ──
+  const BRUSH_REF = 64;
+
+  function initDefaultBrushes() {
+    brushLibrary.length = 0;
+    brushLibrary.push({ name: 'Round Soft', mask: makeRoundSoft(BRUSH_REF), size: BRUSH_REF });
+    brushLibrary.push({ name: 'Round Hard', mask: makeRoundHard(BRUSH_REF), size: BRUSH_REF });
+    brushLibrary.push({ name: 'Flat', mask: makeFlat(BRUSH_REF), size: BRUSH_REF });
+    brushLibrary.push({ name: 'Splatter', mask: makeSplatter(BRUSH_REF), size: BRUSH_REF });
+    brushLibrary.push({ name: 'Noise', mask: makeNoise(BRUSH_REF), size: BRUSH_REF });
+    brushLibrary.push({ name: 'Stipple', mask: makeStipple(BRUSH_REF), size: BRUSH_REF });
+    brushLibrary.push({ name: 'Rake', mask: makeRake(BRUSH_REF), size: BRUSH_REF });
+    brushLibrary.push({ name: 'Dry Brush', mask: makeDryBrush(BRUSH_REF), size: BRUSH_REF });
+    brushLibrary.push({ name: 'Charcoal', mask: makeCharcoal(BRUSH_REF), size: BRUSH_REF });
+    brushLibrary.push({ name: 'Fan', mask: makeFan(BRUSH_REF), size: BRUSH_REF });
+  }
+
+  function makeRoundSoft(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2;
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      const d = Math.sqrt((x - c) * (x - c) + (y - c) * (y - c)) / c;
+      m[y * s + x] = Math.max(0, 1 - d * d);
+    }
+    return m;
+  }
+
+  function makeRoundHard(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2, r = c - 1;
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      const d = Math.sqrt((x - c) * (x - c) + (y - c) * (y - c));
+      m[y * s + x] = d <= r ? 1 : Math.max(0, 1 - (d - r));
+    }
+    return m;
+  }
+
+  function makeFlat(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2, hw = s * 0.45, hh = s * 0.15;
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      const dx = Math.abs(x - c) / hw, dy = Math.abs(y - c) / hh;
+      const d = Math.max(dx, dy);
+      m[y * s + x] = d <= 1 ? Math.max(0, 1 - (d - 0.8) * 5) : 0;
+    }
+    return m;
+  }
+
+  function makeSplatter(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2;
+    // Seeded random for reproducibility
+    let seed = 12345;
+    const rng = () => { seed = (seed * 16807 + 0) % 2147483647; return seed / 2147483647; };
+    // Place random dots
+    const dots = [];
+    for (let i = 0; i < 40; i++) {
+      const angle = rng() * Math.PI * 2;
+      const dist = rng() * c * 0.9;
+      dots.push({ x: c + Math.cos(angle) * dist, y: c + Math.sin(angle) * dist, r: rng() * 4 + 1 });
+    }
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      let val = 0;
+      for (const dot of dots) {
+        const d = Math.sqrt((x - dot.x) * (x - dot.x) + (y - dot.y) * (y - dot.y));
+        if (d < dot.r) val = Math.max(val, 1 - d / dot.r);
+      }
+      m[y * s + x] = val;
+    }
+    return m;
+  }
+
+  function makeNoise(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2;
+    let seed = 54321;
+    const rng = () => { seed = (seed * 16807 + 0) % 2147483647; return seed / 2147483647; };
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      const d = Math.sqrt((x - c) * (x - c) + (y - c) * (y - c)) / c;
+      const circle = Math.max(0, 1 - d);
+      m[y * s + x] = circle * (rng() * 0.7 + 0.3);
+    }
+    return m;
+  }
+
+  function makeStipple(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2, dotSpacing = 6;
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      const d = Math.sqrt((x - c) * (x - c) + (y - c) * (y - c)) / c;
+      if (d > 1) continue;
+      const gx = x % dotSpacing, gy = y % dotSpacing;
+      const dd = Math.sqrt((gx - dotSpacing / 2) * (gx - dotSpacing / 2) + (gy - dotSpacing / 2) * (gy - dotSpacing / 2));
+      if (dd < dotSpacing * 0.3) m[y * s + x] = (1 - d) * (1 - dd / (dotSpacing * 0.3));
+    }
+    return m;
+  }
+
+  function makeRake(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2, tines = 5, gap = s / (tines + 1);
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      const d = Math.sqrt((x - c) * (x - c) + (y - c) * (y - c)) / c;
+      if (d > 1) continue;
+      // Vertical tines
+      let tineVal = 0;
+      for (let t = 1; t <= tines; t++) {
+        const tx = t * gap;
+        const dist = Math.abs(x - tx);
+        if (dist < gap * 0.25) tineVal = Math.max(tineVal, 1 - dist / (gap * 0.25));
+      }
+      m[y * s + x] = tineVal * (1 - d * 0.5);
+    }
+    return m;
+  }
+
+  function makeDryBrush(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2;
+    let seed = 99999;
+    const rng = () => { seed = (seed * 16807 + 0) % 2147483647; return seed / 2147483647; };
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      const d = Math.sqrt((x - c) * (x - c) + (y - c) * (y - c)) / c;
+      if (d > 1) continue;
+      const edge = 1 - d;
+      const noise = rng();
+      // Streaky horizontal pattern
+      const streak = Math.sin(y * 0.8 + rng() * 2) * 0.3 + 0.7;
+      m[y * s + x] = edge * (noise > 0.3 ? streak : 0);
+    }
+    return m;
+  }
+
+  function makeCharcoal(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2;
+    let seed = 77777;
+    const rng = () => { seed = (seed * 16807 + 0) % 2147483647; return seed / 2147483647; };
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      const d = Math.sqrt((x - c) * (x - c) + (y - c) * (y - c)) / c;
+      if (d > 1) continue;
+      const edge = Math.max(0, 1 - d * 1.2);
+      const texture = rng() > 0.15 ? 1 : 0;
+      const grain = 0.5 + rng() * 0.5;
+      m[y * s + x] = edge * texture * grain;
+    }
+    return m;
+  }
+
+  function makeFan(s) {
+    const m = new Float32Array(s * s);
+    const c = s / 2, fanWidth = Math.PI * 0.6;
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+      const dx = x - c, dy = y - c;
+      const d = Math.sqrt(dx * dx + dy * dy) / c;
+      if (d > 1 || d < 0.2) continue;
+      const angle = Math.atan2(dy, dx);
+      // Fan shape: spread across a wide arc
+      if (Math.abs(angle) < fanWidth) {
+        const angFalloff = 1 - Math.abs(angle) / fanWidth;
+        const radFalloff = 1 - Math.abs(d - 0.6) / 0.4;
+        m[y * s + x] = Math.max(0, angFalloff * radFalloff);
+      }
+    }
+    return m;
+  }
+
+  // ── Mask Utilities ──
+  function scaleMask(src, srcSize, dstSize) {
+    if (srcSize === dstSize) return new Float32Array(src);
+    const dst = new Float32Array(dstSize * dstSize);
+    const scale = srcSize / dstSize;
+    for (let y = 0; y < dstSize; y++) {
+      for (let x = 0; x < dstSize; x++) {
+        const sx = x * scale, sy = y * scale;
+        const sx0 = Math.floor(sx), sy0 = Math.floor(sy);
+        const sx1 = Math.min(sx0 + 1, srcSize - 1), sy1 = Math.min(sy0 + 1, srcSize - 1);
+        const fx = sx - sx0, fy = sy - sy0;
+        dst[y * dstSize + x] =
+          src[sy0 * srcSize + sx0] * (1 - fx) * (1 - fy) +
+          src[sy0 * srcSize + sx1] * fx * (1 - fy) +
+          src[sy1 * srcSize + sx0] * (1 - fx) * fy +
+          src[sy1 * srcSize + sx1] * fx * fy;
+      }
+    }
+    return dst;
+  }
+
+  function updateActiveMask() {
+    const brush = brushLibrary[selectedBrush];
+    if (!brush) return;
+    activeMaskSize = Math.max(1, Math.round(size));
+    activeMask = scaleMask(brush.mask, brush.size, activeMaskSize);
+  }
+
+  // ── Bilinear Sampling ──
+  function samplePixel(data, w, h, x, y) {
+    const x0 = Math.max(0, Math.min(Math.floor(x), w - 1));
+    const y0 = Math.max(0, Math.min(Math.floor(y), h - 1));
+    const x1 = Math.min(x0 + 1, w - 1);
+    const y1 = Math.min(y0 + 1, h - 1);
+    const fx = Math.max(0, x - x0), fy = Math.max(0, y - y0);
+
+    const i00 = (y0 * w + x0) * 4;
+    const i10 = (y0 * w + x1) * 4;
+    const i01 = (y1 * w + x0) * 4;
+    const i11 = (y1 * w + x1) * 4;
+
+    return [
+      data[i00] * (1 - fx) * (1 - fy) + data[i10] * fx * (1 - fy) + data[i01] * (1 - fx) * fy + data[i11] * fx * fy,
+      data[i00 + 1] * (1 - fx) * (1 - fy) + data[i10 + 1] * fx * (1 - fy) + data[i01 + 1] * (1 - fx) * fy + data[i11 + 1] * fx * fy,
+      data[i00 + 2] * (1 - fx) * (1 - fy) + data[i10 + 2] * fx * (1 - fy) + data[i01 + 2] * (1 - fx) * fy + data[i11 + 2] * fx * fy
+    ];
+  }
+
+  // ── Stamp Application ──
+  function applyStamp(cx, cy) {
+    if (!activeMask || !canvas) return;
+    const ms = activeMaskSize;
+    const half = ms / 2;
+
+    // Compute stroke direction from previous stamp
+    const ddx = cx - prevStampX, ddy = cy - prevStampY;
+    const ddLen = Math.sqrt(ddx * ddx + ddy * ddy);
+    if (ddLen > 0.1) { strokeDirX = ddx / ddLen; strokeDirY = ddy / ddLen; }
+    prevStampX = cx; prevStampY = cy;
+
+    // Compute canvas-space bounding box for the brush
+    const margin = tool === 'push' || tool === 'liquify' ? pushDistance :
+                   tool === 'scatter' ? scatterRadius :
+                   tool === 'spread' ? spreadAmount :
+                   tool === 'blend' ? blendKernel : 0;
+    const rx0 = Math.max(0, Math.floor(cx - half - margin));
+    const ry0 = Math.max(0, Math.floor(cy - half - margin));
+    const rx1 = Math.min(canvas.width, Math.ceil(cx + half + margin));
+    const ry1 = Math.min(canvas.height, Math.ceil(cy + half + margin));
+    const rw = rx1 - rx0, rh = ry1 - ry0;
+    if (rw <= 0 || rh <= 0) return;
+
+    // Read source pixels (current canvas state)
+    const srcData = ctx.getImageData(rx0, ry0, rw, rh);
+    const src = srcData.data;
+
+    // Output: start with copy of source
+    const dstData = ctx.createImageData(rw, rh);
+    dstData.data.set(src);
+    const dst = dstData.data;
+
+    // Brush area in read-buffer space
+    const bx0 = Math.floor(cx - half) - rx0;
+    const by0 = Math.floor(cy - half) - ry0;
+    const bcx = cx - rx0, bcy = cy - ry0;
+
+    const str = strength / 100;
+    const opa = opacity / 100;
+
+    switch (tool) {
+      case 'smudge':  stampSmudge(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
+      case 'push':    stampPush(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
+      case 'scatter':  stampScatter(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
+      case 'swirl':   stampSwirl(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
+      case 'liquify': stampLiquify(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
+      case 'blend':   stampBlend(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
+      case 'spread':  stampSpread(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
+    }
+
+    ctx.putImageData(dstData, rx0, ry0);
+  }
+
+  // ── Tool: Smudge ──
+  function stampSmudge(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
+    const decay = smudgeDecay / 100;
+    for (let my = 0; my < ms; my++) {
+      for (let mx = 0; mx < ms; mx++) {
+        const a = activeMask[my * ms + mx] * alpha;
+        if (a < 0.01) continue;
+        const px = bx0 + mx, py = by0 + my;
+        if (px < 0 || px >= w || py < 0 || py >= h) continue;
+        const idx = (py * w + px) * 4;
+        const mi = my * ms + mx;
+
+        if (hasPickup) {
+          // Blend pickup with canvas
+          dst[idx]     = Math.round(src[idx]     + (pickupR[mi] - src[idx])     * a);
+          dst[idx + 1] = Math.round(src[idx + 1] + (pickupG[mi] - src[idx + 1]) * a);
+          dst[idx + 2] = Math.round(src[idx + 2] + (pickupB[mi] - src[idx + 2]) * a);
+          // Update pickup with decay
+          pickupR[mi] = pickupR[mi] * decay + src[idx]     * (1 - decay);
+          pickupG[mi] = pickupG[mi] * decay + src[idx + 1] * (1 - decay);
+          pickupB[mi] = pickupB[mi] * decay + src[idx + 2] * (1 - decay);
+        }
+      }
+    }
+  }
+
+  function initPickup(cx, cy) {
+    const ms = activeMaskSize;
+    pickupR = new Float32Array(ms * ms);
+    pickupG = new Float32Array(ms * ms);
+    pickupB = new Float32Array(ms * ms);
+    const half = ms / 2;
+    const imgData = ctx.getImageData(
+      Math.max(0, Math.floor(cx - half)),
+      Math.max(0, Math.floor(cy - half)),
+      Math.min(canvas.width - Math.max(0, Math.floor(cx - half)), ms),
+      Math.min(canvas.height - Math.max(0, Math.floor(cy - half)), ms)
+    );
+    const d = imgData.data, iw = imgData.width, ih = imgData.height;
+    for (let y = 0; y < ih && y < ms; y++) {
+      for (let x = 0; x < iw && x < ms; x++) {
+        const si = (y * iw + x) * 4;
+        const mi = y * ms + x;
+        pickupR[mi] = d[si];
+        pickupG[mi] = d[si + 1];
+        pickupB[mi] = d[si + 2];
+      }
+    }
+    hasPickup = true;
+  }
+
+  // ── Tool: Push ──
+  function stampPush(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
+    const nx = strokeDirX, ny = strokeDirY;
+    if (Math.abs(nx) < 0.01 && Math.abs(ny) < 0.01) return;
+    const dist = pushDistance * alpha;
+
+    for (let my = 0; my < ms; my++) {
+      for (let mx = 0; mx < ms; mx++) {
+        const a = activeMask[my * ms + mx];
+        if (a < 0.01) continue;
+        const px = bx0 + mx, py = by0 + my;
+        if (px < 0 || px >= w || py < 0 || py >= h) continue;
+
+        const srcX = px - nx * dist * a;
+        const srcY = py - ny * dist * a;
+        const [r, g, b] = samplePixel(src, w, h, srcX, srcY);
+        const idx = (py * w + px) * 4;
+        dst[idx]     = Math.round(r);
+        dst[idx + 1] = Math.round(g);
+        dst[idx + 2] = Math.round(b);
+      }
+    }
+  }
+
+  // ── Tool: Scatter ──
+  function stampScatter(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
+    const rad = scatterRadius * alpha;
+    for (let my = 0; my < ms; my++) {
+      for (let mx = 0; mx < ms; mx++) {
+        const a = activeMask[my * ms + mx];
+        if (a < 0.01) continue;
+        const px = bx0 + mx, py = by0 + my;
+        if (px < 0 || px >= w || py < 0 || py >= h) continue;
+
+        const angle = Math.random() * Math.PI * 2;
+        const dist = Math.random() * rad * a;
+        const srcX = px + Math.cos(angle) * dist;
+        const srcY = py + Math.sin(angle) * dist;
+        const [r, g, b] = samplePixel(src, w, h, srcX, srcY);
+        const idx = (py * w + px) * 4;
+        dst[idx]     = Math.round(r);
+        dst[idx + 1] = Math.round(g);
+        dst[idx + 2] = Math.round(b);
+      }
+    }
+  }
+
+  // ── Tool: Swirl ──
+  function stampSwirl(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
+    const angleRad = swirlAngle * Math.PI / 180 * alpha;
+    const half = ms / 2;
+    for (let my = 0; my < ms; my++) {
+      for (let mx = 0; mx < ms; mx++) {
+        const a = activeMask[my * ms + mx];
+        if (a < 0.01) continue;
+        const px = bx0 + mx, py = by0 + my;
+        if (px < 0 || px >= w || py < 0 || py >= h) continue;
+
+        const relX = mx - half, relY = my - half;
+        const d = Math.sqrt(relX * relX + relY * relY) / half;
+        if (d > 1) continue;
+        const ang = angleRad * a * (1 - d);
+        const cosA = Math.cos(ang), sinA = Math.sin(ang);
+        const srcX = cx + relX * cosA - relY * sinA;
+        const srcY = cy + relX * sinA + relY * cosA;
+        const [r, g, b] = samplePixel(src, w, h, srcX, srcY);
+        const idx = (py * w + px) * 4;
+        dst[idx]     = Math.round(r);
+        dst[idx + 1] = Math.round(g);
+        dst[idx + 2] = Math.round(b);
+      }
+    }
+  }
+
+  // ── Tool: Liquify ──
+  function stampLiquify(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
+    const nx = strokeDirX, ny = strokeDirY;
+    if (Math.abs(nx) < 0.01 && Math.abs(ny) < 0.01) return;
+    const dist = pushDistance * alpha;
+    const half = ms / 2;
+
+    for (let my = 0; my < ms; my++) {
+      for (let mx = 0; mx < ms; mx++) {
+        const a = activeMask[my * ms + mx];
+        if (a < 0.01) continue;
+        const px = bx0 + mx, py = by0 + my;
+        if (px < 0 || px >= w || py < 0 || py >= h) continue;
+
+        const relX = mx - half, relY = my - half;
+        const d = Math.sqrt(relX * relX + relY * relY) / half;
+        if (d > 1) continue;
+        const falloff = Math.pow(1 - d, liquifySmooth + 0.5);
+        const warp = a * falloff;
+        const srcX = px - nx * dist * warp;
+        const srcY = py - ny * dist * warp;
+        const [r, g, b] = samplePixel(src, w, h, srcX, srcY);
+        const idx = (py * w + px) * 4;
+        dst[idx]     = Math.round(r);
+        dst[idx + 1] = Math.round(g);
+        dst[idx + 2] = Math.round(b);
+      }
+    }
+  }
+
+  // ── Tool: Blend ──
+  function stampBlend(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
+    const kr = blendKernel;
+    for (let my = 0; my < ms; my++) {
+      for (let mx = 0; mx < ms; mx++) {
+        const a = activeMask[my * ms + mx] * alpha;
+        if (a < 0.01) continue;
+        const px = bx0 + mx, py = by0 + my;
+        if (px < 0 || px >= w || py < 0 || py >= h) continue;
+
+        // Average neighborhood
+        let sr = 0, sg = 0, sb = 0, cnt = 0;
+        for (let ky = -kr; ky <= kr; ky++) {
+          for (let kx = -kr; kx <= kr; kx++) {
+            const sx = px + kx, sy = py + ky;
+            if (sx >= 0 && sx < w && sy >= 0 && sy < h) {
+              const si = (sy * w + sx) * 4;
+              sr += src[si]; sg += src[si + 1]; sb += src[si + 2];
+              cnt++;
+            }
+          }
+        }
+        if (cnt === 0) continue;
+        sr /= cnt; sg /= cnt; sb /= cnt;
+
+        const idx = (py * w + px) * 4;
+        dst[idx]     = Math.round(src[idx]     + (sr - src[idx])     * a);
+        dst[idx + 1] = Math.round(src[idx + 1] + (sg - src[idx + 1]) * a);
+        dst[idx + 2] = Math.round(src[idx + 2] + (sb - src[idx + 2]) * a);
+      }
+    }
+  }
+
+  // ── Tool: Spread ──
+  function stampSpread(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
+    const nx = strokeDirX, ny = strokeDirY;
+    if (Math.abs(nx) < 0.01 && Math.abs(ny) < 0.01) return;
+    const amt = spreadAmount * alpha;
+    const half = ms / 2;
+
+    for (let my = 0; my < ms; my++) {
+      for (let mx = 0; mx < ms; mx++) {
+        const a = activeMask[my * ms + mx];
+        if (a < 0.01) continue;
+        const px = bx0 + mx, py = by0 + my;
+        if (px < 0 || px >= w || py < 0 || py >= h) continue;
+
+        const relX = mx - half, relY = my - half;
+        // Project onto stroke direction
+        const proj = relX * nx + relY * ny;
+        const srcX = px - nx * proj * amt / 100 * a;
+        const srcY = py - ny * proj * amt / 100 * a;
+        const [r, g, b] = samplePixel(src, w, h, srcX, srcY);
+        const idx = (py * w + px) * 4;
+        dst[idx]     = Math.round(r);
+        dst[idx + 1] = Math.round(g);
+        dst[idx + 2] = Math.round(b);
+      }
+    }
+  }
+
+  // ── Stroke Handling ──
+  function beginStroke(x, y) {
+    if (!canvas) return;
+    pushPaintUndo();
+    painting = true;
+    lastX = x; lastY = y;
+    prevStampX = x; prevStampY = y;
+    strokeDirX = 0; strokeDirY = 0;
+    updateActiveMask();
+
+    if (tool === 'smudge') initPickup(x, y);
+
+    applyStamp(x, y);
+  }
+
+  function continueStroke(x, y) {
+    if (!painting || !canvas) return;
+    const dx = x - lastX, dy = y - lastY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const spacingPx = Math.max(1, activeMaskSize * spacing / 100);
+
+    if (dist < spacingPx * 0.5) return;
+
+    const steps = Math.max(1, Math.ceil(dist / spacingPx));
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const sx = lastX + dx * t;
+      const sy = lastY + dy * t;
+      applyStamp(sx, sy);
+    }
+    lastX = x; lastY = y;
+  }
+
+  function endStroke() {
+    if (!painting) return;
+    painting = false;
+    strokeCount++;
+    hasPickup = false;
+  }
+
+  // ── Undo ──
+  function pushPaintUndo() {
+    if (!canvas) return;
+    undoStack.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    if (undoStack.length > MAX_UNDO) undoStack.shift();
+  }
+
+  function undoStroke() {
+    if (undoStack.length === 0) return false;
+    const prev = undoStack.pop();
+    ctx.putImageData(prev, 0, 0);
+    strokeCount = Math.max(0, strokeCount - 1);
+    return true;
+  }
+
+  function clearStrokes() {
+    undoStack.length = 0;
+    strokeCount = 0;
+    hasPickup = false;
+  }
+
+  function hasStrokes() { return strokeCount > 0; }
+  function getStrokeCount() { return strokeCount; }
+
+  // ── Brush Library ──
+  function selectBrush(index) {
+    if (index >= 0 && index < brushLibrary.length) {
+      selectedBrush = index;
+      updateActiveMask();
+    }
+  }
+
+  function getBrushes() {
+    return brushLibrary.map((b, i) => ({ name: b.name, index: i, selected: i === selectedBrush }));
+  }
+
+  function getSelectedBrush() { return selectedBrush; }
+
+  function extractBrushFromImage(imageData, threshold, softness) {
+    const w = imageData.width, h = imageData.height;
+    const d = imageData.data;
+    const sz = Math.max(w, h);
+    const mask = new Float32Array(sz * sz);
+    const th = (threshold / 100) * 255;
+    const sf = softness / 100;
+    const softRange = Math.max(1, th * sf);
+
+    for (let y = 0; y < h && y < sz; y++) {
+      for (let x = 0; x < w && x < sz; x++) {
+        const i = (y * w + x) * 4;
+        const gray = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+        // White = opaque, black = transparent
+        let val = gray / 255;
+        // Apply threshold with softness
+        if (val < th / 255) {
+          val = sf > 0 ? Math.max(0, val / (th / 255)) * sf : 0;
+        }
+        mask[y * sz + x] = val;
+      }
+    }
+
+    return { mask, size: sz };
+  }
+
+  function addBrush(name, mask, maskSize) {
+    brushLibrary.push({ name, mask, size: maskSize });
+    return brushLibrary.length - 1;
+  }
+
+  // ── Settings ──
+  function setTool(t) { tool = t; }
+  function setSize(s) { size = Math.max(1, Math.min(500, s)); updateActiveMask(); }
+  function setSpacing(s) { spacing = Math.max(1, Math.min(200, s)); }
+  function setStrength(s) { strength = Math.max(0, Math.min(100, s)); }
+  function setOpacity(o) { opacity = Math.max(0, Math.min(100, o)); }
+  function setSmudgeDecay(d) { smudgeDecay = Math.max(0, Math.min(100, d)); }
+  function setPushDistance(d) { pushDistance = Math.max(1, Math.min(100, d)); }
+  function setScatterRadius(r) { scatterRadius = Math.max(1, Math.min(100, r)); }
+  function setSwirlAngle(a) { swirlAngle = Math.max(-360, Math.min(360, a)); }
+  function setLiquifySmooth(s) { liquifySmooth = Math.max(0, Math.min(2, s)); }
+  function setBlendKernel(k) { blendKernel = Math.max(1, Math.min(20, k)); }
+  function setSpreadAmount(a) { spreadAmount = Math.max(1, Math.min(100, a)); }
+
+  function getSettings() {
+    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush };
+  }
+
+  // ── Brush Thumbnails ──
+  function getBrushThumbnail(index, thumbSize) {
+    const brush = brushLibrary[index];
+    if (!brush) return null;
+    const c = document.createElement('canvas');
+    c.width = thumbSize; c.height = thumbSize;
+    const tctx = c.getContext('2d');
+    const img = tctx.createImageData(thumbSize, thumbSize);
+    const scaled = scaleMask(brush.mask, brush.size, thumbSize);
+    for (let i = 0; i < thumbSize * thumbSize; i++) {
+      const v = Math.round(scaled[i] * 255);
+      const idx = i * 4;
+      img.data[idx] = v; img.data[idx + 1] = v; img.data[idx + 2] = v; img.data[idx + 3] = 255;
+    }
+    tctx.putImageData(img, 0, 0);
+    return c.toDataURL();
+  }
+
+  // ── Public API ──
+  return {
+    init, beginStroke, continueStroke, endStroke,
+    undoStroke, clearStrokes, hasStrokes, getStrokeCount,
+    setTool, setSize, setSpacing, setStrength, setOpacity,
+    setSmudgeDecay, setPushDistance, setScatterRadius, setSwirlAngle,
+    setLiquifySmooth, setBlendKernel, setSpreadAmount,
+    selectBrush, getBrushes, getSelectedBrush, getBrushThumbnail,
+    addBrush, extractBrushFromImage,
+    getSettings, updateActiveMask
+  };
+})();

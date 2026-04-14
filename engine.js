@@ -469,9 +469,9 @@ const DitherEngine = (() => {
         let imageData = process(pipeline, globals, 0);
         if (!imageData) { resolve(null); return; }
         // Apply grain
-        if (grainOpts && grainOpts.amount > 0) {
+        if (grainOpts && grainOpts.length > 0) {
           if (progressCb) progressCb('Applying grain\u2026', '');
-          imageData = GrainEngine.applyGrain(imageData, grainOpts);
+          imageData = GrainEngine.applyGrainLayers(imageData, grainOpts);
         }
 
         const c = document.createElement('canvas');
@@ -529,8 +529,8 @@ const DitherEngine = (() => {
   function bake(pipeline, globals, grainOpts) {
     let imageData = process(pipeline, globals, 0);
     if (!imageData) return false;
-    if (grainOpts && grainOpts.amount > 0) {
-      imageData = GrainEngine.applyGrain(imageData, grainOpts);
+    if (grainOpts && grainOpts.length > 0) {
+      imageData = GrainEngine.applyGrainLayers(imageData, grainOpts);
     }
     const c = document.createElement('canvas');
     c.width = imageData.width; c.height = imageData.height;
@@ -539,6 +539,18 @@ const DitherEngine = (() => {
     sourceCanvas = c;
     sourceData = imageData;
     sourceImage = null; // no longer an <img>, but sourceCanvas is set
+    _cache.key = '';
+    return { width: imageData.width, height: imageData.height };
+  }
+
+  function bakeImageData(imageData) {
+    const c = document.createElement('canvas');
+    c.width = imageData.width; c.height = imageData.height;
+    const cctx = c.getContext('2d');
+    cctx.putImageData(imageData, 0, 0);
+    sourceCanvas = c;
+    sourceData = imageData;
+    sourceImage = null;
     _cache.key = '';
     return { width: imageData.width, height: imageData.height };
   }
@@ -553,7 +565,7 @@ const DitherEngine = (() => {
   }
 
   return {
-    loadImage, getSourceSize, bake, process, exportFullSize, exportWithOptions,
+    loadImage, getSourceSize, bake, bakeImageData, process, exportFullSize, exportWithOptions,
     hexToRgb, rgbToHex, clampByte,
     getPalettePresets, getPalette, extractPalette, medianCut, nearestColor
   };

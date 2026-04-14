@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=10">
+  <link rel="stylesheet" href="style.css?v=11">
 </head>
 <body>
   <div id="app">
@@ -12,6 +12,7 @@
       <div class="tab-group">
         <button class="tab-btn active" data-tab="dither">DITHER</button>
         <button class="tab-btn" data-tab="grain">GRAIN</button>
+        <button class="tab-btn" data-tab="paintstroke">PAINTSTROKE</button>
       </div>
       <div class="header-actions">
         <button id="btn-randomize-all" class="btn-fun" title="Randomize everything">Shuffle</button>
@@ -265,291 +266,131 @@
           <!-- ═══ GRAIN TAB ═══ -->
           <div id="tab-grain" class="tab-content" style="display:none;">
 
-            <!-- GRAIN TYPE -->
             <div class="sidebar-section">
-              <div class="section-header"><h2>Grain Type</h2></div>
-              <div class="param-group">
-                <select id="grain-type">
-                  <optgroup label="Film">
-                    <option value="fine-film">Fine Film (35mm)</option>
-                    <option value="medium-film">Medium Film (Super 16)</option>
-                    <option value="coarse-film">Coarse Film (8mm)</option>
-                    <option value="tri-x">Kodak Tri-X 400</option>
-                    <option value="hp5">Ilford HP5+</option>
-                    <option value="tmax">Kodak T-Max 3200</option>
-                    <option value="portra">Kodak Portra 400</option>
-                    <option value="cinestill">CineStill 800T</option>
-                    <option value="delta3200">Ilford Delta 3200</option>
-                    <option value="ektar">Kodak Ektar 100</option>
-                  </optgroup>
-                  <optgroup label="Digital Noise">
-                    <option value="gaussian">Gaussian Noise</option>
-                    <option value="uniform">Uniform Noise</option>
-                    <option value="salt-pepper">Salt &amp; Pepper</option>
-                    <option value="poisson">Poisson (Shot Noise)</option>
-                    <option value="speckle">Speckle</option>
-                    <option value="laplacian">Laplacian Noise</option>
-                  </optgroup>
-                  <optgroup label="Organic / Procedural">
-                    <option value="perlin">Perlin Noise</option>
-                    <option value="simplex">Simplex Noise</option>
-                    <option value="worley">Worley (Cellular)</option>
-                    <option value="fbm">Fractal Brownian Motion</option>
-                    <option value="turbulence">Turbulence</option>
-                    <option value="ridged">Ridged Multifractal</option>
-                    <option value="voronoi-crack">Voronoi Cracks</option>
-                  </optgroup>
-                  <optgroup label="Textured">
-                    <option value="paper">Paper Texture</option>
-                    <option value="canvas-tex">Canvas Weave</option>
-                    <option value="linen">Linen</option>
-                    <option value="concrete">Concrete</option>
-                    <option value="sandstone">Sandstone</option>
-                    <option value="brushstroke">Brushstroke</option>
-                  </optgroup>
-                  <optgroup label="Photographic">
-                    <option value="iso-low">Low ISO (100-200)</option>
-                    <option value="iso-mid">Mid ISO (800-1600)</option>
-                    <option value="iso-high">High ISO (3200-6400)</option>
-                    <option value="iso-extreme">Extreme ISO (12800+)</option>
-                    <option value="chromatic">Chromatic Noise</option>
-                    <option value="luminance-noise">Luminance Noise</option>
-                  </optgroup>
-                </select>
+              <div class="section-header">
+                <h2>Grain Types</h2>
+                <button class="btn-dice" id="grain-randomize" title="Randomize grain">Dice</button>
+              </div>
+              <p class="sidebar-hint">Select one or more — they chain in order. Drag to reorder.</p>
+
+              <div class="algo-category" data-cat="grain-film">
+                <div class="algo-category-header">Film</div>
+                <div class="grain-type-list" data-category="film"></div>
+              </div>
+              <div class="algo-category" data-cat="grain-digital">
+                <div class="algo-category-header">Digital Noise</div>
+                <div class="grain-type-list" data-category="digital"></div>
+              </div>
+              <div class="algo-category" data-cat="grain-organic">
+                <div class="algo-category-header">Organic / Procedural</div>
+                <div class="grain-type-list" data-category="organic"></div>
+              </div>
+              <div class="algo-category" data-cat="grain-textured">
+                <div class="algo-category-header">Textured</div>
+                <div class="grain-type-list" data-category="textured"></div>
+              </div>
+              <div class="algo-category" data-cat="grain-photo">
+                <div class="algo-category-header">Photographic</div>
+                <div class="grain-type-list" data-category="photo"></div>
               </div>
             </div>
 
-            <!-- GRAIN CONTROLS -->
+            <div id="grain-params-container" class="params-container"></div>
+
+          </div><!-- /tab-grain -->
+
+          <!-- ═══ PAINTSTROKE TAB ═══ -->
+          <div id="tab-paintstroke" class="tab-content" style="display:none;">
+
+            <!-- TOOL SELECT -->
             <div class="sidebar-section">
-              <div class="section-header"><h2>Controls</h2>
-                <button class="btn-dice" id="grain-randomize" title="Randomize grain">Dice</button>
+              <div class="section-header"><h2>Tool</h2></div>
+              <div class="paint-tool-grid" id="paint-tool-grid">
+                <button class="paint-tool-btn selected" data-tool="smudge" title="Smudge — drag pixels with decay">Smudge</button>
+                <button class="paint-tool-btn" data-tool="push" title="Push — displace along stroke direction">Push</button>
+                <button class="paint-tool-btn" data-tool="scatter" title="Scatter — random displacement">Scatter</button>
+                <button class="paint-tool-btn" data-tool="swirl" title="Swirl — rotate around brush center">Swirl</button>
+                <button class="paint-tool-btn" data-tool="liquify" title="Liquify — smooth forward warp">Liquify</button>
+                <button class="paint-tool-btn" data-tool="blend" title="Blend — soften/blur within brush">Blend</button>
+                <button class="paint-tool-btn" data-tool="spread" title="Spread — directional stretch">Spread</button>
               </div>
-              <div class="param-group">
-                <span class="param-label">Amount</span>
-                <div class="slider-row">
-                  <input type="range" id="grain-amount" min="0" max="100" value="30" step="1">
-                  <span class="param-value" data-for="grain-amount">30</span>
+            </div>
+
+            <!-- BRUSH -->
+            <div class="sidebar-section">
+              <div class="section-header"><h2>Brush</h2></div>
+              <div class="brush-preview-row">
+                <canvas id="brush-preview" width="48" height="48"></canvas>
+                <button id="btn-upload-brush" class="btn-small">Upload Brush</button>
+              </div>
+              <div id="brush-library" class="brush-library-grid"></div>
+              <div id="brush-upload-settings" style="display:none;">
+                <div class="param-group">
+                  <span class="param-label">Threshold</span>
+                  <div class="slider-row">
+                    <input type="range" id="brush-threshold" min="0" max="100" value="50" step="1">
+                    <span class="param-value" data-for="brush-threshold">50</span>
+                  </div>
+                </div>
+                <div class="param-group">
+                  <span class="param-label">Softness</span>
+                  <div class="slider-row">
+                    <input type="range" id="brush-softness" min="0" max="100" value="30" step="1">
+                    <span class="param-value" data-for="brush-softness">30</span>
+                  </div>
                 </div>
               </div>
+            </div>
+
+            <!-- STROKE SETTINGS -->
+            <div class="sidebar-section">
+              <div class="section-header"><h2>Stroke</h2></div>
               <div class="param-group">
                 <span class="param-label">Size</span>
                 <div class="slider-row">
-                  <input type="range" id="grain-size" min="0.5" max="8" value="1" step="0.1">
-                  <span class="param-value" data-for="grain-size">1.0</span>
+                  <input type="range" id="paint-size" min="1" max="200" value="30" step="1">
+                  <span class="param-value" data-for="paint-size">30</span>
                 </div>
               </div>
               <div class="param-group">
-                <span class="param-label">Roughness</span>
+                <span class="param-label">Spacing</span>
                 <div class="slider-row">
-                  <input type="range" id="grain-roughness" min="0" max="100" value="50" step="1">
-                  <span class="param-value" data-for="grain-roughness">50</span>
+                  <input type="range" id="paint-spacing" min="1" max="200" value="25" step="1">
+                  <span class="param-value" data-for="paint-spacing">25</span>
                 </div>
               </div>
               <div class="param-group">
-                <span class="param-label">Intensity Variance</span>
+                <span class="param-label">Strength</span>
                 <div class="slider-row">
-                  <input type="range" id="grain-variance" min="0" max="100" value="50" step="1">
-                  <span class="param-value" data-for="grain-variance">50</span>
+                  <input type="range" id="paint-strength" min="0" max="100" value="50" step="1">
+                  <span class="param-value" data-for="paint-strength">50</span>
                 </div>
-              </div>
-              <div class="param-group">
-                <span class="param-label">Softness</span>
-                <div class="slider-row">
-                  <input type="range" id="grain-softness" min="0" max="100" value="0" step="1">
-                  <span class="param-value" data-for="grain-softness">0</span>
-                </div>
-              </div>
-              <div class="param-group">
-                <label>
-                  <span class="param-label">Seed</span>
-                </label>
-                <div class="seed-row">
-                  <input type="number" id="grain-seed" class="seed-input" value="42" min="1" max="999999">
-                  <label class="seed-random-label">
-                    <input type="checkbox" id="grain-seed-random" class="seed-random-check">
-                    <span>Random</span>
-                  </label>
-                </div>
-              </div>
-            </div>
-
-            <!-- HIGH PASS FILTER -->
-            <div class="sidebar-section">
-              <div class="section-header"><h2>High Pass Filter</h2></div>
-              <p class="sidebar-hint">Shapes grain to follow image detail structure.</p>
-              <div class="param-group">
-                <label class="tone-lock-label">
-                  <input type="checkbox" id="grain-highpass-enable">
-                  <span class="tone-lock-chip midtones">Enable</span>
-                </label>
-              </div>
-              <div id="grain-highpass-controls" style="display:none;">
-                <div class="param-group">
-                  <span class="param-label">Radius</span>
-                  <div class="slider-row">
-                    <input type="range" id="grain-highpass-radius" min="1" max="50" value="10" step="1">
-                    <span class="param-value" data-for="grain-highpass-radius">10</span>
-                  </div>
-                </div>
-                <div class="param-group">
-                  <span class="param-label">Strength</span>
-                  <div class="slider-row">
-                    <input type="range" id="grain-highpass-strength" min="0" max="100" value="50" step="1">
-                    <span class="param-value" data-for="grain-highpass-strength">50</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- VALUE MASKING -->
-            <div class="sidebar-section">
-              <div class="section-header"><h2>Value Masking</h2></div>
-              <p class="sidebar-hint">Control grain intensity by tonal range.</p>
-              <div class="param-group">
-                <span class="param-label">Shadows</span>
-                <div class="slider-row">
-                  <input type="range" id="grain-mask-shadows" min="0" max="100" value="100" step="1">
-                  <span class="param-value" data-for="grain-mask-shadows">100</span>
-                </div>
-              </div>
-              <div class="param-group">
-                <span class="param-label">Midtones</span>
-                <div class="slider-row">
-                  <input type="range" id="grain-mask-midtones" min="0" max="100" value="100" step="1">
-                  <span class="param-value" data-for="grain-mask-midtones">100</span>
-                </div>
-              </div>
-              <div class="param-group">
-                <span class="param-label">Highlights</span>
-                <div class="slider-row">
-                  <input type="range" id="grain-mask-highlights" min="0" max="100" value="100" step="1">
-                  <span class="param-value" data-for="grain-mask-highlights">100</span>
-                </div>
-              </div>
-              <div class="param-group">
-                <span class="param-label">Shadow / Mid Boundary</span>
-                <div class="slider-row">
-                  <input type="range" id="grain-mask-shadow-mid" min="20" max="120" value="64" step="1">
-                  <span class="param-value" data-for="grain-mask-shadow-mid">64</span>
-                </div>
-              </div>
-              <div class="param-group">
-                <span class="param-label">Mid / Highlight Boundary</span>
-                <div class="slider-row">
-                  <input type="range" id="grain-mask-mid-highlight" min="130" max="240" value="192" step="1">
-                  <span class="param-value" data-for="grain-mask-mid-highlight">192</span>
-                </div>
-              </div>
-              <div class="param-group">
-                <label class="tone-lock-label">
-                  <input type="checkbox" id="grain-mask-invert">
-                  <span class="tone-lock-chip highlights">Invert Mask</span>
-                </label>
-              </div>
-            </div>
-
-            <!-- COLOR -->
-            <div class="sidebar-section">
-              <div class="section-header"><h2>Grain Color</h2></div>
-              <div class="param-group">
-                <select id="grain-color-mode">
-                  <option value="mono">Monochrome</option>
-                  <option value="color">Color Noise</option>
-                  <option value="channel">Per-Channel</option>
-                  <option value="tinted">Tinted</option>
-                </select>
-              </div>
-              <div id="grain-color-controls" style="display:none;">
-                <div class="param-group">
-                  <span class="param-label">Red Amount</span>
-                  <div class="slider-row">
-                    <input type="range" id="grain-color-r" min="0" max="100" value="100" step="1">
-                    <span class="param-value" data-for="grain-color-r">100</span>
-                  </div>
-                </div>
-                <div class="param-group">
-                  <span class="param-label">Green Amount</span>
-                  <div class="slider-row">
-                    <input type="range" id="grain-color-g" min="0" max="100" value="100" step="1">
-                    <span class="param-value" data-for="grain-color-g">100</span>
-                  </div>
-                </div>
-                <div class="param-group">
-                  <span class="param-label">Blue Amount</span>
-                  <div class="slider-row">
-                    <input type="range" id="grain-color-b" min="0" max="100" value="100" step="1">
-                    <span class="param-value" data-for="grain-color-b">100</span>
-                  </div>
-                </div>
-              </div>
-              <div id="grain-tint-controls" style="display:none;">
-                <div class="param-group">
-                  <span class="param-label">Tint Color</span>
-                  <div class="color-pair">
-                    <input type="color" id="grain-tint-color" value="#8b7355" title="Grain tint">
-                  </div>
-                </div>
-                <div class="param-group">
-                  <span class="param-label">Tint Strength</span>
-                  <div class="slider-row">
-                    <input type="range" id="grain-tint-strength" min="0" max="100" value="50" step="1">
-                    <span class="param-value" data-for="grain-tint-strength">50</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- BLENDING -->
-            <div class="sidebar-section">
-              <div class="section-header"><h2>Blending</h2></div>
-              <div class="param-group">
-                <select id="grain-blend-mode">
-                  <optgroup label="Normal">
-                    <option value="normal">Normal</option>
-                    <option value="dissolve">Dissolve</option>
-                  </optgroup>
-                  <optgroup label="Darken">
-                    <option value="multiply">Multiply</option>
-                    <option value="darken">Darken</option>
-                    <option value="color-burn">Color Burn</option>
-                    <option value="linear-burn">Linear Burn</option>
-                  </optgroup>
-                  <optgroup label="Lighten">
-                    <option value="screen">Screen</option>
-                    <option value="lighten">Lighten</option>
-                    <option value="color-dodge">Color Dodge</option>
-                    <option value="linear-dodge">Linear Dodge (Add)</option>
-                  </optgroup>
-                  <optgroup label="Contrast">
-                    <option value="overlay" selected>Overlay</option>
-                    <option value="soft-light">Soft Light</option>
-                    <option value="hard-light">Hard Light</option>
-                    <option value="vivid-light">Vivid Light</option>
-                    <option value="linear-light">Linear Light</option>
-                    <option value="pin-light">Pin Light</option>
-                    <option value="hard-mix">Hard Mix</option>
-                  </optgroup>
-                  <optgroup label="Inversion">
-                    <option value="difference">Difference</option>
-                    <option value="exclusion">Exclusion</option>
-                    <option value="subtract">Subtract</option>
-                    <option value="divide">Divide</option>
-                  </optgroup>
-                  <optgroup label="Component">
-                    <option value="luminosity">Luminosity</option>
-                  </optgroup>
-                </select>
               </div>
               <div class="param-group">
                 <span class="param-label">Opacity</span>
                 <div class="slider-row">
-                  <input type="range" id="grain-opacity" min="0" max="100" value="100" step="1">
-                  <span class="param-value" data-for="grain-opacity">100</span>
+                  <input type="range" id="paint-opacity" min="0" max="100" value="100" step="1">
+                  <span class="param-value" data-for="paint-opacity">100</span>
                 </div>
               </div>
             </div>
 
-          </div><!-- /tab-grain -->
+            <!-- TOOL OPTIONS (dynamic per tool) -->
+            <div class="sidebar-section" id="paint-tool-options">
+              <div class="section-header"><h2>Tool Options</h2></div>
+              <div id="paint-tool-params"></div>
+            </div>
+
+            <!-- ACTIONS -->
+            <div class="sidebar-section">
+              <div class="section-header"><h2>Actions</h2></div>
+              <div class="param-group">
+                <button id="btn-clear-strokes" class="btn-small" disabled>Clear All Strokes</button>
+                <span id="stroke-count" class="param-label" style="margin-left:8px;">0 strokes</span>
+              </div>
+            </div>
+
+          </div><!-- /tab-paintstroke -->
 
         </aside>
       </div>
@@ -557,6 +398,10 @@
   </div>
 
   <input type="file" id="file-input" accept="image/*" hidden>
+  <input type="file" id="brush-file-input" accept="image/*" hidden>
+
+  <!-- Brush cursor overlay -->
+  <div id="brush-cursor" class="brush-cursor"></div>
 
   <!-- Export Modal -->
   <div id="export-modal" class="modal-overlay hidden">
@@ -646,9 +491,10 @@
     </div>
   </div>
 
-  <script src="dither.js?v=10"></script>
-  <script src="engine.js?v=10"></script>
-  <script src="grain.js?v=10"></script>
-  <script src="app.js?v=10"></script>
+  <script src="dither.js?v=11"></script>
+  <script src="engine.js?v=11"></script>
+  <script src="grain.js?v=11"></script>
+  <script src="paintstroke.js?v=11"></script>
+  <script src="app.js?v=11"></script>
 </body>
 </html>

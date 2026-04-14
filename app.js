@@ -48,7 +48,8 @@
   function getStateSnapshot() {
     return JSON.stringify({
       selectedAlgorithms: state.selectedAlgorithms,
-      globals: state.globals
+      globals: state.globals,
+      grainLayers: grainLayers
     });
   }
 
@@ -67,6 +68,12 @@
     const data = JSON.parse(json);
     state.selectedAlgorithms = data.selectedAlgorithms;
     state.globals = data.globals;
+    if (data.grainLayers) {
+      grainLayers.length = 0;
+      grainLayers.push(...data.grainLayers);
+      updateGrainUI();
+      buildGrainParamPanels();
+    }
     lastSnapshot = json;
     // Sync UI
     syncUIFromState();
@@ -129,10 +136,40 @@
 
   // Keyboard shortcuts
   document.addEventListener('keydown', e => {
-    if (e.altKey && e.key === 'z') { e.preventDefault(); undo(); }
+    // Space for temporary pan in paint mode
+    if (e.code === 'Space' && activeTab === 'paintstroke' && !e.repeat) {
+      e.preventDefault();
+      spaceHeld = true;
+      canvasWrapper.style.cursor = '';
+      if (brushCursor) brushCursor.style.display = 'none';
+    }
+    // Undo: if paint strokes exist, undo stroke first; else undo param change
+    if (e.altKey && e.key === 'z' && !e.shiftKey) {
+      e.preventDefault();
+      if (activeTab === 'paintstroke' && PaintEngine.hasStrokes()) {
+        PaintEngine.undoStroke();
+        updateStrokeCount();
+      } else { undo(); }
+    }
     if (e.altKey && e.shiftKey && e.key === 'Z') { e.preventDefault(); redo(); }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+      e.preventDefault();
+      if (activeTab === 'paintstroke' && PaintEngine.hasStrokes()) {
+        PaintEngine.undoStroke();
+        updateStrokeCount();
+      } else { undo(); }
+    }
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'z') { e.preventDefault(); redo(); }
+  });
+
+  document.addEventListener('keyup', e => {
+    if (e.code === 'Space') {
+      spaceHeld = false;
+      if (activeTab === 'paintstroke') {
+        canvasWrapper.style.cursor = 'none';
+        if (brushCursor) brushCursor.style.display = '';
+      }
+    }
   });
 
   // ── Debounced processing ──
@@ -178,14 +215,19 @@
     requestAnimationFrame(() => {
       let result = DitherEngine.process(buildPipeline(), buildGlobals(), PREVIEW_MAX);
       if (result) {
-        // Apply grain if amount > 0
-        if (grainState.amount > 0) {
-          result = GrainEngine.applyGrain(result, buildGrainOpts());
+        // Apply grain layers
+        if (grainLayers.length > 0) {
+          result = GrainEngine.applyGrainLayers(result, buildAllGrainOpts());
         }
         canvas.width = result.width;
         canvas.height = result.height;
         ctx.putImageData(result, 0, 0);
         updateCanvasTransform();
+        // Clear paint strokes since the base image changed
+        if (PaintEngine.hasStrokes()) {
+          PaintEngine.clearStrokes();
+          updateStrokeCount();
+        }
       }
       state.processing = false;
       showProcessing(false);
@@ -227,23 +269,58 @@
     runProcess();
   }
 
-  // ── Pan + Zoom ──
+  // ── Pan + Zoom + Paint ──
   let isPanning = false;
+  let isPainting = false;
+  let spaceHeld = false;
   let panStartX = 0, panStartY = 0;
   let panStartPanX = 0, panStartPanY = 0;
 
+  function canvasToImage(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) * (canvas.width / rect.width),
+      y: (clientY - rect.top) * (canvas.height / rect.height)
+    };
+  }
+
   canvasWrapper.addEventListener('mousedown', e => {
     if (e.button !== 0) return;
+    e.preventDefault();
+
+    // Paint mode: paintstroke tab active, Space not held, image loaded
+    if (activeTab === 'paintstroke' && !spaceHeld && DitherEngine.getSourceSize()) {
+      isPainting = true;
+      const pt = canvasToImage(e.clientX, e.clientY);
+      PaintEngine.beginStroke(pt.x, pt.y);
+      return;
+    }
+
+    // Pan mode
     isPanning = true;
     panStartX = e.clientX;
     panStartY = e.clientY;
     panStartPanX = state.panX;
     panStartPanY = state.panY;
     canvasWrapper.classList.add('panning');
-    e.preventDefault();
   });
 
   document.addEventListener('mousemove', e => {
+    // Update brush cursor position
+    if (activeTab === 'paintstroke' && brushCursor) {
+      brushCursor.style.left = e.clientX + 'px';
+      brushCursor.style.top = e.clientY + 'px';
+      const cursorSize = PaintEngine.getSettings().size * state.zoom;
+      brushCursor.style.width = cursorSize + 'px';
+      brushCursor.style.height = cursorSize + 'px';
+    }
+
+    if (isPainting) {
+      const pt = canvasToImage(e.clientX, e.clientY);
+      PaintEngine.continueStroke(pt.x, pt.y);
+      return;
+    }
+
     if (!isPanning) return;
     state.panX = panStartPanX + (e.clientX - panStartX);
     state.panY = panStartPanY + (e.clientY - panStartY);
@@ -251,6 +328,12 @@
   });
 
   document.addEventListener('mouseup', () => {
+    if (isPainting) {
+      isPainting = false;
+      PaintEngine.endStroke();
+      updateStrokeCount();
+      return;
+    }
     if (isPanning) {
       isPanning = false;
       canvasWrapper.classList.remove('panning');
@@ -1097,7 +1180,7 @@
     const opts = getExportOpts();
     let imageData = DitherEngine.process(buildPipeline(), buildGlobals(), EXPORT_PREVIEW_MAX);
     if (!imageData) return;
-    if (grainState.amount > 0) imageData = GrainEngine.applyGrain(imageData, buildGrainOpts());
+    if (grainLayers.length > 0) imageData = GrainEngine.applyGrainLayers(imageData, buildAllGrainOpts());
 
     const tmp = document.createElement('canvas');
     tmp.width = imageData.width; tmp.height = imageData.height;
@@ -1236,7 +1319,7 @@
     const progressDetail = overlay.querySelector('.export-progress-detail');
 
     const opts = getExportOpts();
-    const gOpts = grainState.amount > 0 ? buildGrainOpts() : null;
+    const gOpts = grainLayers.length > 0 ? buildAllGrainOpts() : null;
     const blob = await DitherEngine.exportWithOptions(buildPipeline(), buildGlobals(), opts, (msg, detail) => {
       progressText.textContent = msg;
       progressDetail.textContent = detail || '';
@@ -1268,18 +1351,27 @@
   // ── Bake ──
   $('btn-bake').addEventListener('click', () => {
     pushUndo();
-    const result = DitherEngine.bake(buildPipeline(), buildGlobals(), grainState.amount > 0 ? buildGrainOpts() : null);
+    let result;
+    if (PaintEngine.hasStrokes()) {
+      // Bake canvas pixels directly (includes paint strokes at preview resolution)
+      result = DitherEngine.bakeImageData(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    } else {
+      result = DitherEngine.bake(buildPipeline(), buildGlobals(), grainLayers.length > 0 ? buildAllGrainOpts() : null);
+    }
     if (result) {
-      $('image-info').textContent = `${result.width} × ${result.height} — baked`;
+      $('image-info').textContent = `${result.width} \u00d7 ${result.height} \u2014 baked`;
       // Reset dither state since edits are now baked in
       state.selectedAlgorithms = [];
       state.globals.brightness = 0;
       state.globals.contrast = 0;
       state.globals.gamma = 1.0;
       // Reset grain
-      grainState.amount = 0;
-      $('grain-amount').value = 0;
-      $('grain-amount').parentElement.querySelector('.param-value').textContent = '0';
+      grainLayers.length = 0;
+      updateGrainUI();
+      buildGrainParamPanels();
+      // Reset paint
+      PaintEngine.clearStrokes();
+      updateStrokeCount();
       syncUIFromState();
       updateAlgorithmUI();
       buildParamPanels();
@@ -1309,6 +1401,7 @@
 
   // ── Tab Switching ──
   let activeTab = 'dither';
+  const brushCursor = $('brush-cursor');
 
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1318,187 +1411,709 @@
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
       $('tab-dither').style.display = tab === 'dither' ? '' : 'none';
       $('tab-grain').style.display = tab === 'grain' ? '' : 'none';
+      $('tab-paintstroke').style.display = tab === 'paintstroke' ? '' : 'none';
+      // Show/hide brush cursor
+      if (brushCursor) brushCursor.style.display = tab === 'paintstroke' ? '' : 'none';
+      // Set canvas cursor
+      canvasWrapper.style.cursor = tab === 'paintstroke' ? 'none' : '';
     });
   });
 
-  // ── Grain State ──
-  const grainState = {
-    type: 'fine-film',
-    amount: 30,
-    size: 1,
-    roughness: 50,
-    variance: 50,
-    softness: 0,
-    seed: 42,
-    seedRandom: false,
-    highPass: { enabled: false, radius: 10, strength: 50 },
-    valueMask: { shadows: 100, midtones: 100, highlights: 100, shadowMid: 64, midHighlight: 192, invert: false },
-    colorMode: 'mono',
-    channelR: 100, channelG: 100, channelB: 100,
-    tintColor: '#8b7355',
-    tintStrength: 50,
-    blendMode: 'overlay',
-    opacity: 100
+  // ── Grain Layers ──
+  const GRAIN_TYPES = {
+    'fine-film': { name: 'Fine Film (35mm)', category: 'film' },
+    'medium-film': { name: 'Medium Film (Super 16)', category: 'film' },
+    'coarse-film': { name: 'Coarse Film (8mm)', category: 'film' },
+    'tri-x': { name: 'Kodak Tri-X 400', category: 'film' },
+    'hp5': { name: 'Ilford HP5+', category: 'film' },
+    'tmax': { name: 'Kodak T-Max 3200', category: 'film' },
+    'portra': { name: 'Kodak Portra 400', category: 'film' },
+    'cinestill': { name: 'CineStill 800T', category: 'film' },
+    'delta3200': { name: 'Ilford Delta 3200', category: 'film' },
+    'ektar': { name: 'Kodak Ektar 100', category: 'film' },
+    'gaussian': { name: 'Gaussian Noise', category: 'digital' },
+    'uniform': { name: 'Uniform Noise', category: 'digital' },
+    'salt-pepper': { name: 'Salt & Pepper', category: 'digital' },
+    'poisson': { name: 'Poisson (Shot Noise)', category: 'digital' },
+    'speckle': { name: 'Speckle', category: 'digital' },
+    'laplacian': { name: 'Laplacian Noise', category: 'digital' },
+    'perlin': { name: 'Perlin Noise', category: 'organic' },
+    'simplex': { name: 'Simplex Noise', category: 'organic' },
+    'worley': { name: 'Worley (Cellular)', category: 'organic' },
+    'fbm': { name: 'Fractal Brownian Motion', category: 'organic' },
+    'turbulence': { name: 'Turbulence', category: 'organic' },
+    'ridged': { name: 'Ridged Multifractal', category: 'organic' },
+    'voronoi-crack': { name: 'Voronoi Cracks', category: 'organic' },
+    'paper': { name: 'Paper Texture', category: 'textured' },
+    'canvas-tex': { name: 'Canvas Weave', category: 'textured' },
+    'linen': { name: 'Linen', category: 'textured' },
+    'concrete': { name: 'Concrete', category: 'textured' },
+    'sandstone': { name: 'Sandstone', category: 'textured' },
+    'brushstroke': { name: 'Brushstroke', category: 'textured' },
+    'iso-low': { name: 'Low ISO (100-200)', category: 'photo' },
+    'iso-mid': { name: 'Mid ISO (800-1600)', category: 'photo' },
+    'iso-high': { name: 'High ISO (3200-6400)', category: 'photo' },
+    'iso-extreme': { name: 'Extreme ISO (12800+)', category: 'photo' },
+    'chromatic': { name: 'Chromatic Noise', category: 'photo' },
+    'luminance-noise': { name: 'Luminance Noise', category: 'photo' }
   };
 
-  function buildGrainOpts() {
-    const tintHex = grainState.tintColor;
-    const tr = parseInt(tintHex.slice(1, 3), 16);
-    const tg = parseInt(tintHex.slice(3, 5), 16);
-    const tb = parseInt(tintHex.slice(5, 7), 16);
+  const grainLayers = [];
+
+  function defaultGrainParams() {
     return {
-      type: grainState.type,
-      amount: grainState.amount,
-      size: grainState.size,
-      roughness: grainState.roughness,
-      variance: grainState.variance,
-      softness: grainState.softness,
-      seed: grainState.seed,
-      highPass: grainState.highPass,
-      valueMask: grainState.valueMask,
-      colorMode: grainState.colorMode,
-      channelR: grainState.channelR,
-      channelG: grainState.channelG,
-      channelB: grainState.channelB,
-      tintColor: [tr, tg, tb],
-      tintStrength: grainState.tintStrength,
-      blendMode: grainState.blendMode,
-      opacity: grainState.opacity
+      amount: 30, size: 1, roughness: 50, variance: 50, softness: 0,
+      seed: 42, seedRandom: false,
+      highPass: { enabled: false, radius: 10, strength: 50 },
+      valueMask: { shadows: 100, midtones: 100, highlights: 100, shadowMid: 64, midHighlight: 192, invert: false },
+      colorMode: 'mono', channelR: 100, channelG: 100, channelB: 100,
+      tintColor: '#8b7355', tintStrength: 50,
+      blendMode: 'overlay', opacity: 100
     };
   }
 
-  // ── Grain Slider Helpers ──
-  function grainSlider(id, stateProp, onChange) {
+  function buildGrainLayerOpts(layer) {
+    const p = layer.params;
+    const h = p.tintColor;
+    const tr = parseInt(h.slice(1, 3), 16), tg = parseInt(h.slice(3, 5), 16), tb = parseInt(h.slice(5, 7), 16);
+    return {
+      type: layer.id, amount: p.amount, size: p.size, roughness: p.roughness,
+      variance: p.variance, softness: p.softness, seed: p.seed,
+      highPass: p.highPass, valueMask: p.valueMask,
+      colorMode: p.colorMode, channelR: p.channelR, channelG: p.channelG, channelB: p.channelB,
+      tintColor: [tr, tg, tb], tintStrength: p.tintStrength,
+      blendMode: p.blendMode, opacity: p.opacity
+    };
+  }
+
+  function buildAllGrainOpts() {
+    return grainLayers.map(buildGrainLayerOpts);
+  }
+
+  // ── Grain Type List ──
+  function buildGrainList() {
+    const categories = ['film', 'digital', 'organic', 'textured', 'photo'];
+    for (const cat of categories) {
+      const container = document.querySelector(`.grain-type-list[data-category="${cat}"]`);
+      if (!container) continue;
+      container.innerHTML = '';
+      const types = Object.entries(GRAIN_TYPES).filter(([, t]) => t.category === cat);
+      for (const [id, info] of types) {
+        const item = document.createElement('div');
+        item.className = 'algo-item';
+        item.dataset.grainId = id;
+        item.draggable = true;
+        item.innerHTML = `
+          <div class="algo-checkbox">
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="#0a0a0a" stroke-width="2.5">
+              <polyline points="2 6 5 9 10 3"/>
+            </svg>
+          </div>
+          <span class="algo-name">${info.name}</span>
+          <span class="algo-order"></span>
+          <span class="algo-drag">\u2801\u2802\u2804</span>
+        `;
+        item.addEventListener('click', () => toggleGrainType(id));
+        item.addEventListener('dragstart', onGrainDragStart);
+        item.addEventListener('dragover', onGrainDragOver);
+        item.addEventListener('drop', onGrainDrop);
+        item.addEventListener('dragend', onGrainDragEnd);
+        container.appendChild(item);
+      }
+    }
+  }
+
+  let grainDragSrcId = null;
+  function onGrainDragStart(e) { grainDragSrcId = this.dataset.grainId; e.dataTransfer.effectAllowed = 'move'; this.style.opacity = '0.4'; }
+  function onGrainDragOver(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }
+  function onGrainDrop(e) {
+    e.preventDefault();
+    const tgt = this.dataset.grainId;
+    if (grainDragSrcId && grainDragSrcId !== tgt) {
+      const si = grainLayers.findIndex(l => l.id === grainDragSrcId);
+      const ti = grainLayers.findIndex(l => l.id === tgt);
+      if (si !== -1 && ti !== -1) {
+        const [item] = grainLayers.splice(si, 1);
+        grainLayers.splice(ti, 0, item);
+        updateGrainUI();
+        buildGrainParamPanels();
+        scheduleProcess();
+      }
+    }
+  }
+  function onGrainDragEnd() { this.style.opacity = ''; grainDragSrcId = null; }
+
+  function toggleGrainType(id) {
+    const idx = grainLayers.findIndex(l => l.id === id);
+    if (idx !== -1) {
+      grainLayers.splice(idx, 1);
+    } else {
+      grainLayers.push({ id, params: defaultGrainParams() });
+    }
+    updateGrainUI();
+    buildGrainParamPanels();
+    scheduleProcess();
+  }
+
+  function updateGrainUI() {
+    document.querySelectorAll('.grain-type-list .algo-item').forEach(item => {
+      const id = item.dataset.grainId;
+      const si = grainLayers.findIndex(l => l.id === id);
+      item.classList.toggle('selected', si !== -1);
+      item.querySelector('.algo-order').textContent = si !== -1 ? `#${si + 1}` : '';
+    });
+  }
+
+  // ── Grain Param Panels ──
+  const BLEND_MODE_OPTS = [
+    { group: 'Normal', modes: [['normal','Normal'],['dissolve','Dissolve']] },
+    { group: 'Darken', modes: [['multiply','Multiply'],['darken','Darken'],['color-burn','Color Burn'],['linear-burn','Linear Burn']] },
+    { group: 'Lighten', modes: [['screen','Screen'],['lighten','Lighten'],['color-dodge','Color Dodge'],['linear-dodge','Linear Dodge (Add)']] },
+    { group: 'Contrast', modes: [['overlay','Overlay'],['soft-light','Soft Light'],['hard-light','Hard Light'],['vivid-light','Vivid Light'],['linear-light','Linear Light'],['pin-light','Pin Light'],['hard-mix','Hard Mix']] },
+    { group: 'Inversion', modes: [['difference','Difference'],['exclusion','Exclusion'],['subtract','Subtract'],['divide','Divide']] },
+    { group: 'Component', modes: [['luminosity','Luminosity']] }
+  ];
+
+  function buildGrainParamPanels() {
+    const container = $('grain-params-container');
+    container.innerHTML = '';
+
+    for (const layer of grainLayers) {
+      const info = GRAIN_TYPES[layer.id];
+      const p = layer.params;
+      const section = document.createElement('div');
+      section.className = 'param-section';
+
+      const blendOpts = BLEND_MODE_OPTS.map(g =>
+        `<optgroup label="${g.group}">${g.modes.map(([v,l]) =>
+          `<option value="${v}"${p.blendMode===v?' selected':''}>${l}</option>`).join('')}</optgroup>`
+      ).join('');
+
+      const colorOpts = [['mono','Monochrome'],['color','Color Noise'],['channel','Per-Channel'],['tinted','Tinted']]
+        .map(([v,l]) => `<option value="${v}"${p.colorMode===v?' selected':''}>${l}</option>`).join('');
+
+      const advOpen = p._advancedOpen || false;
+
+      let html = `
+        <div class="param-section-header">
+          <span class="param-section-title">${info.name}</span>
+          <div class="param-section-actions">
+            <button class="param-section-btn btn-randomize-grain" data-grain-id="${layer.id}" title="Randomize">Dice</button>
+            <button class="param-section-btn btn-remove-grain" data-grain-id="${layer.id}" title="Remove">\u2715</button>
+          </div>
+        </div>
+        <div class="param-group">
+          <span class="param-label">Amount</span>
+          <div class="slider-row">
+            <input type="range" data-grain="${layer.id}" data-gparam="amount" min="0" max="100" step="1" value="${p.amount}">
+            <span class="param-value">${p.amount}</span>
+          </div>
+        </div>
+        <div class="param-group">
+          <span class="param-label">Size</span>
+          <div class="slider-row">
+            <input type="range" data-grain="${layer.id}" data-gparam="size" min="0.5" max="8" step="0.1" value="${p.size}">
+            <span class="param-value">${p.size}</span>
+          </div>
+        </div>
+        <div class="param-group">
+          <span class="param-label">Blend Mode</span>
+          <select data-grain="${layer.id}" data-gparam="blendMode">${blendOpts}</select>
+        </div>
+        <div class="param-group">
+          <span class="param-label">Opacity</span>
+          <div class="slider-row">
+            <input type="range" data-grain="${layer.id}" data-gparam="opacity" min="0" max="100" step="1" value="${p.opacity}">
+            <span class="param-value">${p.opacity}</span>
+          </div>
+        </div>
+        <div class="param-group">
+          <button class="btn-advanced-toggle" data-grain-adv="${layer.id}" title="More options">
+            <span class="advanced-arrow ${advOpen ? 'open' : ''}"></span> Advanced
+          </button>
+        </div>
+        <div class="advanced-controls ${advOpen ? '' : 'hidden'}" data-grain-advanced-for="${layer.id}">
+          <div class="param-group">
+            <span class="param-label">Roughness</span>
+            <div class="slider-row">
+              <input type="range" data-grain="${layer.id}" data-gparam="roughness" min="0" max="100" step="1" value="${p.roughness}">
+              <span class="param-value">${p.roughness}</span>
+            </div>
+          </div>
+          <div class="param-group">
+            <span class="param-label">Intensity Variance</span>
+            <div class="slider-row">
+              <input type="range" data-grain="${layer.id}" data-gparam="variance" min="0" max="100" step="1" value="${p.variance}">
+              <span class="param-value">${p.variance}</span>
+            </div>
+          </div>
+          <div class="param-group">
+            <span class="param-label">Softness</span>
+            <div class="slider-row">
+              <input type="range" data-grain="${layer.id}" data-gparam="softness" min="0" max="100" step="1" value="${p.softness}">
+              <span class="param-value">${p.softness}</span>
+            </div>
+          </div>
+          <div class="param-group seed-group">
+            <span class="param-label">Seed</span>
+            <div class="seed-row">
+              <input type="number" class="seed-input" data-grain-seed="${layer.id}" value="${p.seed}" min="1" max="999999" ${p.seedRandom ? 'disabled' : ''}>
+              <label class="seed-random-label" title="Random seed each render">
+                <input type="checkbox" class="seed-random-check" data-grain-seed-rnd="${layer.id}" ${p.seedRandom ? 'checked' : ''}>
+                <span>Random</span>
+              </label>
+            </div>
+          </div>
+          <div class="param-group" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+            <span class="param-label" style="color:var(--fun); font-weight:600; font-size:10px; text-transform:uppercase; letter-spacing:0.06em;">High Pass Filter</span>
+          </div>
+          <div class="param-group">
+            <label class="slider-row">
+              <input type="checkbox" data-grain-hp="${layer.id}" ${p.highPass.enabled ? 'checked' : ''}>
+              <span class="param-label" style="margin:0 0 0 6px">Enable</span>
+            </label>
+          </div>
+          <div data-grain-hp-controls="${layer.id}" style="display:${p.highPass.enabled ? '' : 'none'}">
+            <div class="param-group">
+              <span class="param-label">Radius</span>
+              <div class="slider-row">
+                <input type="range" data-grain="${layer.id}" data-gparam="highPass.radius" min="1" max="50" step="1" value="${p.highPass.radius}">
+                <span class="param-value">${p.highPass.radius}</span>
+              </div>
+            </div>
+            <div class="param-group">
+              <span class="param-label">Strength</span>
+              <div class="slider-row">
+                <input type="range" data-grain="${layer.id}" data-gparam="highPass.strength" min="0" max="100" step="1" value="${p.highPass.strength}">
+                <span class="param-value">${p.highPass.strength}</span>
+              </div>
+            </div>
+          </div>
+          <div class="param-group" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+            <span class="param-label" style="color:var(--fun); font-weight:600; font-size:10px; text-transform:uppercase; letter-spacing:0.06em;">Value Masking</span>
+          </div>
+          <div class="param-group">
+            <span class="param-label">Shadows</span>
+            <div class="slider-row">
+              <input type="range" data-grain="${layer.id}" data-gparam="valueMask.shadows" min="0" max="100" step="1" value="${p.valueMask.shadows}">
+              <span class="param-value">${p.valueMask.shadows}</span>
+            </div>
+          </div>
+          <div class="param-group">
+            <span class="param-label">Midtones</span>
+            <div class="slider-row">
+              <input type="range" data-grain="${layer.id}" data-gparam="valueMask.midtones" min="0" max="100" step="1" value="${p.valueMask.midtones}">
+              <span class="param-value">${p.valueMask.midtones}</span>
+            </div>
+          </div>
+          <div class="param-group">
+            <span class="param-label">Highlights</span>
+            <div class="slider-row">
+              <input type="range" data-grain="${layer.id}" data-gparam="valueMask.highlights" min="0" max="100" step="1" value="${p.valueMask.highlights}">
+              <span class="param-value">${p.valueMask.highlights}</span>
+            </div>
+          </div>
+          <div class="param-group">
+            <span class="param-label">Shadow / Mid Boundary</span>
+            <div class="slider-row">
+              <input type="range" data-grain="${layer.id}" data-gparam="valueMask.shadowMid" min="20" max="120" step="1" value="${p.valueMask.shadowMid}">
+              <span class="param-value">${p.valueMask.shadowMid}</span>
+            </div>
+          </div>
+          <div class="param-group">
+            <span class="param-label">Mid / Highlight Boundary</span>
+            <div class="slider-row">
+              <input type="range" data-grain="${layer.id}" data-gparam="valueMask.midHighlight" min="130" max="240" step="1" value="${p.valueMask.midHighlight}">
+              <span class="param-value">${p.valueMask.midHighlight}</span>
+            </div>
+          </div>
+          <div class="param-group">
+            <label class="slider-row">
+              <input type="checkbox" data-grain-mask-inv="${layer.id}" ${p.valueMask.invert ? 'checked' : ''}>
+              <span class="param-label" style="margin:0 0 0 6px">Invert Mask</span>
+            </label>
+          </div>
+          <div class="param-group" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border);">
+            <span class="param-label" style="color:var(--fun); font-weight:600; font-size:10px; text-transform:uppercase; letter-spacing:0.06em;">Grain Color</span>
+          </div>
+          <div class="param-group">
+            <select data-grain-color-mode="${layer.id}">${colorOpts}</select>
+          </div>
+          <div data-grain-color-ch="${layer.id}" style="display:${(p.colorMode === 'channel' || p.colorMode === 'color') ? '' : 'none'}">
+            <div class="param-group">
+              <span class="param-label">Red</span>
+              <div class="slider-row">
+                <input type="range" data-grain="${layer.id}" data-gparam="channelR" min="0" max="100" step="1" value="${p.channelR}">
+                <span class="param-value">${p.channelR}</span>
+              </div>
+            </div>
+            <div class="param-group">
+              <span class="param-label">Green</span>
+              <div class="slider-row">
+                <input type="range" data-grain="${layer.id}" data-gparam="channelG" min="0" max="100" step="1" value="${p.channelG}">
+                <span class="param-value">${p.channelG}</span>
+              </div>
+            </div>
+            <div class="param-group">
+              <span class="param-label">Blue</span>
+              <div class="slider-row">
+                <input type="range" data-grain="${layer.id}" data-gparam="channelB" min="0" max="100" step="1" value="${p.channelB}">
+                <span class="param-value">${p.channelB}</span>
+              </div>
+            </div>
+          </div>
+          <div data-grain-color-tint="${layer.id}" style="display:${p.colorMode === 'tinted' ? '' : 'none'}">
+            <div class="param-group">
+              <span class="param-label">Tint Color</span>
+              <div class="color-pair">
+                <input type="color" data-grain-tint="${layer.id}" value="${p.tintColor}" title="Grain tint">
+              </div>
+            </div>
+            <div class="param-group">
+              <span class="param-label">Tint Strength</span>
+              <div class="slider-row">
+                <input type="range" data-grain="${layer.id}" data-gparam="tintStrength" min="0" max="100" step="1" value="${p.tintStrength}">
+                <span class="param-value">${p.tintStrength}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+
+      section.innerHTML = html;
+      container.appendChild(section);
+
+      // ── Wire Events ──
+      section.querySelector('.btn-remove-grain').addEventListener('click', () => toggleGrainType(layer.id));
+      section.querySelector('.btn-randomize-grain').addEventListener('click', () => randomizeGrainLayer(layer.id));
+
+      // Range sliders
+      section.querySelectorAll('input[type="range"][data-grain]').forEach(input => {
+        input.addEventListener('input', () => {
+          const l = grainLayers.find(g => g.id === input.dataset.grain);
+          if (!l) return;
+          const param = input.dataset.gparam;
+          const v = parseFloat(input.value);
+          if (param.includes('.')) {
+            const [obj, key] = param.split('.');
+            l.params[obj][key] = v;
+          } else {
+            l.params[param] = v;
+          }
+          input.closest('.slider-row').querySelector('.param-value').textContent = Number.isInteger(v) ? v : v.toFixed(1);
+          scheduleProcess();
+        });
+      });
+
+      // Blend mode select
+      section.querySelectorAll('select[data-gparam="blendMode"]').forEach(sel => {
+        sel.addEventListener('change', () => {
+          const l = grainLayers.find(g => g.id === sel.dataset.grain);
+          if (l) l.params.blendMode = sel.value;
+          scheduleProcess();
+        });
+      });
+
+      // Advanced toggle
+      section.querySelectorAll('[data-grain-adv]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const gid = btn.dataset.grainAdv;
+          const panel = section.querySelector(`[data-grain-advanced-for="${gid}"]`);
+          const arrow = btn.querySelector('.advanced-arrow');
+          const l = grainLayers.find(g => g.id === gid);
+          if (panel) {
+            const isOpen = !panel.classList.contains('hidden');
+            panel.classList.toggle('hidden', isOpen);
+            arrow.classList.toggle('open', !isOpen);
+            if (l) l.params._advancedOpen = !isOpen;
+          }
+        });
+      });
+
+      // High pass toggle
+      section.querySelectorAll('[data-grain-hp]').forEach(chk => {
+        chk.addEventListener('change', () => {
+          const l = grainLayers.find(g => g.id === chk.dataset.grainHp);
+          if (l) {
+            l.params.highPass.enabled = chk.checked;
+            const ctrl = section.querySelector(`[data-grain-hp-controls="${chk.dataset.grainHp}"]`);
+            if (ctrl) ctrl.style.display = chk.checked ? '' : 'none';
+            scheduleProcess();
+          }
+        });
+      });
+
+      // Value mask invert
+      section.querySelectorAll('[data-grain-mask-inv]').forEach(chk => {
+        chk.addEventListener('change', () => {
+          const l = grainLayers.find(g => g.id === chk.dataset.grainMaskInv);
+          if (l) { l.params.valueMask.invert = chk.checked; scheduleProcess(); }
+        });
+      });
+
+      // Color mode select
+      section.querySelectorAll('[data-grain-color-mode]').forEach(sel => {
+        sel.addEventListener('change', () => {
+          const gid = sel.dataset.grainColorMode;
+          const l = grainLayers.find(g => g.id === gid);
+          if (l) {
+            l.params.colorMode = sel.value;
+            const chCtrl = section.querySelector(`[data-grain-color-ch="${gid}"]`);
+            const tintCtrl = section.querySelector(`[data-grain-color-tint="${gid}"]`);
+            if (chCtrl) chCtrl.style.display = (sel.value === 'channel' || sel.value === 'color') ? '' : 'none';
+            if (tintCtrl) tintCtrl.style.display = sel.value === 'tinted' ? '' : 'none';
+            scheduleProcess();
+          }
+        });
+      });
+
+      // Tint color
+      section.querySelectorAll('[data-grain-tint]').forEach(input => {
+        input.addEventListener('input', () => {
+          const l = grainLayers.find(g => g.id === input.dataset.grainTint);
+          if (l) { l.params.tintColor = input.value; scheduleProcess(); }
+        });
+      });
+
+      // Seed input
+      section.querySelectorAll('[data-grain-seed]').forEach(input => {
+        let timer;
+        input.addEventListener('input', () => {
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            const l = grainLayers.find(g => g.id === input.dataset.grainSeed);
+            if (l) { l.params.seed = parseInt(input.value) || 1; scheduleProcess(); }
+          }, 400);
+        });
+      });
+
+      // Seed random
+      section.querySelectorAll('[data-grain-seed-rnd]').forEach(chk => {
+        chk.addEventListener('change', () => {
+          const gid = chk.dataset.grainSeedRnd;
+          const l = grainLayers.find(g => g.id === gid);
+          const numInput = section.querySelector(`[data-grain-seed="${gid}"]`);
+          if (l) {
+            l.params.seedRandom = chk.checked;
+            if (chk.checked) {
+              const rnd = Math.floor(Math.random() * 999999) + 1;
+              l.params.seed = rnd;
+              if (numInput) { numInput.value = rnd; numInput.disabled = true; }
+            } else if (numInput) { numInput.disabled = false; }
+            scheduleProcess();
+          }
+        });
+      });
+    }
+  }
+
+  function randomizeGrainLayer(id) {
+    const layer = grainLayers.find(l => l.id === id);
+    if (!layer) return;
+    const p = layer.params;
+    p.amount = Math.floor(Math.random() * 80) + 5;
+    p.size = +(Math.random() * 4 + 0.5).toFixed(1);
+    p.roughness = Math.floor(Math.random() * 100);
+    p.variance = Math.floor(Math.random() * 100);
+    p.seed = Math.floor(Math.random() * 999999) + 1;
+    const modes = ['normal','multiply','screen','overlay','soft-light','hard-light','difference','exclusion','linear-light','color-burn','color-dodge'];
+    p.blendMode = modes[Math.floor(Math.random() * modes.length)];
+    p.opacity = Math.floor(Math.random() * 60) + 40;
+    buildGrainParamPanels();
+    scheduleProcess();
+  }
+
+  // Grain randomize — picks 1-3 random grain types
+  if ($('grain-randomize')) {
+    $('grain-randomize').addEventListener('click', () => {
+      const allTypes = Object.keys(GRAIN_TYPES);
+      const count = Math.floor(Math.random() * 3) + 1;
+      const shuffled = [...allTypes].sort(() => Math.random() - 0.5);
+      grainLayers.length = 0;
+      for (let i = 0; i < count; i++) {
+        const params = defaultGrainParams();
+        params.amount = Math.floor(Math.random() * 80) + 5;
+        params.size = +(Math.random() * 4 + 0.5).toFixed(1);
+        params.roughness = Math.floor(Math.random() * 100);
+        params.variance = Math.floor(Math.random() * 100);
+        params.seed = Math.floor(Math.random() * 999999) + 1;
+        const modes = ['normal','multiply','screen','overlay','soft-light','hard-light','difference','exclusion'];
+        params.blendMode = modes[Math.floor(Math.random() * modes.length)];
+        params.opacity = Math.floor(Math.random() * 60) + 40;
+        grainLayers.push({ id: shuffled[i], params });
+      }
+      updateGrainUI();
+      buildGrainParamPanels();
+      scheduleProcess();
+    });
+  }
+
+  // ── Paintstroke UI ──
+  PaintEngine.init(canvas);
+
+  function updateStrokeCount() {
+    const cnt = PaintEngine.getStrokeCount();
+    $('stroke-count').textContent = cnt + ' stroke' + (cnt !== 1 ? 's' : '');
+    $('btn-clear-strokes').disabled = cnt === 0;
+  }
+
+  // Tool selection
+  document.querySelectorAll('.paint-tool-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.paint-tool-btn').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+      PaintEngine.setTool(btn.dataset.tool);
+      buildToolOptions(btn.dataset.tool);
+    });
+  });
+
+  // Stroke sliders
+  function paintSlider(id, setter) {
     const el = $(id);
     if (!el) return;
     el.addEventListener('input', () => {
       const v = parseFloat(el.value);
-      if (stateProp.includes('.')) {
-        const [obj, key] = stateProp.split('.');
-        grainState[obj][key] = v;
-      } else {
-        grainState[stateProp] = v;
-      }
+      setter(v);
       const disp = el.parentElement.querySelector('.param-value');
       if (disp) disp.textContent = Number.isInteger(v) ? v : v.toFixed(1);
-      if (onChange) onChange();
-      scheduleProcess();
     });
   }
 
-  grainSlider('grain-amount', 'amount');
-  grainSlider('grain-size', 'size');
-  grainSlider('grain-roughness', 'roughness');
-  grainSlider('grain-variance', 'variance');
-  grainSlider('grain-softness', 'softness');
-  grainSlider('grain-highpass-radius', 'highPass.radius');
-  grainSlider('grain-highpass-strength', 'highPass.strength');
-  grainSlider('grain-mask-shadows', 'valueMask.shadows');
-  grainSlider('grain-mask-midtones', 'valueMask.midtones');
-  grainSlider('grain-mask-highlights', 'valueMask.highlights');
-  grainSlider('grain-mask-shadow-mid', 'valueMask.shadowMid');
-  grainSlider('grain-mask-mid-highlight', 'valueMask.midHighlight');
-  grainSlider('grain-color-r', 'channelR');
-  grainSlider('grain-color-g', 'channelG');
-  grainSlider('grain-color-b', 'channelB');
-  grainSlider('grain-tint-strength', 'tintStrength');
-  grainSlider('grain-opacity', 'opacity');
+  paintSlider('paint-size', v => PaintEngine.setSize(v));
+  paintSlider('paint-spacing', v => PaintEngine.setSpacing(v));
+  paintSlider('paint-strength', v => PaintEngine.setStrength(v));
+  paintSlider('paint-opacity', v => PaintEngine.setOpacity(v));
 
-  // Grain type select
-  $('grain-type').addEventListener('change', () => {
-    grainState.type = $('grain-type').value;
-    scheduleProcess();
-  });
+  // Tool-specific options panel
+  function buildToolOptions(tool) {
+    const container = $('paint-tool-params');
+    container.innerHTML = '';
+    const toolOpts = {
+      smudge: [{ label: 'Decay', id: 'smudge-decay', min: 0, max: 100, value: PaintEngine.getSettings().smudgeDecay, setter: v => PaintEngine.setSmudgeDecay(v) }],
+      push: [{ label: 'Distance', id: 'push-dist', min: 1, max: 100, value: PaintEngine.getSettings().pushDistance, setter: v => PaintEngine.setPushDistance(v) }],
+      scatter: [{ label: 'Radius', id: 'scatter-rad', min: 1, max: 100, value: PaintEngine.getSettings().scatterRadius, setter: v => PaintEngine.setScatterRadius(v) }],
+      swirl: [{ label: 'Angle', id: 'swirl-angle', min: -360, max: 360, value: PaintEngine.getSettings().swirlAngle, setter: v => PaintEngine.setSwirlAngle(v) }],
+      liquify: [
+        { label: 'Distance', id: 'liq-dist', min: 1, max: 100, value: PaintEngine.getSettings().pushDistance, setter: v => PaintEngine.setPushDistance(v) },
+        { label: 'Smoothness', id: 'liq-smooth', min: 0, max: 2, step: 0.1, value: PaintEngine.getSettings().liquifySmooth, setter: v => PaintEngine.setLiquifySmooth(v) }
+      ],
+      blend: [{ label: 'Kernel', id: 'blend-kern', min: 1, max: 20, value: PaintEngine.getSettings().blendKernel, setter: v => PaintEngine.setBlendKernel(v) }],
+      spread: [{ label: 'Amount', id: 'spread-amt', min: 1, max: 100, value: PaintEngine.getSettings().spreadAmount, setter: v => PaintEngine.setSpreadAmount(v) }]
+    };
 
-  // Grain blend mode select
-  $('grain-blend-mode').addEventListener('change', () => {
-    grainState.blendMode = $('grain-blend-mode').value;
-    scheduleProcess();
-  });
-
-  // Grain color mode select
-  $('grain-color-mode').addEventListener('change', () => {
-    grainState.colorMode = $('grain-color-mode').value;
-    $('grain-color-controls').style.display = (grainState.colorMode === 'channel' || grainState.colorMode === 'color') ? '' : 'none';
-    $('grain-tint-controls').style.display = grainState.colorMode === 'tinted' ? '' : 'none';
-    scheduleProcess();
-  });
-
-  // Grain tint color
-  if ($('grain-tint-color')) {
-    $('grain-tint-color').addEventListener('input', () => {
-      grainState.tintColor = $('grain-tint-color').value;
-      scheduleProcess();
-    });
-  }
-
-  // Grain high pass toggle
-  $('grain-highpass-enable').addEventListener('change', () => {
-    grainState.highPass.enabled = $('grain-highpass-enable').checked;
-    $('grain-highpass-controls').style.display = grainState.highPass.enabled ? '' : 'none';
-    scheduleProcess();
-  });
-
-  // Grain mask invert
-  $('grain-mask-invert').addEventListener('change', () => {
-    grainState.valueMask.invert = $('grain-mask-invert').checked;
-    scheduleProcess();
-  });
-
-  // Grain seed
-  let grainSeedTimer;
-  $('grain-seed').addEventListener('input', () => {
-    clearTimeout(grainSeedTimer);
-    grainSeedTimer = setTimeout(() => {
-      grainState.seed = parseInt($('grain-seed').value) || 1;
-      scheduleProcess();
-    }, 400);
-  });
-
-  $('grain-seed-random').addEventListener('change', () => {
-    const checked = $('grain-seed-random').checked;
-    grainState.seedRandom = checked;
-    $('grain-seed').disabled = checked;
-    if (checked) {
-      grainState.seed = Math.floor(Math.random() * 999999) + 1;
-      $('grain-seed').value = grainState.seed;
-      scheduleProcess();
+    const opts = toolOpts[tool] || [];
+    for (const opt of opts) {
+      const step = opt.step || 1;
+      const dispVal = step < 1 ? parseFloat(opt.value).toFixed(1) : opt.value;
+      container.innerHTML += `
+        <div class="param-group">
+          <span class="param-label">${opt.label}</span>
+          <div class="slider-row">
+            <input type="range" id="tool-opt-${opt.id}" min="${opt.min}" max="${opt.max}" step="${step}" value="${opt.value}">
+            <span class="param-value">${dispVal}</span>
+          </div>
+        </div>
+      `;
     }
+
+    // Wire events after HTML is set
+    for (const opt of opts) {
+      const el = $('tool-opt-' + opt.id);
+      if (el) {
+        el.addEventListener('input', () => {
+          const v = parseFloat(el.value);
+          opt.setter(v);
+          const disp = el.parentElement.querySelector('.param-value');
+          const step = opt.step || 1;
+          if (disp) disp.textContent = step < 1 ? v.toFixed(1) : v;
+        });
+      }
+    }
+  }
+
+  buildToolOptions('smudge');
+
+  // Brush library
+  function buildBrushLibrary() {
+    const container = $('brush-library');
+    container.innerHTML = '';
+    const brushes = PaintEngine.getBrushes();
+    for (const brush of brushes) {
+      const thumb = document.createElement('div');
+      thumb.className = 'brush-thumb' + (brush.selected ? ' selected' : '');
+      thumb.title = brush.name;
+      const dataUrl = PaintEngine.getBrushThumbnail(brush.index, 40);
+      if (dataUrl) thumb.style.backgroundImage = `url(${dataUrl})`;
+      thumb.addEventListener('click', () => {
+        PaintEngine.selectBrush(brush.index);
+        container.querySelectorAll('.brush-thumb').forEach(t => t.classList.remove('selected'));
+        thumb.classList.add('selected');
+        updateBrushPreview();
+      });
+      container.appendChild(thumb);
+    }
+  }
+
+  function updateBrushPreview() {
+    const previewCanvas = $('brush-preview');
+    if (!previewCanvas) return;
+    const idx = PaintEngine.getSelectedBrush();
+    const dataUrl = PaintEngine.getBrushThumbnail(idx, 48);
+    if (dataUrl) {
+      const img = new Image();
+      img.onload = () => {
+        const pctx = previewCanvas.getContext('2d');
+        pctx.clearRect(0, 0, 48, 48);
+        pctx.drawImage(img, 0, 0);
+      };
+      img.src = dataUrl;
+    }
+  }
+
+  buildBrushLibrary();
+  updateBrushPreview();
+
+  // Brush upload
+  const brushFileInput = $('brush-file-input');
+  $('btn-upload-brush').addEventListener('click', () => brushFileInput.click());
+
+  brushFileInput.addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const c = document.createElement('canvas');
+        c.width = img.width; c.height = img.height;
+        const tctx = c.getContext('2d');
+        tctx.drawImage(img, 0, 0);
+        const imgData = tctx.getImageData(0, 0, img.width, img.height);
+        const threshold = parseInt($('brush-threshold')?.value || 50);
+        const softness = parseInt($('brush-softness')?.value || 30);
+        const result = PaintEngine.extractBrushFromImage(imgData, threshold, softness);
+        PaintEngine.addBrush(file.name.replace(/\.[^.]+$/, ''), result.mask, result.size);
+        PaintEngine.selectBrush(PaintEngine.getBrushes().length - 1);
+        buildBrushLibrary();
+        updateBrushPreview();
+        $('brush-upload-settings').style.display = '';
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+    brushFileInput.value = '';
   });
 
-  // Grain randomize button
-  if ($('grain-randomize')) {
-    $('grain-randomize').addEventListener('click', () => {
-      const types = [...$('grain-type').options].map(o => o.value);
-      grainState.type = types[Math.floor(Math.random() * types.length)];
-      grainState.amount = Math.floor(Math.random() * 80) + 5;
-      grainState.size = +(Math.random() * 4 + 0.5).toFixed(1);
-      grainState.roughness = Math.floor(Math.random() * 100);
-      grainState.variance = Math.floor(Math.random() * 100);
-      grainState.seed = Math.floor(Math.random() * 999999) + 1;
-      const modes = ['normal','multiply','screen','overlay','soft-light','hard-light','difference','exclusion','linear-light','color-burn','color-dodge'];
-      grainState.blendMode = modes[Math.floor(Math.random() * modes.length)];
-      grainState.opacity = Math.floor(Math.random() * 60) + 40;
-      // Sync UI
-      $('grain-type').value = grainState.type;
-      $('grain-amount').value = grainState.amount;
-      $('grain-amount').parentElement.querySelector('.param-value').textContent = grainState.amount;
-      $('grain-size').value = grainState.size;
-      $('grain-size').parentElement.querySelector('.param-value').textContent = grainState.size;
-      $('grain-roughness').value = grainState.roughness;
-      $('grain-roughness').parentElement.querySelector('.param-value').textContent = grainState.roughness;
-      $('grain-variance').value = grainState.variance;
-      $('grain-variance').parentElement.querySelector('.param-value').textContent = grainState.variance;
-      $('grain-seed').value = grainState.seed;
-      $('grain-blend-mode').value = grainState.blendMode;
-      $('grain-opacity').value = grainState.opacity;
-      $('grain-opacity').parentElement.querySelector('.param-value').textContent = grainState.opacity;
-      scheduleProcess();
-    });
-  }
+  // Clear strokes
+  $('btn-clear-strokes').addEventListener('click', () => {
+    PaintEngine.clearStrokes();
+    updateStrokeCount();
+    runProcess(); // Re-render base image
+  });
 
   // ── Init ──
   buildAlgorithmList();
+  buildGrainList();
   buildPalettePresets();
   loadPalettePreset('pico8');
   updateColorModeUI();

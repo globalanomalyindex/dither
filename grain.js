@@ -656,5 +656,13 @@ const GrainEngine = (() => {
     return result;
   }
 
-  return { generateGrain, applyGrain };
+  function applyGrainLayers(imageData, layers) {
+    let result = imageData;
+    for (const layer of layers) {
+      if (layer.amount > 0) result = applyGrain(result, layer);
+    }
+    return result;
+  }
+
+  return { generateGrain, applyGrain, applyGrainLayers };
 })();

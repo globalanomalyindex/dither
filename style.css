@@ -986,6 +986,80 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
   padding: 8px 24px;
 }
 
+/* ── Paint Tool Grid ── */
+.paint-tool-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+
+.paint-tool-btn {
+  padding: 6px 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: all var(--transition);
+  text-align: center;
+}
+
+.paint-tool-btn:hover { background: var(--bg-hover); color: var(--text); border-color: var(--border-light); }
+.paint-tool-btn.selected { background: var(--fun); color: #fff; border-color: var(--fun); }
+
+/* ── Brush Library ── */
+.brush-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+#brush-preview {
+  width: 48px;
+  height: 48px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #000;
+  image-rendering: pixelated;
+}
+
+.brush-library-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+}
+
+.brush-thumb {
+  width: 100%;
+  aspect-ratio: 1;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background-size: cover;
+  background-position: center;
+  cursor: pointer;
+  transition: border-color var(--transition);
+}
+
+.brush-thumb:hover { border-color: var(--border-light); }
+.brush-thumb.selected { border-color: var(--fun); box-shadow: 0 0 0 1px var(--fun); }
+
+/* ── Brush Cursor Overlay ── */
+.brush-cursor {
+  position: fixed;
+  pointer-events: none;
+  border: 1px solid rgba(255,255,255,0.6);
+  border-radius: 50%;
+  z-index: 100;
+  display: none;
+  transform: translate(-50%, -50%);
+  mix-blend-mode: difference;
+}
+
 /* ── Responsive ── */
 @media (max-width: 480px) {
   .workspace { flex-direction: column; }
