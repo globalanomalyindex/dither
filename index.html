@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=11">
+  <link rel="stylesheet" href="style.css?v=12">
 </head>
 <body>
   <div id="app">
@@ -324,22 +324,16 @@
                 <button id="btn-upload-brush" class="btn-small">Upload Brush</button>
               </div>
               <div id="brush-library" class="brush-library-grid"></div>
-              <div id="brush-upload-settings" style="display:none;">
-                <div class="param-group">
-                  <span class="param-label">Threshold</span>
-                  <div class="slider-row">
-                    <input type="range" id="brush-threshold" min="0" max="100" value="50" step="1">
-                    <span class="param-value" data-for="brush-threshold">50</span>
-                  </div>
-                </div>
-                <div class="param-group">
-                  <span class="param-label">Softness</span>
-                  <div class="slider-row">
-                    <input type="range" id="brush-softness" min="0" max="100" value="30" step="1">
-                    <span class="param-value" data-for="brush-softness">30</span>
-                  </div>
+              <div class="param-group">
+                <span class="param-label">Angle</span>
+                <div class="slider-row">
+                  <input type="range" id="brush-angle" min="0" max="360" value="0" step="1">
+                  <span class="param-value" data-for="brush-angle">0</span>
                 </div>
               </div>
+              <label class="param-check">
+                <input type="checkbox" id="brush-follow-dir"> Follow stroke direction
+              </label>
             </div>
 
             <!-- STROKE SETTINGS -->
@@ -401,7 +395,34 @@
   <input type="file" id="brush-file-input" accept="image/*" hidden>
 
   <!-- Brush cursor overlay -->
-  <div id="brush-cursor" class="brush-cursor"></div>
+  <div id="brush-cursor" class="brush-cursor"><img id="brush-cursor-img" alt=""></div>
+
+  <!-- Brush Upload Modal -->
+  <div id="brush-upload-modal" class="modal-overlay" style="display:none">
+    <div class="modal-panel">
+      <h3>Import Brush</h3>
+      <div class="brush-import-preview">
+        <canvas id="brush-import-canvas" width="128" height="128"></canvas>
+      </div>
+      <div class="brush-import-controls">
+        <label>Threshold
+          <input type="range" id="brush-import-threshold" min="0" max="100" value="50">
+          <span id="brush-import-threshold-val">50</span>
+        </label>
+        <label>Softness
+          <input type="range" id="brush-import-softness" min="0" max="100" value="20">
+          <span id="brush-import-softness-val">20</span>
+        </label>
+        <label class="brush-import-check">
+          <input type="checkbox" id="brush-import-invert"> Invert (white on black)
+        </label>
+      </div>
+      <div class="brush-import-actions">
+        <button id="brush-import-cancel" class="btn-secondary">Cancel</button>
+        <button id="brush-import-confirm" class="btn-primary">Add Brush</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Export Modal -->
   <div id="export-modal" class="modal-overlay hidden">
@@ -491,10 +512,10 @@
     </div>
   </div>
 
-  <script src="dither.js?v=11"></script>
-  <script src="engine.js?v=11"></script>
-  <script src="grain.js?v=11"></script>
-  <script src="paintstroke.js?v=11"></script>
-  <script src="app.js?v=11"></script>
+  <script src="dither.js?v=12"></script>
+  <script src="engine.js?v=12"></script>
+  <script src="grain.js?v=12"></script>
+  <script src="paintstroke.js?v=12"></script>
+  <script src="app.js?v=12"></script>
 </body>
 </html>

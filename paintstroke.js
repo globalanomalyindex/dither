@@ -29,6 +29,10 @@ const PaintEngine = (() => {
   let blendKernel = 3;     // blur kernel radius
   let spreadAmount = 50;   // stretch intensity
 
+  // Brush angle
+  let brushAngle = 0;          // manual rotation in degrees
+  let followDirection = false;  // rotate brush to follow stroke direction
+
   // Active brush mask
   let activeMask = null;
   let activeMaskSize = 0;
@@ -248,24 +252,32 @@ const PaintEngine = (() => {
     activeMask = scaleMask(brush.mask, brush.size, activeMaskSize);
   }
 
-  // ── Bilinear Sampling ──
+  // ── Nearest-Neighbor Sampling (preserves dither pattern) ──
   function samplePixel(data, w, h, x, y) {
-    const x0 = Math.max(0, Math.min(Math.floor(x), w - 1));
-    const y0 = Math.max(0, Math.min(Math.floor(y), h - 1));
-    const x1 = Math.min(x0 + 1, w - 1);
-    const y1 = Math.min(y0 + 1, h - 1);
-    const fx = Math.max(0, x - x0), fy = Math.max(0, y - y0);
+    const px = Math.max(0, Math.min(Math.round(x), w - 1));
+    const py = Math.max(0, Math.min(Math.round(y), h - 1));
+    const i = (py * w + px) * 4;
+    return [data[i], data[i + 1], data[i + 2]];
+  }
 
-    const i00 = (y0 * w + x0) * 4;
-    const i10 = (y0 * w + x1) * 4;
-    const i01 = (y1 * w + x0) * 4;
-    const i11 = (y1 * w + x1) * 4;
-
-    return [
-      data[i00] * (1 - fx) * (1 - fy) + data[i10] * fx * (1 - fy) + data[i01] * (1 - fx) * fy + data[i11] * fx * fy,
-      data[i00 + 1] * (1 - fx) * (1 - fy) + data[i10 + 1] * fx * (1 - fy) + data[i01 + 1] * (1 - fx) * fy + data[i11 + 1] * fx * fy,
-      data[i00 + 2] * (1 - fx) * (1 - fy) + data[i10 + 2] * fx * (1 - fy) + data[i01 + 2] * (1 - fx) * fy + data[i11 + 2] * fx * fy
-    ];
+  // ── Mask Rotation ──
+  function rotateMask(mask, ms, angleDeg) {
+    if (Math.abs(angleDeg % 360) < 0.5) return mask;
+    const rad = -angleDeg * Math.PI / 180;
+    const cosA = Math.cos(rad), sinA = Math.sin(rad);
+    const half = ms / 2;
+    const out = new Float32Array(ms * ms);
+    for (let y = 0; y < ms; y++) {
+      for (let x = 0; x < ms; x++) {
+        const rx = (x - half) * cosA - (y - half) * sinA + half;
+        const ry = (x - half) * sinA + (y - half) * cosA + half;
+        const ix = Math.round(rx), iy = Math.round(ry);
+        if (ix >= 0 && ix < ms && iy >= 0 && iy < ms) {
+          out[y * ms + x] = mask[iy * ms + ix];
+        }
+      }
+    }
+    return out;
   }
 
   // ── Stamp Application ──
@@ -280,6 +292,16 @@ const PaintEngine = (() => {
     if (ddLen > 0.1) { strokeDirX = ddx / ddLen; strokeDirY = ddy / ddLen; }
     prevStampX = cx; prevStampY = cy;
 
+    // Apply brush rotation (manual angle + follow direction)
+    let effectiveAngle = brushAngle;
+    if (followDirection && (Math.abs(strokeDirX) > 0.01 || Math.abs(strokeDirY) > 0.01)) {
+      effectiveAngle += Math.atan2(strokeDirY, strokeDirX) * 180 / Math.PI;
+    }
+    const savedMask = activeMask;
+    if (Math.abs(effectiveAngle % 360) > 0.5) {
+      activeMask = rotateMask(savedMask, ms, effectiveAngle);
+    }
+
     // Compute canvas-space bounding box for the brush
     const margin = tool === 'push' || tool === 'liquify' ? pushDistance :
                    tool === 'scatter' ? scatterRadius :
@@ -290,7 +312,7 @@ const PaintEngine = (() => {
     const rx1 = Math.min(canvas.width, Math.ceil(cx + half + margin));
     const ry1 = Math.min(canvas.height, Math.ceil(cy + half + margin));
     const rw = rx1 - rx0, rh = ry1 - ry0;
-    if (rw <= 0 || rh <= 0) return;
+    if (rw <= 0 || rh <= 0) { activeMask = savedMask; return; }
 
     // Read source pixels (current canvas state)
     const srcData = ctx.getImageData(rx0, ry0, rw, rh);
@@ -320,6 +342,7 @@ const PaintEngine = (() => {
     }
 
     ctx.putImageData(dstData, rx0, ry0);
+    activeMask = savedMask;
   }
 
   // ── Tool: Smudge ──
@@ -616,26 +639,26 @@ const PaintEngine = (() => {
 
   function getSelectedBrush() { return selectedBrush; }
 
-  function extractBrushFromImage(imageData, threshold, softness) {
+  function extractBrushFromImage(imageData, threshold, softness, invert) {
     const w = imageData.width, h = imageData.height;
     const d = imageData.data;
     const sz = Math.max(w, h);
     const mask = new Float32Array(sz * sz);
-    const th = (threshold / 100) * 255;
+    const th = threshold / 100;
     const sf = softness / 100;
-    const softRange = Math.max(1, th * sf);
 
     for (let y = 0; y < h && y < sz; y++) {
       for (let x = 0; x < w && x < sz; x++) {
         const i = (y * w + x) * 4;
-        const gray = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
-        // White = opaque, black = transparent
-        let val = gray / 255;
+        let gray = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) / 255;
+        // invert: black = opaque (stamp on white bg). default: white = opaque
+        if (invert) gray = 1 - gray;
         // Apply threshold with softness
-        if (val < th / 255) {
-          val = sf > 0 ? Math.max(0, val / (th / 255)) * sf : 0;
-        }
-        mask[y * sz + x] = val;
+        const edge = sf > 0 ? sf * 0.5 : 0.01;
+        const lo = Math.max(0, th - edge), hi = Math.min(1, th + edge);
+        if (gray <= lo) { mask[y * sz + x] = 0; }
+        else if (gray >= hi) { mask[y * sz + x] = 1; }
+        else { mask[y * sz + x] = (gray - lo) / (hi - lo); }
       }
     }
 
@@ -660,9 +683,11 @@ const PaintEngine = (() => {
   function setLiquifySmooth(s) { liquifySmooth = Math.max(0, Math.min(2, s)); }
   function setBlendKernel(k) { blendKernel = Math.max(1, Math.min(20, k)); }
   function setSpreadAmount(a) { spreadAmount = Math.max(1, Math.min(100, a)); }
+  function setBrushAngle(a) { brushAngle = a % 360; }
+  function setFollowDirection(v) { followDirection = !!v; }
 
   function getSettings() {
-    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush };
+    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection };
   }
 
   // ── Brush Thumbnails ──
@@ -683,6 +708,38 @@ const PaintEngine = (() => {
     return c.toDataURL();
   }
 
+  // ── Brush Cursor Image ──
+  let _cursorCache = { brush: -1, size: 0, url: '' };
+
+  function getBrushCursorURL(displaySize) {
+    if (_cursorCache.brush === selectedBrush && _cursorCache.size === displaySize && _cursorCache.url) {
+      return _cursorCache.url;
+    }
+    const brush = brushLibrary[selectedBrush];
+    if (!brush) return '';
+    const sz = Math.max(4, Math.min(displaySize, 256));
+    const c = document.createElement('canvas');
+    c.width = sz; c.height = sz;
+    const tctx = c.getContext('2d');
+    const img = tctx.createImageData(sz, sz);
+    const scaled = scaleMask(brush.mask, brush.size, sz);
+    for (let i = 0; i < sz * sz; i++) {
+      const a = scaled[i];
+      const idx = i * 4;
+      img.data[idx] = 255;
+      img.data[idx + 1] = 255;
+      img.data[idx + 2] = 255;
+      img.data[idx + 3] = Math.round(a * 180);
+    }
+    tctx.putImageData(img, 0, 0);
+    _cursorCache = { brush: selectedBrush, size: displaySize, url: c.toDataURL() };
+    return _cursorCache.url;
+  }
+
+  function invalidateCursorCache() {
+    _cursorCache = { brush: -1, size: 0, url: '' };
+  }
+
   // ── Public API ──
   return {
     init, beginStroke, continueStroke, endStroke,
@@ -690,8 +747,10 @@ const PaintEngine = (() => {
     setTool, setSize, setSpacing, setStrength, setOpacity,
     setSmudgeDecay, setPushDistance, setScatterRadius, setSwirlAngle,
     setLiquifySmooth, setBlendKernel, setSpreadAmount,
+    setBrushAngle, setFollowDirection,
     selectBrush, getBrushes, getSelectedBrush, getBrushThumbnail,
     addBrush, extractBrushFromImage,
-    getSettings, updateActiveMask
+    getSettings, updateActiveMask,
+    getBrushCursorURL, invalidateCursorCache
   };
 })();
