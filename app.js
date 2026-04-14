@@ -176,8 +176,12 @@
     showProcessing(true);
 
     requestAnimationFrame(() => {
-      const result = DitherEngine.process(buildPipeline(), buildGlobals(), PREVIEW_MAX);
+      let result = DitherEngine.process(buildPipeline(), buildGlobals(), PREVIEW_MAX);
       if (result) {
+        // Apply grain if amount > 0
+        if (grainState.amount > 0) {
+          result = GrainEngine.applyGrain(result, buildGrainOpts());
+        }
         canvas.width = result.width;
         canvas.height = result.height;
         ctx.putImageData(result, 0, 0);
@@ -216,6 +220,7 @@
     dropZone.style.display = 'none';
     workspace.classList.remove('hidden');
     $('btn-export').disabled = false;
+    $('btn-bake').disabled = false;
     $('btn-reset').disabled = false;
     lastSnapshot = getStateSnapshot();
     fitToView();
@@ -1090,8 +1095,9 @@
 
   async function renderExportPreview() {
     const opts = getExportOpts();
-    const imageData = DitherEngine.process(buildPipeline(), buildGlobals(), EXPORT_PREVIEW_MAX);
+    let imageData = DitherEngine.process(buildPipeline(), buildGlobals(), EXPORT_PREVIEW_MAX);
     if (!imageData) return;
+    if (grainState.amount > 0) imageData = GrainEngine.applyGrain(imageData, buildGrainOpts());
 
     const tmp = document.createElement('canvas');
     tmp.width = imageData.width; tmp.height = imageData.height;
@@ -1230,10 +1236,11 @@
     const progressDetail = overlay.querySelector('.export-progress-detail');
 
     const opts = getExportOpts();
+    const gOpts = grainState.amount > 0 ? buildGrainOpts() : null;
     const blob = await DitherEngine.exportWithOptions(buildPipeline(), buildGlobals(), opts, (msg, detail) => {
       progressText.textContent = msg;
       progressDetail.textContent = detail || '';
-    });
+    }, gOpts);
 
     if (blob) {
       progressText.textContent = 'Downloading\u2026';
@@ -1258,6 +1265,28 @@
     closeExportModal();
   });
 
+  // ── Bake ──
+  $('btn-bake').addEventListener('click', () => {
+    pushUndo();
+    const result = DitherEngine.bake(buildPipeline(), buildGlobals(), grainState.amount > 0 ? buildGrainOpts() : null);
+    if (result) {
+      $('image-info').textContent = `${result.width} × ${result.height} — baked`;
+      // Reset dither state since edits are now baked in
+      state.selectedAlgorithms = [];
+      state.globals.brightness = 0;
+      state.globals.contrast = 0;
+      state.globals.gamma = 1.0;
+      // Reset grain
+      grainState.amount = 0;
+      $('grain-amount').value = 0;
+      $('grain-amount').parentElement.querySelector('.param-value').textContent = '0';
+      syncUIFromState();
+      updateAlgorithmUI();
+      buildParamPanels();
+      runProcess();
+    }
+  });
+
   // ── Reset ──
   $('btn-reset').addEventListener('click', () => {
     pushUndo();
@@ -1277,6 +1306,196 @@
     buildParamPanels();
     runProcess();
   });
+
+  // ── Tab Switching ──
+  let activeTab = 'dither';
+
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tab = btn.dataset.tab;
+      if (tab === activeTab) return;
+      activeTab = tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+      $('tab-dither').style.display = tab === 'dither' ? '' : 'none';
+      $('tab-grain').style.display = tab === 'grain' ? '' : 'none';
+    });
+  });
+
+  // ── Grain State ──
+  const grainState = {
+    type: 'fine-film',
+    amount: 30,
+    size: 1,
+    roughness: 50,
+    variance: 50,
+    softness: 0,
+    seed: 42,
+    seedRandom: false,
+    highPass: { enabled: false, radius: 10, strength: 50 },
+    valueMask: { shadows: 100, midtones: 100, highlights: 100, shadowMid: 64, midHighlight: 192, invert: false },
+    colorMode: 'mono',
+    channelR: 100, channelG: 100, channelB: 100,
+    tintColor: '#8b7355',
+    tintStrength: 50,
+    blendMode: 'overlay',
+    opacity: 100
+  };
+
+  function buildGrainOpts() {
+    const tintHex = grainState.tintColor;
+    const tr = parseInt(tintHex.slice(1, 3), 16);
+    const tg = parseInt(tintHex.slice(3, 5), 16);
+    const tb = parseInt(tintHex.slice(5, 7), 16);
+    return {
+      type: grainState.type,
+      amount: grainState.amount,
+      size: grainState.size,
+      roughness: grainState.roughness,
+      variance: grainState.variance,
+      softness: grainState.softness,
+      seed: grainState.seed,
+      highPass: grainState.highPass,
+      valueMask: grainState.valueMask,
+      colorMode: grainState.colorMode,
+      channelR: grainState.channelR,
+      channelG: grainState.channelG,
+      channelB: grainState.channelB,
+      tintColor: [tr, tg, tb],
+      tintStrength: grainState.tintStrength,
+      blendMode: grainState.blendMode,
+      opacity: grainState.opacity
+    };
+  }
+
+  // ── Grain Slider Helpers ──
+  function grainSlider(id, stateProp, onChange) {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener('input', () => {
+      const v = parseFloat(el.value);
+      if (stateProp.includes('.')) {
+        const [obj, key] = stateProp.split('.');
+        grainState[obj][key] = v;
+      } else {
+        grainState[stateProp] = v;
+      }
+      const disp = el.parentElement.querySelector('.param-value');
+      if (disp) disp.textContent = Number.isInteger(v) ? v : v.toFixed(1);
+      if (onChange) onChange();
+      scheduleProcess();
+    });
+  }
+
+  grainSlider('grain-amount', 'amount');
+  grainSlider('grain-size', 'size');
+  grainSlider('grain-roughness', 'roughness');
+  grainSlider('grain-variance', 'variance');
+  grainSlider('grain-softness', 'softness');
+  grainSlider('grain-highpass-radius', 'highPass.radius');
+  grainSlider('grain-highpass-strength', 'highPass.strength');
+  grainSlider('grain-mask-shadows', 'valueMask.shadows');
+  grainSlider('grain-mask-midtones', 'valueMask.midtones');
+  grainSlider('grain-mask-highlights', 'valueMask.highlights');
+  grainSlider('grain-mask-shadow-mid', 'valueMask.shadowMid');
+  grainSlider('grain-mask-mid-highlight', 'valueMask.midHighlight');
+  grainSlider('grain-color-r', 'channelR');
+  grainSlider('grain-color-g', 'channelG');
+  grainSlider('grain-color-b', 'channelB');
+  grainSlider('grain-tint-strength', 'tintStrength');
+  grainSlider('grain-opacity', 'opacity');
+
+  // Grain type select
+  $('grain-type').addEventListener('change', () => {
+    grainState.type = $('grain-type').value;
+    scheduleProcess();
+  });
+
+  // Grain blend mode select
+  $('grain-blend-mode').addEventListener('change', () => {
+    grainState.blendMode = $('grain-blend-mode').value;
+    scheduleProcess();
+  });
+
+  // Grain color mode select
+  $('grain-color-mode').addEventListener('change', () => {
+    grainState.colorMode = $('grain-color-mode').value;
+    $('grain-color-controls').style.display = (grainState.colorMode === 'channel' || grainState.colorMode === 'color') ? '' : 'none';
+    $('grain-tint-controls').style.display = grainState.colorMode === 'tinted' ? '' : 'none';
+    scheduleProcess();
+  });
+
+  // Grain tint color
+  if ($('grain-tint-color')) {
+    $('grain-tint-color').addEventListener('input', () => {
+      grainState.tintColor = $('grain-tint-color').value;
+      scheduleProcess();
+    });
+  }
+
+  // Grain high pass toggle
+  $('grain-highpass-enable').addEventListener('change', () => {
+    grainState.highPass.enabled = $('grain-highpass-enable').checked;
+    $('grain-highpass-controls').style.display = grainState.highPass.enabled ? '' : 'none';
+    scheduleProcess();
+  });
+
+  // Grain mask invert
+  $('grain-mask-invert').addEventListener('change', () => {
+    grainState.valueMask.invert = $('grain-mask-invert').checked;
+    scheduleProcess();
+  });
+
+  // Grain seed
+  let grainSeedTimer;
+  $('grain-seed').addEventListener('input', () => {
+    clearTimeout(grainSeedTimer);
+    grainSeedTimer = setTimeout(() => {
+      grainState.seed = parseInt($('grain-seed').value) || 1;
+      scheduleProcess();
+    }, 400);
+  });
+
+  $('grain-seed-random').addEventListener('change', () => {
+    const checked = $('grain-seed-random').checked;
+    grainState.seedRandom = checked;
+    $('grain-seed').disabled = checked;
+    if (checked) {
+      grainState.seed = Math.floor(Math.random() * 999999) + 1;
+      $('grain-seed').value = grainState.seed;
+      scheduleProcess();
+    }
+  });
+
+  // Grain randomize button
+  if ($('grain-randomize')) {
+    $('grain-randomize').addEventListener('click', () => {
+      const types = [...$('grain-type').options].map(o => o.value);
+      grainState.type = types[Math.floor(Math.random() * types.length)];
+      grainState.amount = Math.floor(Math.random() * 80) + 5;
+      grainState.size = +(Math.random() * 4 + 0.5).toFixed(1);
+      grainState.roughness = Math.floor(Math.random() * 100);
+      grainState.variance = Math.floor(Math.random() * 100);
+      grainState.seed = Math.floor(Math.random() * 999999) + 1;
+      const modes = ['normal','multiply','screen','overlay','soft-light','hard-light','difference','exclusion','linear-light','color-burn','color-dodge'];
+      grainState.blendMode = modes[Math.floor(Math.random() * modes.length)];
+      grainState.opacity = Math.floor(Math.random() * 60) + 40;
+      // Sync UI
+      $('grain-type').value = grainState.type;
+      $('grain-amount').value = grainState.amount;
+      $('grain-amount').parentElement.querySelector('.param-value').textContent = grainState.amount;
+      $('grain-size').value = grainState.size;
+      $('grain-size').parentElement.querySelector('.param-value').textContent = grainState.size;
+      $('grain-roughness').value = grainState.roughness;
+      $('grain-roughness').parentElement.querySelector('.param-value').textContent = grainState.roughness;
+      $('grain-variance').value = grainState.variance;
+      $('grain-variance').parentElement.querySelector('.param-value').textContent = grainState.variance;
+      $('grain-seed').value = grainState.seed;
+      $('grain-blend-mode').value = grainState.blendMode;
+      $('grain-opacity').value = grainState.opacity;
+      $('grain-opacity').parentElement.querySelector('.param-value').textContent = grainState.opacity;
+      scheduleProcess();
+    });
+  }
 
   // ── Init ──
   buildAlgorithmList();

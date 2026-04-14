@@ -1161,28 +1161,51 @@ const DitherAlgorithms = (() => {
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),r=mkRand(p.seed),cs=p.cellSize;
-    // Voronoi-like cells
     const numCells=Math.ceil(w*h/(cs*cs));
     const cellPts=[];
     for(let i=0;i<numCells;i++) cellPts.push({x:r()*w,y:r()*h});
-    for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      let min1=Infinity,min2=Infinity,nearIdx=0;
-      for(let i=0;i<cellPts.length;i++){
-        const d=(x-cellPts[i].x)**2+(y-cellPts[i].y)**2;
-        if(d<min1){min2=min1;min1=d;nearIdx=i;}
-        else if(d<min2) min2=d;
-      }
-      const edgeDist=Math.sqrt(min2)-Math.sqrt(min1);
-      if(edgeDist<p.leadWidth){
-        o[y*w+x]=20; // lead
-      } else {
-        const cp=cellPts[nearIdx];
-        const sx=Math.min(w-1,Math.max(0,Math.round(cp.x)));
-        const sy=Math.min(h-1,Math.max(0,Math.round(cp.y)));
-        let v=clamp(px[sy*w+sx]);
-        // Light effect - brighten center of cells
-        v=clamp(v+edgeDist*p.lightEffect*2);
-        o[y*w+x]=v;
+    // Grid-accelerated nearest-neighbor lookup
+    const gridSize=cs*2;
+    const gw=Math.ceil(w/gridSize),gh=Math.ceil(h/gridSize);
+    const grid=new Array(gw*gh);
+    for(let i=0;i<grid.length;i++) grid[i]=[];
+    for(let i=0;i<numCells;i++){
+      const gx=Math.min(gw-1,Math.floor(cellPts[i].x/gridSize));
+      const gy=Math.min(gh-1,Math.floor(cellPts[i].y/gridSize));
+      grid[gy*gw+gx].push(i);
+    }
+    for(let y=0;y<h;y++){
+      const gy0=Math.floor(y/gridSize);
+      for(let x=0;x<w;x++){
+        const gx0=Math.floor(x/gridSize);
+        let min1=Infinity,min2=Infinity,nearIdx=0;
+        // Search 3x3 neighborhood of grid cells
+        for(let dy=-1;dy<=1;dy++){
+          const gy=gy0+dy;
+          if(gy<0||gy>=gh) continue;
+          for(let dx=-1;dx<=1;dx++){
+            const gx=gx0+dx;
+            if(gx<0||gx>=gw) continue;
+            const cell=grid[gy*gw+gx];
+            for(let k=0;k<cell.length;k++){
+              const ci=cell[k];
+              const d=(x-cellPts[ci].x)**2+(y-cellPts[ci].y)**2;
+              if(d<min1){min2=min1;min1=d;nearIdx=ci;}
+              else if(d<min2) min2=d;
+            }
+          }
+        }
+        const edgeDist=Math.sqrt(min2)-Math.sqrt(min1);
+        if(edgeDist<p.leadWidth){
+          o[y*w+x]=20;
+        } else {
+          const cp=cellPts[nearIdx];
+          const sx=Math.min(w-1,Math.max(0,Math.round(cp.x)));
+          const sy=Math.min(h-1,Math.max(0,Math.round(cp.y)));
+          let v=clamp(px[sy*w+sx]);
+          v=clamp(v+edgeDist*p.lightEffect*2);
+          o[y*w+x]=v;
+        }
       }
     }
     return o;

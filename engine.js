@@ -29,7 +29,9 @@ const DitherEngine = (() => {
   }
 
   function getSourceSize() {
-    return sourceImage ? { width: sourceImage.width, height: sourceImage.height } : null;
+    if (sourceData) return { width: sourceData.width, height: sourceData.height };
+    if (sourceImage) return { width: sourceImage.width, height: sourceImage.height };
+    return null;
   }
 
   function clampByte(v) { return v < 0 ? 0 : v > 255 ? 255 : v | 0; }
@@ -450,7 +452,7 @@ const DitherEngine = (() => {
     return new Promise(resolve => c.toBlob(blob => resolve(blob), 'image/png'));
   }
 
-  function exportWithOptions(pipeline, globals, opts, progressCb) {
+  function exportWithOptions(pipeline, globals, opts, progressCb, grainOpts) {
     const scale = opts.scale || 1;
     const format = opts.format || 'png';
     const quality = (opts.quality || 92) / 100;
@@ -464,8 +466,13 @@ const DitherEngine = (() => {
     return new Promise(resolve => {
       setTimeout(async () => {
         // Always render at 1x (exactly what's on the canvas)
-        const imageData = process(pipeline, globals, 0);
+        let imageData = process(pipeline, globals, 0);
         if (!imageData) { resolve(null); return; }
+        // Apply grain
+        if (grainOpts && grainOpts.amount > 0) {
+          if (progressCb) progressCb('Applying grain\u2026', '');
+          imageData = GrainEngine.applyGrain(imageData, grainOpts);
+        }
 
         const c = document.createElement('canvas');
 
@@ -519,6 +526,23 @@ const DitherEngine = (() => {
     });
   }
 
+  function bake(pipeline, globals, grainOpts) {
+    let imageData = process(pipeline, globals, 0);
+    if (!imageData) return false;
+    if (grainOpts && grainOpts.amount > 0) {
+      imageData = GrainEngine.applyGrain(imageData, grainOpts);
+    }
+    const c = document.createElement('canvas');
+    c.width = imageData.width; c.height = imageData.height;
+    const cctx = c.getContext('2d');
+    cctx.putImageData(imageData, 0, 0);
+    sourceCanvas = c;
+    sourceData = imageData;
+    sourceImage = null; // no longer an <img>, but sourceCanvas is set
+    _cache.key = '';
+    return { width: imageData.width, height: imageData.height };
+  }
+
   function extractPalette(maxColors) {
     if (!sourceData) return [];
     const px = sourceData.data, n = sourceData.width * sourceData.height;
@@ -529,7 +553,7 @@ const DitherEngine = (() => {
   }
 
   return {
-    loadImage, getSourceSize, process, exportFullSize, exportWithOptions,
+    loadImage, getSourceSize, bake, process, exportFullSize, exportWithOptions,
     hexToRgb, rgbToHex, clampByte,
     getPalettePresets, getPalette, extractPalette, medianCut, nearestColor
   };
