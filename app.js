@@ -160,6 +160,21 @@
       } else { undo(); }
     }
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'z') { e.preventDefault(); redo(); }
+
+    // Brush size shortcuts: [ decrease, ] increase (like Photoshop)
+    if (activeTab === 'paintstroke' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (e.key === '[' || e.key === ']') {
+        e.preventDefault();
+        const sizeEl = $('paint-size');
+        if (sizeEl) {
+          const current = parseInt(sizeEl.value);
+          const step = e.shiftKey ? 10 : (current > 50 ? 5 : (current > 20 ? 3 : 1));
+          const newSize = e.key === ']' ? Math.min(200, current + step) : Math.max(1, current - step);
+          sizeEl.value = newSize;
+          sizeEl.dispatchEvent(new Event('input'));
+        }
+      }
+    }
   });
 
   document.addEventListener('keyup', e => {

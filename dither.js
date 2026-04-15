@@ -7,15 +7,24 @@ const DitherAlgorithms = (() => {
   function clamp(v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
   function mkRand(s) { return () => { s = (s * 16807) % 2147483647; return s / 2147483647; }; }
 
-  function errorDiffusion(px, w, h, matrix, strength, serpentine) {
+  function errorDiffusion(px, w, h, matrix, strength, serpentine, threshold, noise, errorScale, seed, gamma) {
     const out = new Uint8ClampedArray(w * h), buf = new Float32Array(px);
+    const thr = threshold != null ? threshold : 128;
+    const es = errorScale != null ? errorScale : 1;
+    const ns = noise || 0;
+    const gm = gamma != null ? gamma : 1;
+    const r = ns > 0 ? mkRand(seed || 42) : null;
     for (let y = 0; y < h; y++) {
       const ltr = !serpentine || (y % 2 === 0);
       const sx = ltr ? 0 : w-1, ex = ltr ? w : -1, dx = ltr ? 1 : -1;
       for (let x = sx; x !== ex; x += dx) {
-        const i = y*w+x, old = clamp(buf[i]), nv = old > 128 ? 255 : 0;
+        const i = y*w+x;
+        let old = clamp(buf[i]);
+        if (gm !== 1) old = Math.pow(old / 255, gm) * 255;
+        if (r) old = clamp(old + (r() - 0.5) * ns * 2);
+        const nv = old > thr ? 255 : 0;
         out[i] = nv;
-        const err = (old - nv) * strength;
+        const err = (old - nv) * strength * es;
         for (const [mdx, mdy, mw] of matrix) {
           const nx = x + (ltr ? mdx : -mdx), ny = y + mdy;
           if (nx >= 0 && nx < w && ny >= 0 && ny < h) buf[ny*w+nx] += err * mw;
@@ -51,8 +60,13 @@ const DitherAlgorithms = (() => {
   function addED(id, name, matrix, cat='classic') {
     A.push({ id, name, category: cat, params: [
       { id:'strength', label:'Diffusion', min:0, max:1, step:.01, default:1 },
-      { id:'serpentine', label:'Serpentine', type:'checkbox', default: id==='floyd-steinberg' }
-    ], apply(px,w,h,p) { return errorDiffusion(px,w,h,matrix,p.strength,p.serpentine); }});
+      { id:'serpentine', label:'Serpentine', type:'checkbox', default: id==='floyd-steinberg' },
+      { id:'threshold', label:'Threshold', min:0, max:255, step:1, default:128 },
+      { id:'noise', label:'Noise', min:0, max:100, step:1, default:0 },
+      { id:'errorScale', label:'Error Scale', min:.1, max:3, step:.05, default:1 },
+      { id:'gamma', label:'Gamma', min:.2, max:3, step:.05, default:1 },
+      { id:'seed', label:'Seed', min:1, max:999, step:1, default:42 }
+    ], apply(px,w,h,p) { return errorDiffusion(px,w,h,matrix,p.strength,p.serpentine,p.threshold,p.noise,p.errorScale,p.seed,p.gamma); }});
   }
 
   // ═══════════════════════════════════════════
@@ -74,79 +88,130 @@ const DitherAlgorithms = (() => {
   // ═══════════════════════════════════════════
   A.push({ id:'ordered', name:'Ordered (Bayer)', category:'ordered', params:[
     {id:'size',label:'Matrix',type:'select',options:[{value:2,label:'2x2'},{value:4,label:'4x4'},{value:8,label:'8x8'},{value:16,label:'16x16'}],default:4},
-    {id:'spread',label:'Spread',min:0,max:255,step:1,default:128}
+    {id:'spread',label:'Spread',min:0,max:255,step:1,default:128},
+    {id:'rotation',label:'Rotation',min:0,max:90,step:1,default:0},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'noise',label:'Noise',min:0,max:80,step:1,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const sz=+p.size, b=normBayer(sz), sp=p.spread, o=new Uint8ClampedArray(w*h);
-    for(let y=0;y<h;y++) for(let x=0;x<w;x++) { const i=y*w+x; o[i]=(clamp(px[i])+(b[y%sz][x%sz]-.5)*sp)>128?255:0; }
+    const ang=p.rotation*Math.PI/180, cosA=Math.cos(ang), sinA=Math.sin(ang);
+    const r=p.noise>0?mkRand(p.seed):null;
+    for(let y=0;y<h;y++) for(let x=0;x<w;x++) {
+      const i=y*w+x;
+      const rx=Math.round(x*cosA+y*sinA), ry=Math.round(-x*sinA+y*cosA);
+      const bx=((rx%sz)+sz)%sz, by=((ry%sz)+sz)%sz;
+      let v=clamp(px[i]); if(p.gamma!==1) v=Math.pow(v/255,p.gamma)*255;
+      v+=(b[by][bx]-.5)*sp;
+      if(r) v+=(r()-.5)*p.noise;
+      const result=v>p.threshold?255:0;
+      o[i]=p.invert?255-result:result;
+    }
     return o;
   }});
 
   A.push({ id:'clustered-dot', name:'Clustered Dot', category:'ordered', params:[
     {id:'size',label:'Cluster Size',min:3,max:12,step:1,default:6},
-    {id:'spread',label:'Spread',min:0,max:255,step:1,default:128}
+    {id:'spread',label:'Spread',min:0,max:255,step:1,default:128},
+    {id:'rotation',label:'Rotation',min:0,max:90,step:1,default:0},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
     const sz=p.size, o=new Uint8ClampedArray(w*h);
-    // Build clustered dot threshold matrix
     const mat=Array.from({length:sz},()=>new Array(sz));
     const cx=sz/2,cy=sz/2;
     const indices=[];
     for(let y=0;y<sz;y++)for(let x=0;x<sz;x++) indices.push({x,y,d:Math.sqrt((x-cx+.5)**2+(y-cy+.5)**2)});
     indices.sort((a,b)=>a.d-b.d);
     for(let i=0;i<indices.length;i++) mat[indices[i].y][indices[i].x]=(i+.5)/(sz*sz);
+    const ang=p.rotation*Math.PI/180,cosA=Math.cos(ang),sinA=Math.sin(ang);
     for(let y=0;y<h;y++) for(let x=0;x<w;x++){
-      const i=y*w+x; o[i]=(clamp(px[i])+(mat[y%sz][x%sz]-.5)*p.spread)>128?255:0;
+      const i=y*w+x;
+      const rx=Math.round(x*cosA+y*sinA),ry=Math.round(-x*sinA+y*cosA);
+      const bx=((rx%sz)+sz)%sz,by=((ry%sz)+sz)%sz;
+      let v=clamp(px[i]); if(p.gamma!==1) v=Math.pow(v/255,p.gamma)*255;
+      const result=(v+(mat[by][bx]-.5)*p.spread)>p.threshold?255:0;
+      o[i]=p.invert?255-result:result;
     }
     return o;
   }});
 
   A.push({ id:'blue-noise', name:'Blue Noise', category:'ordered', params:[
     {id:'scale',label:'Scale',min:1,max:8,step:1,default:2},
-    {id:'strength',label:'Strength',min:0,max:255,step:1,default:128}
+    {id:'strength',label:'Strength',min:0,max:255,step:1,default:128},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'warp',label:'Warp',min:0,max:1,step:.05,default:0},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),sc=p.scale;
-    // Generate pseudo blue-noise via golden ratio hash
     const phi = 1.618033988749895;
     for(let y=0;y<h;y++) for(let x=0;x<w;x++){
-      const sx=Math.floor(x/sc),sy=Math.floor(y/sc);
+      let sx=Math.floor(x/sc),sy=Math.floor(y/sc);
+      if(p.warp>0){
+        const v=clamp(px[y*w+x])/255;
+        sx+=Math.round(v*p.warp*4); sy+=Math.round(v*p.warp*4);
+      }
       let bn=(sx*phi+sy*phi*phi)%1;
       bn=((bn*2654435761)>>>0)/4294967296;
       const i=y*w+x;
-      o[i]=(clamp(px[i])+(bn-.5)*p.strength)>128?255:0;
+      let v=clamp(px[i]); if(p.gamma!==1) v=Math.pow(v/255,p.gamma)*255;
+      const result=(v+(bn-.5)*p.strength)>p.threshold?255:0;
+      o[i]=p.invert?255-result:result;
     }
     return o;
   }});
 
   A.push({ id:'void-cluster', name:'Void & Cluster', category:'ordered', params:[
     {id:'size',label:'Pattern Size',min:4,max:16,step:4,default:8},
-    {id:'spread',label:'Spread',min:32,max:255,step:1,default:160}
+    {id:'spread',label:'Spread',min:32,max:255,step:1,default:160},
+    {id:'rotation',label:'Rotation',min:0,max:90,step:1,default:0},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
     const sz=p.size, o=new Uint8ClampedArray(w*h);
-    // Approximation of void-and-cluster noise
     const mat=Array.from({length:sz},(_,y)=>Array.from({length:sz},(_,x)=>{
       let v=0;for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){
         const ny=((y+dy)%sz+sz)%sz,nx=((x+dx)%sz+sz)%sz;
         v+=Math.sin(nx*2.39996+ny*7.11)*0.5+0.5;}
       return v;
     }));
-    // Normalize
-    let min=Infinity,max=-Infinity;
-    for(let y=0;y<sz;y++)for(let x=0;x<sz;x++){if(mat[y][x]<min)min=mat[y][x];if(mat[y][x]>max)max=mat[y][x];}
-    for(let y=0;y<sz;y++)for(let x=0;x<sz;x++) mat[y][x]=(mat[y][x]-min)/(max-min);
+    let mn=Infinity,mx=-Infinity;
+    for(let y=0;y<sz;y++)for(let x=0;x<sz;x++){if(mat[y][x]<mn)mn=mat[y][x];if(mat[y][x]>mx)mx=mat[y][x];}
+    for(let y=0;y<sz;y++)for(let x=0;x<sz;x++) mat[y][x]=(mat[y][x]-mn)/(mx-mn);
+    const ang=p.rotation*Math.PI/180,cosA=Math.cos(ang),sinA=Math.sin(ang);
     for(let y=0;y<h;y++) for(let x=0;x<w;x++){
-      const i=y*w+x; o[i]=(clamp(px[i])+(mat[y%sz][x%sz]-.5)*p.spread)>128?255:0;
+      const i=y*w+x;
+      const rx=Math.round(x*cosA+y*sinA),ry=Math.round(-x*sinA+y*cosA);
+      const bx=((rx%sz)+sz)%sz,by=((ry%sz)+sz)%sz;
+      let v=clamp(px[i]); if(p.gamma!==1) v=Math.pow(v/255,p.gamma)*255;
+      const result=(v+(mat[by][bx]-.5)*p.spread)>p.threshold?255:0;
+      o[i]=p.invert?255-result:result;
     }
     return o;
   }});
 
   A.push({ id:'checkerboard', name:'Checkerboard', category:'ordered', params:[
     {id:'size',label:'Cell Size',min:1,max:16,step:1,default:2},
-    {id:'bias',label:'Threshold Bias',min:-128,max:128,step:1,default:0}
+    {id:'bias',label:'Threshold Bias',min:-128,max:128,step:1,default:0},
+    {id:'rotation',label:'Rotation',min:0,max:90,step:1,default:0},
+    {id:'contrast',label:'Check Contrast',min:0,max:120,step:1,default:40},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),sz=p.size;
+    const ang=p.rotation*Math.PI/180,cosA=Math.cos(ang),sinA=Math.sin(ang);
     for(let y=0;y<h;y++) for(let x=0;x<w;x++){
       const i=y*w+x;
-      const checker=(Math.floor(x/sz)+Math.floor(y/sz))%2;
-      o[i]=clamp(px[i])>(128+p.bias+checker*40-20)?255:0;
+      const rx=Math.round(x*cosA+y*sinA),ry=Math.round(-x*sinA+y*cosA);
+      const checker=(Math.floor(((rx%sz)+sz)/sz)+Math.floor(((ry%sz)+sz)/sz))%2;
+      let v=clamp(px[i]); if(p.gamma!==1) v=Math.pow(v/255,p.gamma)*255;
+      const result=v>(128+p.bias+checker*p.contrast-p.contrast/2)?255:0;
+      o[i]=p.invert?255-result:result;
     }
     return o;
   }});
@@ -154,42 +219,54 @@ const DitherAlgorithms = (() => {
   A.push({ id:'threshold-map', name:'Threshold Map', category:'ordered', params:[
     {id:'mapType',label:'Map',type:'select',options:[{value:'perlin',label:'Perlin-like'},{value:'worley',label:'Worley'},{value:'fbm',label:'FBM'}],default:'perlin'},
     {id:'scale',label:'Scale',min:.005,max:.1,step:.005,default:.02},
-    {id:'contrast',label:'Contrast',min:.1,max:3,step:.1,default:1}
+    {id:'contrast',label:'Contrast',min:.1,max:3,step:.1,default:1},
+    {id:'offsetX',label:'Offset X',min:-100,max:100,step:1,default:0},
+    {id:'offsetY',label:'Offset Y',min:-100,max:100,step:1,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h),sc=p.scale;
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+      const mx=x+p.offsetX,my=y+p.offsetY;
       let threshold;
-      if(p.mapType==='perlin'){threshold=(Math.sin(x*sc*6.28)*Math.cos(y*sc*6.28)+Math.sin((x+y)*sc*3.14)*.5+1.5)/3;}
+      if(p.mapType==='perlin'){threshold=(Math.sin(mx*sc*6.28)*Math.cos(my*sc*6.28)+Math.sin((mx+my)*sc*3.14)*.5+1.5)/3;}
       else if(p.mapType==='worley'){
-        const gx=Math.floor(x*sc*2),gy=Math.floor(y*sc*2);
+        const gx=Math.floor(mx*sc*2),gy=Math.floor(my*sc*2);
         let minD=1e9;for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
           const cx2=(gx+dx+.5+Math.sin((gx+dx)*12.9898+(gy+dy)*78.233)*.5)/sc/2;
           const cy2=(gy+dy+.5+Math.sin((gy+dy)*12.9898+(gx+dx)*78.233)*.5)/sc/2;
-          const d=Math.sqrt((x-cx2)**2+(y-cy2)**2)*sc;if(d<minD)minD=d;}
+          const d=Math.sqrt((mx-cx2)**2+(my-cy2)**2)*sc;if(d<minD)minD=d;}
         threshold=Math.min(1,minD*2);}
       else{let n=0,amp=1,freq=1,ma=0;for(let oc=0;oc<4;oc++){
-        n+=(Math.sin(x*sc*freq*6.28)*Math.cos(y*sc*freq*4.17)+1)/2*amp;ma+=amp;amp*=.5;freq*=2;}
+        n+=(Math.sin(mx*sc*freq*6.28)*Math.cos(my*sc*freq*4.17)+1)/2*amp;ma+=amp;amp*=.5;freq*=2;}
         threshold=n/ma;}
       threshold=.5+(threshold-.5)*p.contrast;
-      o[y*w+x]=clamp(px[y*w+x])/255>threshold?255:0;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      const result=v>threshold?255:0;
+      o[y*w+x]=p.invert?255-result:result;
     }return o;
   }});
 
   A.push({ id:'truchet', name:'Truchet Tiles', category:'ordered', params:[
     {id:'tileSize',label:'Tile Size',min:4,max:24,step:2,default:10},
     {id:'style',label:'Style',type:'select',options:[{value:'arc',label:'Quarter Arcs'},{value:'triangle',label:'Triangles'},{value:'maze',label:'Maze'}],default:'arc'},
+    {id:'lineWidth',label:'Line Width',min:.1,max:.8,step:.05,default:.5},
+    {id:'contrast',label:'Contrast',min:.3,max:1,step:.05,default:.7},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
-  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed),ts=p.tileSize;
+  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);const r=mkRand(p.seed),ts=p.tileSize;
     for(let ty=0;ty<h;ty+=ts)for(let tx=0;tx<w;tx+=ts){
       const midX=Math.min(w-1,tx+ts/2),midY=Math.min(h-1,ty+ts/2);
-      const v=clamp(px[midY*w+midX])/255;const flip=v<.5;
+      let v=clamp(px[midY*w+midX])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      const flip=v<.5;
       for(let dy=0;dy<ts&&ty+dy<h;dy++)for(let dx=0;dx<ts&&tx+dx<w;dx++){
         const nx=dx/ts,ny=dy/ts;let inside=false;
         if(p.style==='arc'){
-          if(flip){const d1=Math.sqrt(nx*nx+ny*ny),d2=Math.sqrt((1-nx)**2+(1-ny)**2);inside=d1<.5||d2<.5;}
-          else{const d1=Math.sqrt((1-nx)**2+ny*ny),d2=Math.sqrt(nx*nx+(1-ny)**2);inside=d1<.5||d2<.5;}
+          if(flip){const d1=Math.sqrt(nx*nx+ny*ny),d2=Math.sqrt((1-nx)**2+(1-ny)**2);inside=d1<p.lineWidth||d2<p.lineWidth;}
+          else{const d1=Math.sqrt((1-nx)**2+ny*ny),d2=Math.sqrt(nx*nx+(1-ny)**2);inside=d1<p.lineWidth||d2<p.lineWidth;}
         }else if(p.style==='triangle'){inside=flip?nx+ny<1:nx+ny>1;}
         else{inside=flip?(dx<ts/2)===(dy<ts/2):(dx<ts/2)!==(dy<ts/2);}
-        if(inside&&v<.7)o[(ty+dy)*w+tx+dx]=0;
+        if(inside&&v<p.contrast)o[(ty+dy)*w+tx+dx]=p.invert?255:0;
       }}return o;
   }});
 
@@ -200,12 +277,19 @@ const DitherAlgorithms = (() => {
     {id:'dotSize',label:'Dot Size',min:2,max:30,step:1,default:6},
     {id:'angle',label:'Angle',min:0,max:180,step:1,default:45},
     {id:'shape',label:'Shape',type:'select',options:[{value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},{value:'square',label:'Square'},{value:'line',label:'Line'},{value:'cross',label:'Cross'},{value:'star',label:'Star'},{value:'ring',label:'Ring'},{value:'ellipse',label:'Ellipse'}],default:'circle'},
-    {id:'softness',label:'Softness',min:0,max:1,step:.05,default:0}
+    {id:'softness',label:'Softness',min:0,max:1,step:.05,default:0},
+    {id:'dotGain',label:'Dot Gain',min:.5,max:2.5,step:.05,default:1.42},
+    {id:'jitter',label:'Jitter',min:0,max:1,step:.05,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h), ds=p.dotSize, ang=p.angle*Math.PI/180;
     const cos=Math.cos(ang), sin=Math.sin(ang), soft=p.softness;
+    const r=p.jitter>0?mkRand(p.seed):null;
     for(let y=0;y<h;y++) for(let x=0;x<w;x++) {
-      const rx=x*cos+y*sin, ry=-x*sin+y*cos;
+      let rx=x*cos+y*sin, ry=-x*sin+y*cos;
+      if(r){rx+=(r()-.5)*p.jitter*ds;ry+=(r()-.5)*p.jitter*ds;}
       const cx=((rx%ds)+ds)%ds, cy=((ry%ds)+ds)%ds;
       const nx=(cx/ds-.5)*2, ny=(cy/ds-.5)*2;
       let d;
@@ -217,9 +301,12 @@ const DitherAlgorithms = (() => {
       else if(p.shape==='ring') d=Math.abs(Math.sqrt(nx*nx+ny*ny)-.5)*2;
       else if(p.shape==='ellipse') d=Math.sqrt(nx*nx*1.5+ny*ny*0.7);
       else d=Math.max(Math.abs(nx),Math.abs(ny))*(0.5+0.5*Math.cos(Math.atan2(ny,nx)*4));
-      const val=clamp(px[y*w+x])/255, t=(1-val)*1.42;
-      if(soft>0){ const s2=d-t; o[y*w+x]=clamp(128-s2/soft*128); }
-      else o[y*w+x]=d<t?255:0;
+      let val=clamp(px[y*w+x])/255; if(p.gamma!==1) val=Math.pow(val,p.gamma);
+      const t=(1-val)*p.dotGain;
+      let result;
+      if(soft>0){ const s2=d-t; result=clamp(128-s2/soft*128); }
+      else result=d<t?255:0;
+      o[y*w+x]=p.invert?255-result:result;
     }
     return o;
   }});
@@ -230,20 +317,30 @@ const DitherAlgorithms = (() => {
     {id:'mAngle',label:'M Angle',min:0,max:90,step:5,default:75},
     {id:'yAngle',label:'Y Angle',min:0,max:90,step:5,default:0},
     {id:'kAngle',label:'K Angle',min:0,max:90,step:5,default:45},
-    {id:'softness',label:'Softness',min:0,max:1,step:.05,default:.1}
+    {id:'softness',label:'Softness',min:0,max:1,step:.05,default:.1},
+    {id:'dotGain',label:'Dot Gain',min:.5,max:2.5,step:.05,default:1.42},
+    {id:'shape',label:'Shape',type:'select',options:[{value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},{value:'square',label:'Square'},{value:'ellipse',label:'Ellipse'}],default:'circle'},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),ds=p.dotSize;
-    // For grayscale, simulate K plate only
     const ang=p.kAngle*Math.PI/180;
     const cos=Math.cos(ang),sin=Math.sin(ang);
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
       const rx=x*cos+y*sin,ry=-x*sin+y*cos;
       const cx2=((rx%ds)+ds)%ds,cy2=((ry%ds)+ds)%ds;
       const nx=(cx2/ds-.5)*2,ny=(cy2/ds-.5)*2;
-      const d=Math.sqrt(nx*nx+ny*ny);
-      const val=clamp(px[y*w+x])/255,t=(1-val)*1.42;
-      if(p.softness>0){const s2=d-t;o[y*w+x]=clamp(128-s2/p.softness*128);}
-      else o[y*w+x]=d<t?0:255;
+      let d;
+      if(p.shape==='diamond') d=Math.abs(nx)+Math.abs(ny);
+      else if(p.shape==='square') d=Math.max(Math.abs(nx),Math.abs(ny));
+      else if(p.shape==='ellipse') d=Math.sqrt(nx*nx*1.5+ny*ny*0.7);
+      else d=Math.sqrt(nx*nx+ny*ny);
+      let val=clamp(px[y*w+x])/255; if(p.gamma!==1) val=Math.pow(val,p.gamma);
+      const t=(1-val)*p.dotGain;
+      let result;
+      if(p.softness>0){const s2=d-t;result=clamp(128-s2/p.softness*128);}
+      else result=d<t?0:255;
+      o[y*w+x]=p.invert?255-result:result;
     }
     return o;
   }});
@@ -251,21 +348,23 @@ const DitherAlgorithms = (() => {
   A.push({ id:'stochastic-screen', name:'Stochastic Screen', category:'halftone', params:[
     {id:'dotSize',label:'Dot Size',min:1,max:8,step:1,default:2},
     {id:'regularity',label:'Regularity',min:0,max:1,step:.05,default:.5},
+    {id:'dotScale',label:'Dot Scale',min:.2,max:2,step:.05,default:.7},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),r=mkRand(p.seed),ds=p.dotSize;
+    o.fill(p.invert?0:255);
     for(let y=0;y<h;y+=ds)for(let x=0;x<w;x+=ds){
-      const v=clamp(px[y*w+x])/255;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
       const jx=(r()-.5)*(1-p.regularity)*ds*2;
       const jy=(r()-.5)*(1-p.regularity)*ds*2;
-      const dotR=ds*(1-v)*0.7+0.5;
+      const dotR=ds*(1-v)*p.dotScale+0.5;
       for(let dy=-ds;dy<=ds*2;dy++)for(let dx=-ds;dx<=ds*2;dx++){
         const fx=x+dx+Math.round(jx),fy=y+dy+Math.round(jy);
         if(fx>=0&&fx<w&&fy>=0&&fy<h){
           const dist=Math.sqrt((dx-ds/2)**2+(dy-ds/2)**2);
-          if(dist<dotR) o[fy*w+fx]=0;
-          else if(o[fy*w+fx]===0);
-          else o[fy*w+fx]=255;
+          if(dist<dotR) o[fy*w+fx]=p.invert?255:0;
         }
       }
     }
@@ -275,7 +374,10 @@ const DitherAlgorithms = (() => {
   A.push({ id:'am-halftone', name:'AM Halftone', category:'halftone', params:[
     {id:'lpi',label:'Lines/Inch',min:2,max:20,step:1,default:8},
     {id:'angle',label:'Screen Angle',min:0,max:90,step:5,default:45},
-    {id:'gain',label:'Dot Gain',min:0,max:1,step:.05,default:.2}
+    {id:'gain',label:'Dot Gain',min:0,max:1,step:.05,default:.2},
+    {id:'shape',label:'Shape',type:'select',options:[{value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},{value:'square',label:'Square'},{value:'line',label:'Line'}],default:'circle'},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),cell=Math.max(2,Math.round(w/p.lpi/6));
     const ang=p.angle*Math.PI/180,cos=Math.cos(ang),sin=Math.sin(ang);
@@ -283,10 +385,15 @@ const DitherAlgorithms = (() => {
       const rx=x*cos+y*sin,ry=-x*sin+y*cos;
       const cx2=((rx%cell)+cell)%cell,cy2=((ry%cell)+cell)%cell;
       const nx=(cx2/cell-.5)*2,ny=(cy2/cell-.5)*2;
-      const d=Math.sqrt(nx*nx+ny*ny);
-      const val=clamp(px[y*w+x])/255;
+      let d;
+      if(p.shape==='diamond') d=Math.abs(nx)+Math.abs(ny);
+      else if(p.shape==='square') d=Math.max(Math.abs(nx),Math.abs(ny));
+      else if(p.shape==='line') d=Math.abs(ny);
+      else d=Math.sqrt(nx*nx+ny*ny);
+      let val=clamp(px[y*w+x])/255; if(p.gamma!==1) val=Math.pow(val,p.gamma);
       const t=(1-val)*(1+p.gain)*1.2;
-      o[y*w+x]=d<t?0:255;
+      const result=d<t?0:255;
+      o[y*w+x]=p.invert?255-result:result;
     }
     return o;
   }});
@@ -294,18 +401,23 @@ const DitherAlgorithms = (() => {
   A.push({ id:'fm-halftone', name:'FM Halftone', category:'halftone', params:[
     {id:'minDot',label:'Min Dot',min:1,max:4,step:1,default:1},
     {id:'maxDot',label:'Max Dot',min:2,max:8,step:1,default:4},
+    {id:'cutoff',label:'White Cutoff',min:.8,max:1,step:.01,default:.95},
+    {id:'spacing',label:'Spacing',min:.3,max:1.5,step:.05,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed);
-    const step=p.maxDot;
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);const r=mkRand(p.seed);
+    const step=Math.max(1,Math.round(p.maxDot*p.spacing));
     for(let y=0;y<h;y+=step)for(let x=0;x<w;x+=step){
-      const v=clamp(px[Math.min(h-1,y)*w+Math.min(w-1,x)])/255;
-      if(v>0.95)continue;
+      let v=clamp(px[Math.min(h-1,y)*w+Math.min(w-1,x)])/255;
+      if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      if(v>p.cutoff)continue;
       const dotR=p.minDot+(p.maxDot-p.minDot)*(1-v);
       const cx2=x+Math.floor(r()*step*.5),cy2=y+Math.floor(r()*step*.5);
       for(let dy=-p.maxDot;dy<=p.maxDot;dy++)for(let dx=-p.maxDot;dx<=p.maxDot;dx++){
         const fx=cx2+dx,fy=cy2+dy;
-        if(fx>=0&&fx<w&&fy>=0&&fy<h&&Math.sqrt(dx*dx+dy*dy)<=dotR)o[fy*w+fx]=0;
+        if(fx>=0&&fx<w&&fy>=0&&fy<h&&Math.sqrt(dx*dx+dy*dy)<=dotR)o[fy*w+fx]=p.invert?255:0;
       }
     }
     return o;
@@ -313,31 +425,41 @@ const DitherAlgorithms = (() => {
 
   A.push({ id:'mezzotint', name:'Mezzotint', category:'halftone', params:[
     {id:'style',label:'Style',type:'select',options:[{value:'fine',label:'Fine'},{value:'medium',label:'Medium'},{value:'coarse',label:'Coarse'},{value:'worm',label:'Worm'},{value:'stroke',label:'Stroke'}],default:'medium'},
+    {id:'density',label:'Density',min:.2,max:2,step:.05,default:.8},
+    {id:'angle',label:'Angle Bias',min:0,max:180,step:5,default:0},
+    {id:'length',label:'Mark Length',min:.5,max:3,step:.1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),r=mkRand(p.seed);
     const sizes={fine:1,medium:2,coarse:4,worm:2,stroke:3};
     const sz=sizes[p.style]||2;
+    const inkV=p.invert?255:0, paperV=p.invert?0:255;
     if(p.style==='worm'||p.style==='stroke'){
-      o.fill(255);
-      const count=w*h/(sz*sz)*0.8;
+      o.fill(paperV);
+      const count=w*h/(sz*sz)*p.density;
+      const angBias=p.angle*Math.PI/180;
       for(let i=0;i<count;i++){
         let cx2=r()*w,cy2=r()*h;
-        const sv=clamp(px[Math.min(h-1,Math.round(cy2))*w+Math.min(w-1,Math.round(cx2))])/255;
+        let sv=clamp(px[Math.min(h-1,Math.round(cy2))*w+Math.min(w-1,Math.round(cx2))])/255;
+        if(p.gamma!==1) sv=Math.pow(sv,p.gamma);
         if(r()<sv)continue;
-        const len=p.style==='worm'?Math.round(3+r()*8):Math.round(2+r()*5);
-        const ang2=r()*Math.PI;
+        const baseLen=p.style==='worm'?Math.round(3+r()*8):Math.round(2+r()*5);
+        const len=Math.round(baseLen*p.length);
+        const ang2=p.angle>0?angBias+(r()-.5)*1:r()*Math.PI;
         for(let t=0;t<len;t++){
           const fx=Math.round(cx2),fy=Math.round(cy2);
-          if(fx>=0&&fx<w&&fy>=0&&fy<h)o[fy*w+fx]=0;
+          if(fx>=0&&fx<w&&fy>=0&&fy<h)o[fy*w+fx]=inkV;
           cx2+=Math.cos(ang2)*(p.style==='worm'?1+r():1.5);
           cy2+=Math.sin(ang2)*(p.style==='worm'?1+r():1.5);
         }
       }
     } else {
       for(let y=0;y<h;y+=sz)for(let x=0;x<w;x+=sz){
-        const v=clamp(px[Math.min(h-1,y)*w+Math.min(w-1,x)])/255;
-        const ink=r()>v?0:255;
+        let v=clamp(px[Math.min(h-1,y)*w+Math.min(w-1,x)])/255;
+        if(p.gamma!==1) v=Math.pow(v,p.gamma);
+        const ink=r()>v?inkV:paperV;
         for(let dy=0;dy<sz&&y+dy<h;dy++)for(let dx=0;dx<sz&&x+dx<w;dx++)
           o[(y+dy)*w+x+dx]=ink;
       }
@@ -348,8 +470,12 @@ const DitherAlgorithms = (() => {
   A.push({ id:'newsprint', name:'Newsprint', category:'halftone', params:[
     {id:'dotSize',label:'Dot Size',min:3,max:16,step:1,default:6},
     {id:'angle',label:'Angle',min:0,max:90,step:5,default:45},
-    {id:'paperTone',label:'Paper Tone',min:200,max:255,step:1,default:240},
-    {id:'inkDensity',label:'Ink Density',min:.5,max:1,step:.05,default:.85}
+    {id:'paperTone',label:'Paper Tone',min:150,max:255,step:1,default:240},
+    {id:'inkDensity',label:'Ink Density',min:.3,max:1.5,step:.05,default:.85},
+    {id:'inkDarkness',label:'Ink Darkness',min:0,max:80,step:1,default:40},
+    {id:'bleed',label:'Ink Bleed',min:0,max:1,step:.05,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'shape',label:'Shape',type:'select',options:[{value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},{value:'square',label:'Square'}],default:'circle'}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),ds=p.dotSize;
     const ang=p.angle*Math.PI/180,cos=Math.cos(ang),sin=Math.sin(ang);
@@ -357,30 +483,46 @@ const DitherAlgorithms = (() => {
       const rx=x*cos+y*sin,ry=-x*sin+y*cos;
       const cx2=((rx%ds)+ds)%ds,cy2=((ry%ds)+ds)%ds;
       const nx=(cx2/ds-.5)*2,ny=(cy2/ds-.5)*2;
-      const d=Math.sqrt(nx*nx+ny*ny);
-      const val=clamp(px[y*w+x])/255;
+      let d;
+      if(p.shape==='diamond') d=Math.abs(nx)+Math.abs(ny);
+      else if(p.shape==='square') d=Math.max(Math.abs(nx),Math.abs(ny));
+      else d=Math.sqrt(nx*nx+ny*ny);
+      let val=clamp(px[y*w+x])/255; if(p.gamma!==1) val=Math.pow(val,p.gamma);
       const t=(1-val)*p.inkDensity*1.42;
-      o[y*w+x]=d<t?clamp(val*40):p.paperTone;
+      if(d<t){
+        const edge=p.bleed>0?clamp(val*p.inkDarkness+(d/t)*p.bleed*60):clamp(val*p.inkDarkness);
+        o[y*w+x]=edge;
+      } else o[y*w+x]=p.paperTone;
     }
     return o;
   }});
 
   A.push({ id:'rosette', name:'Rosette Pattern', category:'halftone', params:[
     {id:'dotSize',label:'Cell Size',min:4,max:20,step:1,default:8},
-    {id:'petals',label:'Petals',min:3,max:8,step:1,default:6},
-    {id:'softness',label:'Softness',min:0,max:1,step:.05,default:.2}
+    {id:'petals',label:'Petals',min:3,max:12,step:1,default:6},
+    {id:'petalDepth',label:'Petal Depth',min:0,max:1,step:.05,default:.3},
+    {id:'rotation',label:'Rotation',min:0,max:90,step:1,default:0},
+    {id:'softness',label:'Softness',min:0,max:1,step:.05,default:.2},
+    {id:'dotGain',label:'Dot Gain',min:.5,max:2.5,step:.05,default:1.3},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),ds=p.dotSize;
+    const rAng=p.rotation*Math.PI/180,cosR=Math.cos(rAng),sinR=Math.sin(rAng);
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      const cx2=((x%ds)+ds)%ds,cy2=((y%ds)+ds)%ds;
+      const rx=x*cosR+y*sinR,ry=-x*sinR+y*cosR;
+      const cx2=((rx%ds)+ds)%ds,cy2=((ry%ds)+ds)%ds;
       const nx=(cx2/ds-.5)*2,ny=(cy2/ds-.5)*2;
       const ang2=Math.atan2(ny,nx);
       const r2=Math.sqrt(nx*nx+ny*ny);
       const petal=0.5+0.5*Math.cos(ang2*p.petals);
-      const d=r2*(1-petal*0.3);
-      const val=clamp(px[y*w+x])/255,t=(1-val)*1.3;
-      if(p.softness>0){const s2=d-t;o[y*w+x]=clamp(128-s2/p.softness*128);}
-      else o[y*w+x]=d<t?0:255;
+      const d=r2*(1-petal*p.petalDepth);
+      let val=clamp(px[y*w+x])/255; if(p.gamma!==1) val=Math.pow(val,p.gamma);
+      const t=(1-val)*p.dotGain;
+      let result;
+      if(p.softness>0){const s2=d-t;result=clamp(128-s2/p.softness*128);}
+      else result=d<t?0:255;
+      o[y*w+x]=p.invert?255-result:result;
     }
     return o;
   }});
@@ -390,49 +532,84 @@ const DitherAlgorithms = (() => {
   // ═══════════════════════════════════════════
   A.push({ id:'horizontal-lines', name:'Horizontal Lines', category:'lines', params:[
     {id:'spacing',label:'Spacing',min:2,max:20,step:1,default:4},
-    {id:'thickness',label:'Thickness',min:1,max:10,step:1,default:2}
-  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);
-    for(let y=0;y<h;y++) for(let x=0;x<w;x++) { const v=clamp(px[y*w+x])/255; const linePhase=y%p.spacing; o[y*w+x]=linePhase<p.thickness&&v<(1-linePhase/p.spacing)?0:255; }
+    {id:'thickness',label:'Thickness',min:1,max:10,step:1,default:2},
+    {id:'wobble',label:'Wobble',min:0,max:5,step:.25,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);const r=p.wobble>0?mkRand(p.seed):null;
+    for(let y=0;y<h;y++) for(let x=0;x<w;x++) {
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      const wy=r?y+Math.sin(x*0.1)*p.wobble*2+(r()-.5)*p.wobble:y;
+      const linePhase=((wy%p.spacing)+p.spacing)%p.spacing;
+      const result=linePhase<p.thickness&&v<(1-linePhase/p.spacing)?0:255;
+      o[y*w+x]=p.invert?255-result:result;
+    }
     return o;
   }});
 
   A.push({ id:'vertical-lines', name:'Vertical Lines', category:'lines', params:[
     {id:'spacing',label:'Spacing',min:2,max:20,step:1,default:4},
-    {id:'thickness',label:'Thickness',min:1,max:10,step:1,default:2}
-  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);
-    for(let y=0;y<h;y++) for(let x=0;x<w;x++) { const v=clamp(px[y*w+x])/255; const linePhase=x%p.spacing; o[y*w+x]=linePhase<p.thickness&&v<(1-linePhase/p.spacing)?0:255; }
+    {id:'thickness',label:'Thickness',min:1,max:10,step:1,default:2},
+    {id:'wobble',label:'Wobble',min:0,max:5,step:.25,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);const r=p.wobble>0?mkRand(p.seed):null;
+    for(let y=0;y<h;y++) for(let x=0;x<w;x++) {
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      const wx=r?x+Math.sin(y*0.1)*p.wobble*2+(r()-.5)*p.wobble:x;
+      const linePhase=((wx%p.spacing)+p.spacing)%p.spacing;
+      const result=linePhase<p.thickness&&v<(1-linePhase/p.spacing)?0:255;
+      o[y*w+x]=p.invert?255-result:result;
+    }
     return o;
   }});
 
   A.push({ id:'diagonal-lines', name:'Diagonal Lines', category:'lines', params:[
     {id:'spacing',label:'Spacing',min:2,max:20,step:1,default:5},
     {id:'angle',label:'Angle',min:0,max:180,step:5,default:45},
-    {id:'thickness',label:'Thickness',min:1,max:8,step:1,default:2}
+    {id:'thickness',label:'Thickness',min:1,max:8,step:1,default:2},
+    {id:'wobble',label:'Wobble',min:0,max:3,step:.1,default:0},
+    {id:'taper',label:'Taper',min:0,max:1,step:.05,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h), ang=p.angle*Math.PI/180;
     const cos=Math.cos(ang),sin=Math.sin(ang);
+    const r=p.wobble>0?mkRand(p.seed):null;
     for(let y=0;y<h;y++) for(let x=0;x<w;x++) {
-      const proj=Math.abs((x*cos+y*sin)%p.spacing);
-      const v=clamp(px[y*w+x])/255;
-      const lineWidth=p.thickness*(1-v);
-      o[y*w+x]=proj<lineWidth?0:255;
+      const wb=r?(r()-.5)*p.wobble:0;
+      const proj=Math.abs((x*cos+y*sin+wb)%p.spacing);
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      const lineWidth=p.thickness*(1-v*p.taper);
+      const result=proj<lineWidth?0:255;
+      o[y*w+x]=p.invert?255-result:result;
     }
     return o;
   }});
 
   A.push({ id:'crosshatch', name:'Crosshatch', category:'lines', params:[
     {id:'spacing',label:'Spacing',min:3,max:20,step:1,default:6},
-    {id:'layers',label:'Layers',min:1,max:4,step:1,default:3},
-    {id:'angle',label:'Base Angle',min:0,max:90,step:5,default:45}
-  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h); o.fill(255);
-    const angles=[p.angle,p.angle+90,p.angle+45,p.angle+135];
+    {id:'layers',label:'Layers',min:1,max:6,step:1,default:3},
+    {id:'angle',label:'Base Angle',min:0,max:90,step:5,default:45},
+    {id:'lineWeight',label:'Line Weight',min:.5,max:4,step:.25,default:1.5},
+    {id:'wobble',label:'Wobble',min:0,max:3,step:.1,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h); o.fill(p.invert?0:255);
+    const angles=[p.angle,p.angle+90,p.angle+45,p.angle+135,p.angle+22,p.angle+67];
+    const r=p.wobble>0?mkRand(p.seed):null;
     for(let y=0;y<h;y++) for(let x=0;x<w;x++) {
-      const v=clamp(px[y*w+x])/255;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
       const layersNeeded=Math.ceil((1-v)*p.layers);
       for(let l=0;l<layersNeeded;l++){
-        const a=angles[l%4]*Math.PI/180;
-        const proj=Math.abs((x*Math.cos(a)+y*Math.sin(a))%p.spacing);
-        const thresh=0.4+(l*0.15);
-        if(proj<1.5&&v<thresh) { o[y*w+x]=0; break; }
+        const a=angles[l%6]*Math.PI/180;
+        const wb=r?(r()-.5)*p.wobble:0;
+        const proj=Math.abs((x*Math.cos(a)+y*Math.sin(a)+wb)%p.spacing);
+        const thresh=0.4+(l*0.12);
+        if(proj<p.lineWeight&&v<thresh) { o[y*w+x]=p.invert?255:0; break; }
       }
     }
     return o;
@@ -463,20 +640,30 @@ const DitherAlgorithms = (() => {
 
   A.push({ id:'contour-hatch', name:'Contour Hatching', category:'lines', params:[
     {id:'spacing',label:'Line Spacing',min:3,max:15,step:1,default:5},
-    {id:'thickness',label:'Line Width',min:.5,max:3,step:.25,default:1},
-    {id:'curvature',label:'Curvature',min:0,max:1,step:.05,default:.6}
+    {id:'thickness',label:'Line Width',min:.5,max:4,step:.25,default:1},
+    {id:'curvature',label:'Curvature',min:0,max:1,step:.05,default:.6},
+    {id:'cutoff',label:'White Cutoff',min:.7,max:1,step:.01,default:.92},
+    {id:'densityLayers',label:'Density Layers',min:1,max:3,step:1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      const v=clamp(px[y*w+x])/255;
-      if(v>.92)continue;
-      // Use gradient direction for contour-following
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      if(v>p.cutoff)continue;
       const e=sobelAt(px,x,y,w,h);
-      // Hatch perpendicular to gradient (along contour)
       const hatchAng=e.ang+Math.PI/2;
       const proj=Math.abs((x*Math.cos(hatchAng)+y*Math.sin(hatchAng))%p.spacing);
       const lineW=p.thickness*(1-v*0.5);
-      if(proj<lineW) o[y*w+x]=0;
+      if(proj<lineW){o[y*w+x]=p.invert?255:0;continue;}
+      if(p.densityLayers>=2&&v<.5){
+        const proj2=Math.abs((x*Math.cos(hatchAng+.5)+y*Math.sin(hatchAng+.5))%(p.spacing*1.3));
+        if(proj2<lineW*.7){o[y*w+x]=p.invert?255:0;continue;}
+      }
+      if(p.densityLayers>=3&&v<.25){
+        const proj3=Math.abs((x*Math.cos(hatchAng+1)+y*Math.sin(hatchAng+1))%(p.spacing*1.6));
+        if(proj3<lineW*.5) o[y*w+x]=p.invert?255:0;
+      }
     }
     return o;
   }});
@@ -486,46 +673,58 @@ const DitherAlgorithms = (() => {
     {id:'angle',label:'Angle',min:0,max:180,step:5,default:45},
     {id:'thickness',label:'Swell',min:.5,max:4,step:.25,default:1.5},
     {id:'curvature',label:'Curvature',min:0,max:1,step:.05,default:.5},
+    {id:'crosshatch',label:'Cross Lines',type:'checkbox',default:false},
+    {id:'crossAngle',label:'Cross Angle',min:30,max:90,step:5,default:90},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
     const ang=p.angle*Math.PI/180,cos=Math.cos(ang),sin=Math.sin(ang);
+    const ang2=(p.angle+p.crossAngle)*Math.PI/180,cos2=Math.cos(ang2),sin2=Math.sin(ang2);
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      const v=clamp(px[y*w+x])/255;
-      // Perpendicular distance to line
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
       const proj=(x*cos+y*sin);
       const lineIdx=Math.round(proj/p.lineSpacing);
-      const distToLine=Math.abs(proj-lineIdx*p.lineSpacing);
-      // Line swell based on darkness
       const swell=p.thickness*(1-v);
-      // Curvature: modulate based on local value
       const curveOffset=p.curvature*(v-.5)*p.lineSpacing*0.5;
       const adjustedDist=Math.abs(proj+curveOffset-lineIdx*p.lineSpacing);
-      if(adjustedDist<swell) o[y*w+x]=0;
+      if(adjustedDist<swell){o[y*w+x]=p.invert?255:0;continue;}
+      if(p.crosshatch&&v<.45){
+        const proj2=(x*cos2+y*sin2);
+        const lineIdx2=Math.round(proj2/p.lineSpacing);
+        const co2=p.curvature*(v-.5)*p.lineSpacing*0.5;
+        const ad2=Math.abs(proj2+co2-lineIdx2*p.lineSpacing);
+        if(ad2<swell*.7) o[y*w+x]=p.invert?255:0;
+      }
     }
     return o;
   }});
 
   A.push({ id:'stipple', name:'Stipple', category:'lines', params:[
-    {id:'density',label:'Density',min:500,max:20000,step:500,default:8000},
-    {id:'dotSize',label:'Dot Size',min:1,max:4,step:1,default:1},
+    {id:'density',label:'Density',min:500,max:30000,step:500,default:8000},
+    {id:'dotSize',label:'Dot Size',min:1,max:6,step:1,default:1},
+    {id:'variableSize',label:'Variable Size',type:'checkbox',default:false},
     {id:'regularity',label:'Regularity',min:0,max:1,step:.05,default:.3},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed);
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);const r=mkRand(p.seed);
+    const inkV=p.invert?255:0;
     for(let i=0;i<p.density;i++){
       const x=Math.floor(r()*w),y=Math.floor(r()*h);
-      const v=clamp(px[y*w+x])/255;
-      if(r()<v)continue; // more dots in dark areas
-      // Regularity: push toward grid
-      const gx=p.regularity>0?Math.round(x/(p.dotSize*3))*(p.dotSize*3):x;
-      const gy=p.regularity>0?Math.round(y/(p.dotSize*3))*(p.dotSize*3):y;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      if(r()<v)continue;
+      const ds=p.variableSize?Math.max(1,Math.round(p.dotSize*(1-v))):p.dotSize;
+      const gx=p.regularity>0?Math.round(x/(ds*3))*(ds*3):x;
+      const gy=p.regularity>0?Math.round(y/(ds*3))*(ds*3):y;
       const fx=Math.round(x*(1-p.regularity)+gx*p.regularity);
       const fy=Math.round(y*(1-p.regularity)+gy*p.regularity);
-      for(let dy=-p.dotSize+1;dy<p.dotSize;dy++)for(let dx=-p.dotSize+1;dx<p.dotSize;dx++){
-        if(dx*dx+dy*dy<p.dotSize*p.dotSize){
+      for(let dy=-ds+1;dy<ds;dy++)for(let dx=-ds+1;dx<ds;dx++){
+        if(dx*dx+dy*dy<ds*ds){
           const px2=fx+dx,py2=fy+dy;
-          if(px2>=0&&px2<w&&py2>=0&&py2<h) o[py2*w+px2]=0;
+          if(px2>=0&&px2<w&&py2>=0&&py2<h) o[py2*w+px2]=inkV;
         }
       }
     }
@@ -534,16 +733,22 @@ const DitherAlgorithms = (() => {
 
   A.push({ id:'wave-lines', name:'Wave Lines', category:'lines', params:[
     {id:'spacing',label:'Spacing',min:3,max:20,step:1,default:6},
-    {id:'amplitude',label:'Amplitude',min:0,max:10,step:.5,default:3},
-    {id:'frequency',label:'Frequency',min:.01,max:.2,step:.01,default:.05}
+    {id:'amplitude',label:'Amplitude',min:0,max:15,step:.5,default:3},
+    {id:'frequency',label:'Frequency',min:.01,max:.3,step:.01,default:.05},
+    {id:'thickness',label:'Thickness',min:.5,max:5,step:.25,default:1.5},
+    {id:'harmonics',label:'Harmonics',min:1,max:4,step:1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      const v=clamp(px[y*w+x])/255;
-      const wave=Math.sin(x*p.frequency)*p.amplitude*(1-v);
-      const proj=(y+wave)%p.spacing;
-      const lineW=1.5*(1-v);
-      if(Math.abs(proj)<lineW||Math.abs(proj-p.spacing)<lineW) o[y*w+x]=0;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      let wave=0;
+      for(let h2=1;h2<=p.harmonics;h2++) wave+=Math.sin(x*p.frequency*h2)*(p.amplitude/h2);
+      wave*=(1-v);
+      const proj=((y+wave)%p.spacing+p.spacing)%p.spacing;
+      const lineW=p.thickness*(1-v);
+      if(proj<lineW||p.spacing-proj<lineW) o[y*w+x]=p.invert?255:0;
     }
     return o;
   }});
@@ -551,16 +756,21 @@ const DitherAlgorithms = (() => {
   A.push({ id:'concentric-lines', name:'Concentric Lines', category:'lines', params:[
     {id:'spacing',label:'Ring Spacing',min:3,max:20,step:1,default:6},
     {id:'centerX',label:'Center X',min:0,max:1,step:.05,default:.5},
-    {id:'centerY',label:'Center Y',min:0,max:1,step:.05,default:.5}
+    {id:'centerY',label:'Center Y',min:0,max:1,step:.05,default:.5},
+    {id:'thickness',label:'Thickness',min:.5,max:5,step:.25,default:1.5},
+    {id:'wobble',label:'Wobble',min:0,max:5,step:.25,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
     const cx2=w*p.centerX,cy2=h*p.centerY;
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      const v=clamp(px[y*w+x])/255;
-      const dist=Math.sqrt((x-cx2)**2+(y-cy2)**2);
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      let dist=Math.sqrt((x-cx2)**2+(y-cy2)**2);
+      if(p.wobble>0){const a=Math.atan2(y-cy2,x-cx2);dist+=Math.sin(a*8)*p.wobble;}
       const ring=dist%p.spacing;
-      const lineW=1.5*(1-v);
-      if(ring<lineW) o[y*w+x]=0;
+      const lineW=p.thickness*(1-v);
+      if(ring<lineW) o[y*w+x]=p.invert?255:0;
     }
     return o;
   }});
@@ -569,85 +779,121 @@ const DitherAlgorithms = (() => {
     {id:'spacing',label:'Spacing',min:3,max:15,step:1,default:5},
     {id:'tightness',label:'Tightness',min:.5,max:3,step:.1,default:1},
     {id:'centerX',label:'Center X',min:0,max:1,step:.05,default:.5},
-    {id:'centerY',label:'Center Y',min:0,max:1,step:.05,default:.5}
+    {id:'centerY',label:'Center Y',min:0,max:1,step:.05,default:.5},
+    {id:'thickness',label:'Thickness',min:.3,max:4,step:.1,default:1.2},
+    {id:'direction',label:'Direction',type:'select',options:[{value:'cw',label:'Clockwise'},{value:'ccw',label:'Counter-CW'},{value:'double',label:'Double Spiral'}],default:'cw'},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
     const cx2=w*p.centerX,cy2=h*p.centerY;
+    const dir=p.direction==='ccw'?-1:1;
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      const v=clamp(px[y*w+x])/255;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
       const dist=Math.sqrt((x-cx2)**2+(y-cy2)**2);
-      const ang2=Math.atan2(y-cy2,x-cx2);
-      const spiral=(dist-ang2/(2*Math.PI)*p.spacing*p.tightness)%p.spacing;
-      const lineW=1.2*(1-v);
-      if(Math.abs(spiral)<lineW||Math.abs(spiral-p.spacing)<lineW) o[y*w+x]=0;
+      const ang2=Math.atan2(y-cy2,x-cx2)*dir;
+      const spiral=((dist-ang2/(2*Math.PI)*p.spacing*p.tightness)%p.spacing+p.spacing)%p.spacing;
+      const lineW=p.thickness*(1-v);
+      let hit=spiral<lineW||p.spacing-spiral<lineW;
+      if(!hit&&p.direction==='double'){
+        const spiral2=((dist+ang2/(2*Math.PI)*p.spacing*p.tightness)%p.spacing+p.spacing)%p.spacing;
+        hit=spiral2<lineW||p.spacing-spiral2<lineW;
+      }
+      if(hit) o[y*w+x]=p.invert?255:0;
     }
     return o;
   }});
 
   A.push({ id:'woodcut', name:'Woodcut', category:'lines', params:[
-    {id:'lineWidth',label:'Line Width',min:1,max:6,step:1,default:3},
+    {id:'lineWidth',label:'Line Width',min:1,max:8,step:1,default:3},
     {id:'contrast',label:'Contrast',min:.5,max:3,step:.1,default:1.5},
     {id:'angle',label:'Grain Angle',min:0,max:180,step:5,default:30},
     {id:'variation',label:'Variation',min:0,max:1,step:.05,default:.4},
+    {id:'cutoff',label:'Cut Depth',min:.4,max:1,step:.05,default:.75},
+    {id:'edgeLines',label:'Edge Lines',type:'checkbox',default:false},
+    {id:'edgeWeight',label:'Edge Weight',min:20,max:120,step:5,default:50},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed);
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);const r=mkRand(p.seed);
     const ang=p.angle*Math.PI/180,cos=Math.cos(ang),sin=Math.sin(ang);
+    const inkV=p.invert?255:0;
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
       let v=clamp(px[y*w+x])/255;
-      v=Math.pow(v,1/p.contrast); // boost contrast
+      v=Math.pow(v,1/p.contrast);
       const proj=x*cos+y*sin;
       const wobble=Math.sin(proj*0.1+r()*p.variation*10)*p.variation*2;
       const linePhase=(proj+wobble)%(p.lineWidth*2);
       const cutWidth=p.lineWidth*(1-v)*1.5;
-      if(linePhase<cutWidth&&v<0.75) o[y*w+x]=0;
+      if(linePhase<cutWidth&&v<p.cutoff) o[y*w+x]=inkV;
+      if(p.edgeLines){
+        const e=sobelAt(px,x,y,w,h);
+        if(e.mag>p.edgeWeight) o[y*w+x]=inkV;
+      }
     }
     return o;
   }});
 
   A.push({ id:'linocut', name:'Linocut', category:'lines', params:[
     {id:'blockSize',label:'Block Size',min:2,max:10,step:1,default:4},
-    {id:'cutDepth',label:'Cut Depth',min:.3,max:1,step:.05,default:.6},
+    {id:'cutDepth',label:'Cut Depth',min:.2,max:1,step:.05,default:.6},
     {id:'texture',label:'Texture',min:0,max:1,step:.05,default:.3},
+    {id:'angle',label:'Grain Angle',min:0,max:180,step:5,default:0},
+    {id:'edgeLines',label:'Edge Lines',type:'checkbox',default:false},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h);const r=mkRand(p.seed),bs=p.blockSize;
+    const ang=p.angle*Math.PI/180,cosA=Math.cos(ang),sinA=Math.sin(ang);
+    const cutV=p.invert?0:255, inkV=p.invert?255:0, texV=p.invert?0:255;
     for(let y=0;y<h;y+=bs)for(let x=0;x<w;x+=bs){
-      const v=clamp(px[Math.min(h-1,y)*w+Math.min(w-1,x)])/255;
+      let v=clamp(px[Math.min(h-1,y)*w+Math.min(w-1,x)])/255;
+      if(p.gamma!==1) v=Math.pow(v,p.gamma);
       const cut=v>p.cutDepth;
       for(let dy=0;dy<bs&&y+dy<h;dy++)for(let dx=0;dx<bs&&x+dx<w;dx++){
         if(cut){
-          o[(y+dy)*w+x+dx]=255; // cut away (white)
+          o[(y+dy)*w+x+dx]=cutV;
         }else{
-          // Ink with texture
-          const tex=r()<p.texture?255:0;
+          const grainCheck=p.angle>0?Math.sin(((x+dx)*cosA+(y+dy)*sinA)*0.5)>.3:true;
+          const tex=r()<p.texture&&grainCheck?texV:inkV;
           o[(y+dy)*w+x+dx]=tex;
         }
+      }
+    }
+    if(p.edgeLines){
+      for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
+        const e=sobelAt(px,x,y,w,h);
+        if(e.mag>50) o[y*w+x]=inkV;
       }
     }
     return o;
   }});
 
   A.push({ id:'etching', name:'Etching', category:'lines', params:[
-    {id:'lineSpacing',label:'Line Spacing',min:2,max:8,step:1,default:3},
+    {id:'lineSpacing',label:'Line Spacing',min:2,max:10,step:1,default:3},
     {id:'crossAngle',label:'Cross Angle',min:30,max:90,step:5,default:75},
-    {id:'depth',label:'Depth',min:.3,max:1,step:.05,default:.7},
+    {id:'baseAngle',label:'Base Angle',min:0,max:90,step:5,default:45},
+    {id:'depth',label:'Depth',min:.2,max:1,step:.05,default:.7},
+    {id:'lineWeight',label:'Line Weight',min:.3,max:3,step:.1,default:1},
+    {id:'crossWeight',label:'Cross Weight',min:.3,max:2,step:.1,default:.8},
     {id:'irregularity',label:'Irregularity',min:0,max:1,step:.05,default:.2},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed);
-    const a1=45*Math.PI/180,a2=(45+p.crossAngle)*Math.PI/180;
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);const r=mkRand(p.seed);
+    const a1=p.baseAngle*Math.PI/180,a2=(p.baseAngle+p.crossAngle)*Math.PI/180;
+    const inkV=p.invert?255:0;
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      const v=clamp(px[y*w+x])/255;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
       if(v>p.depth)continue;
       const wobble=(r()-.5)*p.irregularity*2;
-      // Primary lines
       const p1=Math.abs((x*Math.cos(a1)+y*Math.sin(a1)+wobble)%p.lineSpacing);
-      if(p1<1){o[y*w+x]=0;continue;}
-      // Cross lines for darker values
+      if(p1<p.lineWeight){o[y*w+x]=inkV;continue;}
       if(v<p.depth*0.6){
         const p2=Math.abs((x*Math.cos(a2)+y*Math.sin(a2)+wobble)%p.lineSpacing);
-        if(p2<0.8)o[y*w+x]=0;
+        if(p2<p.crossWeight)o[y*w+x]=inkV;
       }
     }
     return o;
@@ -657,22 +903,26 @@ const DitherAlgorithms = (() => {
   // ARTISTIC & PAINTERLY (12)
   // ═══════════════════════════════════════════
   A.push({ id:'overshot-sketch', name:'Overshot Sketch', category:'artistic', params:[
-    {id:'lineCount',label:'Lines',min:500,max:8000,step:500,default:3000},
-    {id:'overshoot',label:'Overshoot',min:0,max:1,step:.05,default:.4},
-    {id:'wobble',label:'Wobble',min:0,max:1,step:.05,default:.3},
-    {id:'thickness',label:'Thickness',min:1,max:3,step:1,default:1},
+    {id:'lineCount',label:'Lines',min:500,max:12000,step:500,default:3000},
+    {id:'overshoot',label:'Overshoot',min:0,max:1.5,step:.05,default:.4},
+    {id:'wobble',label:'Wobble',min:0,max:2,step:.05,default:.3},
+    {id:'thickness',label:'Thickness',min:1,max:5,step:1,default:1},
+    {id:'minLength',label:'Min Length',min:2,max:15,step:1,default:5},
+    {id:'maxLength',label:'Max Length',min:8,max:40,step:1,default:15},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
-  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed);
+  ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);const r=mkRand(p.seed);
     for(let i=0;i<p.lineCount;i++){
       const x=Math.floor(r()*w),y=Math.floor(r()*h);
-      const v=clamp(px[y*w+x])/255;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
       if(r()>1-v+.08)continue;
       let ang=r()*Math.PI;
       if(x>2&&x<w-3&&y>2&&y<h-3){
         const gx=clamp(px[y*w+x+1])-clamp(px[y*w+x-1]);
         const gy=clamp(px[(y+1)*w+x])-clamp(px[(y-1)*w+x]);
         ang=Math.atan2(gx,-gy)+r()*.4;}
-      const baseLen=(1-v)*15+5;
+      const baseLen=(1-v)*p.maxLength+p.minLength;
       const ovLen=baseLen*(1+p.overshoot*(r()*.5+.5));
       const dx=Math.cos(ang),dy=Math.sin(ang);
       for(let t=-ovLen/2;t<ovLen/2;t++){
@@ -681,15 +931,21 @@ const DitherAlgorithms = (() => {
           const fx=Math.round(x+dx*t+wobbleX-dy*ww),fy=Math.round(y+dy*t+wobbleY+dx*ww);
           if(fx>=0&&fx<w&&fy>=0&&fy<h){
             const edgeFade=Math.abs(t)/(ovLen/2);
-            if(edgeFade<.85||r()>.3)o[fy*w+fx]=Math.min(o[fy*w+fx],edgeFade>.7?128:0);
+            if(edgeFade<.85||r()>.3){
+              const mark=edgeFade>.7?128:0;
+              o[fy*w+fx]=p.invert?Math.max(o[fy*w+fx],255-mark):Math.min(o[fy*w+fx],mark);
+            }
           }}}
     }return o;
   }});
 
   A.push({ id:'gesture-drawing', name:'Gesture Drawing', category:'artistic', params:[
-    {id:'strokes',label:'Strokes',min:200,max:5000,step:200,default:1500},
-    {id:'strokeLen',label:'Stroke Length',min:10,max:80,step:5,default:30},
+    {id:'strokes',label:'Strokes',min:200,max:8000,step:200,default:1500},
+    {id:'strokeLen',label:'Stroke Length',min:10,max:120,step:5,default:30},
     {id:'speed',label:'Speed/Looseness',min:0,max:1,step:.05,default:.6},
+    {id:'thickness',label:'Thickness',min:1,max:4,step:1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed);
     for(let s=0;s<p.strokes;s++){
@@ -742,9 +998,12 @@ const DitherAlgorithms = (() => {
   }});
 
   A.push({ id:'ink-splatter', name:'Ink Splatter', category:'artistic', params:[
-    {id:'splatCount',label:'Splats',min:20,max:500,step:10,default:100},
-    {id:'maxRadius',label:'Max Radius',min:2,max:40,step:1,default:15},
-    {id:'drips',label:'Drip Length',min:0,max:30,step:1,default:8},
+    {id:'splatCount',label:'Splats',min:20,max:800,step:10,default:100},
+    {id:'maxRadius',label:'Max Radius',min:2,max:60,step:1,default:15},
+    {id:'drips',label:'Drip Length',min:0,max:50,step:1,default:8},
+    {id:'droplets',label:'Droplet Count',min:0,max:10,step:1,default:5},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) { const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed);
     for(let s=0;s<p.splatCount;s++){
@@ -875,23 +1134,22 @@ const DitherAlgorithms = (() => {
   A.push({ id:'charcoal', name:'Charcoal', category:'artistic', params:[
     {id:'grain',label:'Grain',min:0,max:1,step:.05,default:.5},
     {id:'smudge',label:'Smudge',min:0,max:1,step:.05,default:.3},
-    {id:'darkness',label:'Darkness',min:.5,max:2,step:.05,default:1.2},
+    {id:'darkness',label:'Darkness',min:.5,max:3,step:.05,default:1.2},
+    {id:'patchiness',label:'Patchiness',min:0,max:.5,step:.02,default:.1},
+    {id:'blurRadius',label:'Smudge Radius',min:1,max:10,step:1,default:5},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),r=mkRand(p.seed);
-    // Start with darkened, contrasted source
     for(let i=0;i<w*h;i++){
       let v=clamp(px[i])/255;
       v=Math.pow(v,p.darkness);
-      // Paper grain
       const grain=(r()-.5)*p.grain*80;
-      // Patchy application
-      const patch=r()<0.1?40:0;
+      const patch=r()<p.patchiness?40:0;
       o[i]=clamp(v*255+grain+patch);
     }
-    // Smudge pass (horizontal blur)
     if(p.smudge>0){
-      const rad=Math.round(p.smudge*5);
+      const rad=Math.round(p.blurRadius*p.smudge);
       const tmp=new Uint8ClampedArray(o);
       for(let y=0;y<h;y++)for(let x=0;x<w;x++){
         let sum=0,n2=0;
@@ -901,6 +1159,7 @@ const DitherAlgorithms = (() => {
         o[y*w+x]=clamp(sum/n2*p.smudge+tmp[y*w+x]*(1-p.smudge));
       }
     }
+    if(p.invert) for(let i=0;i<w*h;i++) o[i]=255-o[i];
     return o;
   }});
 
@@ -976,8 +1235,10 @@ const DitherAlgorithms = (() => {
   // RECONSTRUCTIVE (6) — paintstroke-by-paintstroke
   // ═══════════════════════════════════════════
   A.push({ id:'oil-paint', name:'Oil Paint', category:'reconstructive', params:[
-    {id:'brushSize',label:'Brush Size',min:2,max:15,step:1,default:6},
-    {id:'detail',label:'Detail Passes',min:1,max:5,step:1,default:3},
+    {id:'brushSize',label:'Brush Size',min:2,max:20,step:1,default:6},
+    {id:'detail',label:'Detail Passes',min:1,max:6,step:1,default:3},
+    {id:'strokeLength',label:'Stroke Length',min:.3,max:2,step:.1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),r=mkRand(p.seed);
@@ -1017,9 +1278,11 @@ const DitherAlgorithms = (() => {
   }});
 
   A.push({ id:'pointillism', name:'Pointillism', category:'reconstructive', params:[
-    {id:'dotSize',label:'Dot Size',min:2,max:10,step:1,default:4},
-    {id:'density',label:'Density',min:.3,max:1,step:.05,default:.7},
-    {id:'jitter',label:'Color Jitter',min:0,max:40,step:1,default:15},
+    {id:'dotSize',label:'Dot Size',min:2,max:15,step:1,default:4},
+    {id:'density',label:'Density',min:.2,max:1,step:.05,default:.7},
+    {id:'jitter',label:'Color Jitter',min:0,max:60,step:1,default:15},
+    {id:'background',label:'Background',min:200,max:255,step:1,default:240},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h);o.fill(240);const r=mkRand(p.seed);
@@ -1367,26 +1630,33 @@ const DitherAlgorithms = (() => {
   }});
 
   A.push({ id:'contour-drawing', name:'Contour Drawing', category:'sketch', params:[
-    {id:'lines',label:'Contour Lines',min:10,max:30,step:1,default:15},
-    {id:'thickness',label:'Thickness',min:1,max:4,step:1,default:2},
-    {id:'smoothing',label:'Smoothing',min:0,max:1,step:.05,default:.6}
+    {id:'lines',label:'Contour Lines',min:3,max:50,step:1,default:15},
+    {id:'thickness',label:'Thickness',min:1,max:6,step:1,default:2},
+    {id:'smoothing',label:'Smoothing',min:0,max:1,step:.05,default:.6},
+    {id:'fillBetween',label:'Fill Between',type:'checkbox',default:false},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);
-    // Draw lines at fixed brightness levels
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
+    const inkV=p.invert?255:0;
     const step=255/(p.lines+1);
     for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
-      const v=clamp(px[y*w+x]);
-      // Check if this pixel crosses a contour level
+      let v=clamp(px[y*w+x]); if(p.gamma!==1) v=Math.pow(v/255,p.gamma)*255;
+      let vn=clamp(px[y*w+x+1]); if(p.gamma!==1) vn=Math.pow(vn/255,p.gamma)*255;
+      let vs=clamp(px[(y+1)*w+x]); if(p.gamma!==1) vs=Math.pow(vs/255,p.gamma)*255;
+      if(p.fillBetween){
+        const band=Math.floor(v/step);
+        if(band%2===0) o[y*w+x]=inkV;
+        continue;
+      }
       for(let level=1;level<=p.lines;level++){
         const threshold=level*step;
-        const vn=clamp(px[y*w+x+1]),vs=clamp(px[(y+1)*w+x]);
         if((v>=threshold&&vn<threshold)||(v<threshold&&vn>=threshold)||
            (v>=threshold&&vs<threshold)||(v<threshold&&vs>=threshold)){
-          // Draw with thickness
           for(let dy=-p.thickness+1;dy<p.thickness;dy++)for(let dx=-p.thickness+1;dx<p.thickness;dx++){
             if(dx*dx+dy*dy<p.thickness*p.thickness){
               const fx=x+dx,fy=y+dy;
-              if(fx>=0&&fx<w&&fy>=0&&fy<h) o[fy*w+fx]=0;
+              if(fx>=0&&fx<w&&fy>=0&&fy<h) o[fy*w+fx]=inkV;
             }
           }
           break;
@@ -1397,44 +1667,73 @@ const DitherAlgorithms = (() => {
   }});
 
   A.push({ id:'pen-ink', name:'Pen & Ink', category:'sketch', params:[
-    {id:'lineWeight',label:'Line Weight',min:.5,max:3,step:.25,default:1},
+    {id:'lineWeight',label:'Line Weight',min:.3,max:4,step:.1,default:1},
+    {id:'hatchAngle',label:'Hatch Angle',min:0,max:180,step:5,default:45},
+    {id:'fillDensity',label:'Fill Density',min:2,max:15,step:1,default:5},
     {id:'crosshatch',label:'Crosshatch',type:'checkbox',default:true},
+    {id:'crossAngle',label:'Cross Angle',min:30,max:150,step:5,default:90},
+    {id:'crossThreshold',label:'Cross Threshold',min:.1,max:.8,step:.05,default:.45},
+    {id:'solidThreshold',label:'Solid Fill',min:0,max:.4,step:.02,default:.15},
     {id:'edgeLines',label:'Edge Lines',type:'checkbox',default:true},
-    {id:'fillDensity',label:'Fill Density',min:2,max:10,step:1,default:5},
+    {id:'edgeThreshold',label:'Edge Threshold',min:20,max:150,step:5,default:60},
+    {id:'edgeWeight',label:'Edge Weight',min:1,max:4,step:1,default:1},
+    {id:'hatchCutoff',label:'Hatch Cutoff',min:.4,max:1,step:.05,default:.75},
+    {id:'wobble',label:'Wobble',min:0,max:2,step:.1,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed);
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);const r=mkRand(p.seed);
+    const inkV=p.invert?255:0;
+    const a1=p.hatchAngle*Math.PI/180;
+    const cos1=Math.cos(a1),sin1=Math.sin(a1);
+    const a2=(p.hatchAngle+p.crossAngle)*Math.PI/180;
+    const cos2=Math.cos(a2),sin2=Math.sin(a2);
     // Hatching fill
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      const v=clamp(px[y*w+x])/255;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      const wb=p.wobble>0?(r()-.5)*p.wobble:0;
       // Primary hatching
-      const proj1=Math.abs((x*0.707+y*0.707)%p.fillDensity);
-      if(proj1<p.lineWeight&&v<0.75) {o[y*w+x]=0;continue;}
+      const proj1=Math.abs((x*cos1+y*sin1+wb)%p.fillDensity);
+      if(proj1<p.lineWeight&&v<p.hatchCutoff) {o[y*w+x]=inkV;continue;}
       // Crosshatch for darker areas
-      if(p.crosshatch&&v<0.45){
-        const proj2=Math.abs((x*0.707-y*0.707)%p.fillDensity);
-        if(proj2<p.lineWeight) {o[y*w+x]=0;continue;}
+      if(p.crosshatch&&v<p.crossThreshold){
+        const proj2=Math.abs((x*cos2+y*sin2+wb)%p.fillDensity);
+        if(proj2<p.lineWeight) {o[y*w+x]=inkV;continue;}
       }
       // Very dark = solid fill
-      if(v<0.15) {o[y*w+x]=0;continue;}
+      if(v<p.solidThreshold) {o[y*w+x]=inkV;continue;}
     }
     // Edge lines
     if(p.edgeLines){
       for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
         const e=sobelAt(px,x,y,w,h);
-        if(e.mag>60) o[y*w+x]=0;
+        if(e.mag>p.edgeThreshold){
+          for(let ew=0;ew<p.edgeWeight;ew++){
+            const fx=x+Math.round(Math.cos(e.ang)*ew),fy=y+Math.round(Math.sin(e.ang)*ew);
+            if(fx>=0&&fx<w&&fy>=0&&fy<h) o[fy*w+fx]=inkV;
+          }
+        }
       }
     }
     return o;
   }});
 
   A.push({ id:'comic-lines', name:'Comic Lines', category:'sketch', params:[
-    {id:'edgeThreshold',label:'Edge Threshold',min:20,max:120,step:5,default:50},
-    {id:'lineThickness',label:'Line Thickness',min:1,max:4,step:1,default:2},
+    {id:'edgeThreshold',label:'Edge Threshold',min:10,max:150,step:5,default:50},
+    {id:'lineThickness',label:'Line Thickness',min:1,max:6,step:1,default:2},
     {id:'screenDots',label:'Screen Dots',type:'checkbox',default:true},
-    {id:'screenSize',label:'Screen Size',min:3,max:12,step:1,default:6}
+    {id:'screenSize',label:'Screen Size',min:3,max:16,step:1,default:6},
+    {id:'screenAngle',label:'Screen Angle',min:0,max:90,step:5,default:0},
+    {id:'screenShape',label:'Screen Shape',type:'select',options:[{value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},{value:'line',label:'Lines'}],default:'circle'},
+    {id:'shadeCutoff',label:'Shade Cutoff',min:.3,max:.9,step:.05,default:.6},
+    {id:'fillDensity',label:'Fill Density',min:.3,max:1.5,step:.05,default:.7},
+    {id:'solidBlacks',label:'Solid Blacks',min:0,max:.3,step:.02,default:.1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
+    const inkV=p.invert?255:0, paperV=p.invert?0:255;
     // Edge detection for outlines
     for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
       const e=sobelAt(px,x,y,w,h);
@@ -1442,36 +1741,49 @@ const DitherAlgorithms = (() => {
         for(let dy=-p.lineThickness+1;dy<p.lineThickness;dy++)for(let dx=-p.lineThickness+1;dx<p.lineThickness;dx++){
           if(dx*dx+dy*dy<p.lineThickness*p.lineThickness){
             const fx=x+dx,fy=y+dy;
-            if(fx>=0&&fx<w&&fy>=0&&fy<h) o[fy*w+fx]=0;
+            if(fx>=0&&fx<w&&fy>=0&&fy<h) o[fy*w+fx]=inkV;
           }
         }
       }
     }
-    // Halftone screen for shading
+    // Screen for shading
     if(p.screenDots){
       const ds=p.screenSize;
+      const sAng=p.screenAngle*Math.PI/180,cosS=Math.cos(sAng),sinS=Math.sin(sAng);
       for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-        if(o[y*w+x]===0)continue; // don't overwrite lines
-        const v=clamp(px[y*w+x])/255;
-        if(v>0.6)continue; // only shade darker areas
-        const cx2=((x%ds)+ds)%ds,cy2=((y%ds)+ds)%ds;
+        if(o[y*w+x]===inkV)continue;
+        let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+        if(v<p.solidBlacks){o[y*w+x]=inkV;continue;}
+        if(v>p.shadeCutoff)continue;
+        const rx=x*cosS+y*sinS,ry=-x*sinS+y*cosS;
+        const cx2=((rx%ds)+ds)%ds,cy2=((ry%ds)+ds)%ds;
         const nx=(cx2/ds-.5)*2,ny=(cy2/ds-.5)*2;
-        const d=Math.sqrt(nx*nx+ny*ny);
-        const t=(1-v)*1.2;
-        if(d<t*0.7) o[y*w+x]=0;
+        let d;
+        if(p.screenShape==='diamond') d=Math.abs(nx)+Math.abs(ny);
+        else if(p.screenShape==='line') d=Math.abs(ny);
+        else d=Math.sqrt(nx*nx+ny*ny);
+        const t=(1-v)*1.2*p.fillDensity;
+        if(d<t) o[y*w+x]=inkV;
       }
     }
     return o;
   }});
 
   A.push({ id:'architectural', name:'Architectural Sketch', category:'sketch', params:[
-    {id:'lineWeight',label:'Line Weight',min:.5,max:3,step:.25,default:1.5},
-    {id:'hatching',label:'Hatching Density',min:3,max:12,step:1,default:6},
-    {id:'edgeSensitivity',label:'Edge Detail',min:20,max:100,step:5,default:40},
+    {id:'lineWeight',label:'Line Weight',min:.5,max:4,step:.25,default:1.5},
+    {id:'hatching',label:'Hatching Density',min:3,max:15,step:1,default:6},
+    {id:'hatchAngle',label:'Hatch Angle',min:0,max:180,step:5,default:45},
+    {id:'edgeSensitivity',label:'Edge Detail',min:10,max:150,step:5,default:40},
+    {id:'shadowCutoff',label:'Shadow Cutoff',min:.3,max:1,step:.05,default:.65},
+    {id:'hatchWeight',label:'Hatch Weight',min:.3,max:3,step:.1,default:1},
+    {id:'crosshatch',label:'Cross-hatch',type:'checkbox',default:false},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h);o.fill(255);const r=mkRand(p.seed);
-    // Clean edge lines (architectural style - precise)
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);const r=mkRand(p.seed);
+    const inkV=p.invert?255:0;
+    const hAng=p.hatchAngle*Math.PI/180,cosH=Math.cos(hAng),sinH=Math.sin(hAng);
     for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
       const e=sobelAt(px,x,y,w,h);
       if(e.mag>p.edgeSensitivity){
@@ -1479,17 +1791,20 @@ const DitherAlgorithms = (() => {
         for(let dd=0;dd<lw;dd++){
           const fx=x+Math.round(Math.cos(e.ang)*dd);
           const fy=y+Math.round(Math.sin(e.ang)*dd);
-          if(fx>=0&&fx<w&&fy>=0&&fy<h) o[fy*w+fx]=0;
+          if(fx>=0&&fx<w&&fy>=0&&fy<h) o[fy*w+fx]=inkV;
         }
       }
     }
-    // Shadow hatching (45 degrees, consistent spacing)
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      if(o[y*w+x]===0)continue;
-      const v=clamp(px[y*w+x])/255;
-      if(v>0.65)continue;
-      const proj=Math.abs((x+y)%p.hatching);
-      if(proj<1) o[y*w+x]=clamp(100+v*155);
+      if(o[y*w+x]===inkV)continue;
+      let v=clamp(px[y*w+x])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
+      if(v>p.shadowCutoff)continue;
+      const proj=Math.abs((x*cosH+y*sinH)%p.hatching);
+      if(proj<p.hatchWeight) o[y*w+x]=p.invert?clamp(255-(100+v*155)):clamp(100+v*155);
+      if(p.crosshatch&&v<p.shadowCutoff*.5){
+        const proj2=Math.abs((-x*sinH+y*cosH)%(p.hatching*1.3));
+        if(proj2<p.hatchWeight*.7) o[y*w+x]=p.invert?clamp(255-(80+v*155)):clamp(80+v*155);
+      }
     }
     return o;
   }});
@@ -1515,10 +1830,13 @@ const DitherAlgorithms = (() => {
   }});
 
   A.push({ id:'reaction-diffusion', name:'Reaction-Diffusion', category:'exotic', params:[
-    {id:'iterations',label:'Iterations',min:5,max:50,step:5,default:15},
-    {id:'feed',label:'Feed Rate',min:.01,max:.08,step:.005,default:.055},
-    {id:'kill',label:'Kill Rate',min:.04,max:.07,step:.002,default:.062},
-    {id:'imageMix',label:'Image Influence',min:0,max:1,step:.05,default:.5}
+    {id:'iterations',label:'Iterations',min:5,max:80,step:5,default:15},
+    {id:'feed',label:'Feed Rate',min:.01,max:.08,step:.002,default:.055},
+    {id:'kill',label:'Kill Rate',min:.04,max:.07,step:.001,default:.062},
+    {id:'imageMix',label:'Image Influence',min:0,max:1,step:.05,default:.5},
+    {id:'scale',label:'Scale',min:.2,max:2,step:.1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h);
     let a=new Float32Array(w*h),b=new Float32Array(w*h);
@@ -1539,29 +1857,43 @@ const DitherAlgorithms = (() => {
       }
       a=na;b=nb;
     }
-    for(let i=0;i<w*h;i++) o[i]=clamp((1-b[i])*255);
+    for(let i=0;i<w*h;i++){let v=(1-b[i])*255;if(p.gamma!==1)v=Math.pow(clamp(v)/255,p.gamma)*255;o[i]=p.invert?255-clamp(v):clamp(v);}
     return o;
   }});
 
   A.push({ id:'pixel-sort', name:'Pixel Sort', category:'exotic', params:[
-    {id:'threshold',label:'Threshold',min:10,max:200,step:5,default:80},
+    {id:'threshold',label:'Threshold',min:10,max:240,step:5,default:80},
+    {id:'upperThreshold',label:'Upper Threshold',min:30,max:255,step:5,default:255},
     {id:'direction',label:'Direction',type:'select',options:[{value:'h',label:'Horizontal'},{value:'v',label:'Vertical'},{value:'d',label:'Diagonal'}],default:'h'},
-    {id:'mode',label:'Mode',type:'select',options:[{value:'dark',label:'Dark First'},{value:'light',label:'Light First'}],default:'dark'}
+    {id:'mode',label:'Mode',type:'select',options:[{value:'dark',label:'Dark First'},{value:'light',label:'Light First'},{value:'random',label:'Random'}],default:'dark'},
+    {id:'minRunLength',label:'Min Run',min:1,max:50,step:1,default:1},
+    {id:'maxRunLength',label:'Max Run',min:10,max:500,step:10,default:500},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h);
     const buf=new Float32Array(px);
+    if(p.gamma!==1) for(let i=0;i<w*h;i++) buf[i]=Math.pow(clamp(buf[i])/255,p.gamma)*255;
+    const rng=p.mode==='random'?mkRand(p.seed):null;
+    function sortSeg(seg){
+      if(seg.length<p.minRunLength)return seg;
+      const s=seg.slice(0,Math.min(seg.length,p.maxRunLength));
+      if(p.mode==='random'){s.sort(()=>rng()-.5);}
+      else s.sort((a2,b2)=>p.mode==='dark'?a2-b2:b2-a2);
+      return s.concat(seg.slice(s.length));
+    }
     if(p.direction==='h'){
       for(let y=0;y<h;y++){
         let start=-1;
         for(let x=0;x<=w;x++){
           const v=x<w?clamp(buf[y*w+x]):256;
-          const inRange=v<p.threshold;
+          const inRange=v>=p.threshold&&v<=p.upperThreshold;
           if(inRange&&start===-1) start=x;
           else if(!inRange&&start!==-1){
             const seg=[];
             for(let sx=start;sx<x;sx++) seg.push(clamp(buf[y*w+sx]));
-            seg.sort((a2,b2)=>p.mode==='dark'?a2-b2:b2-a2);
-            for(let sx=start;sx<x;sx++) buf[y*w+sx]=seg[sx-start];
+            const sorted=sortSeg(seg);
+            for(let sx=start;sx<x;sx++) buf[y*w+sx]=sorted[sx-start];
             start=-1;
           }
         }
@@ -1571,13 +1903,13 @@ const DitherAlgorithms = (() => {
         let start=-1;
         for(let y=0;y<=h;y++){
           const v=y<h?clamp(buf[y*w+x]):256;
-          const inRange=v<p.threshold;
+          const inRange=v>=p.threshold&&v<=p.upperThreshold;
           if(inRange&&start===-1) start=y;
           else if(!inRange&&start!==-1){
             const seg=[];
             for(let sy=start;sy<y;sy++) seg.push(clamp(buf[sy*w+x]));
-            seg.sort((a2,b2)=>p.mode==='dark'?a2-b2:b2-a2);
-            for(let sy=start;sy<y;sy++) buf[sy*w+x]=seg[sy-start];
+            const sorted=sortSeg(seg);
+            for(let sy=start;sy<y;sy++) buf[sy*w+x]=sorted[sy-start];
             start=-1;
           }
         }
@@ -1588,8 +1920,11 @@ const DitherAlgorithms = (() => {
   }});
 
   A.push({ id:'voronoi-dither', name:'Voronoi Dither', category:'exotic', params:[
-    {id:'cells',label:'Cells',min:50,max:1000,step:50,default:300},
-    {id:'style',label:'Style',type:'select',options:[{value:'flat',label:'Flat'},{value:'edge',label:'Edges Only'},{value:'mixed',label:'Mixed'}],default:'flat'},
+    {id:'cells',label:'Cells',min:50,max:2000,step:50,default:300},
+    {id:'style',label:'Style',type:'select',options:[{value:'flat',label:'Flat'},{value:'edge',label:'Edges Only'},{value:'mixed',label:'Mixed'},{value:'stippled',label:'Stippled'}],default:'flat'},
+    {id:'edgeWidth',label:'Edge Width',min:.5,max:5,step:.25,default:2},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),r=mkRand(p.seed);
@@ -1602,17 +1937,27 @@ const DitherAlgorithms = (() => {
         if(d<min1){min2=min1;min1=d;nearIdx=i;}
         else if(d<min2)min2=d;
       }
+      const edgeDist=Math.sqrt(min2)-Math.sqrt(min1);
+      let result;
       if(p.style==='edge'){
-        o[y*w+x]=(Math.sqrt(min2)-Math.sqrt(min1))<2?0:255;
+        result=edgeDist<p.edgeWidth?0:255;
       } else if(p.style==='mixed'){
-        const edge=Math.sqrt(min2)-Math.sqrt(min1)<2;
         const cp=pts[nearIdx];
-        const sv=clamp(px[Math.min(h-1,Math.round(cp.y))*w+Math.min(w-1,Math.round(cp.x))]);
-        o[y*w+x]=edge?0:sv;
+        let sv=clamp(px[Math.min(h-1,Math.round(cp.y))*w+Math.min(w-1,Math.round(cp.x))]);
+        if(p.gamma!==1) sv=Math.pow(sv/255,p.gamma)*255;
+        result=edgeDist<p.edgeWidth?0:sv;
+      } else if(p.style==='stippled'){
+        const cp=pts[nearIdx];
+        let sv=clamp(px[Math.min(h-1,Math.round(cp.y))*w+Math.min(w-1,Math.round(cp.x))])/255;
+        if(p.gamma!==1) sv=Math.pow(sv,p.gamma);
+        result=sv>.5?255:edgeDist<p.edgeWidth?0:255;
       } else {
         const cp=pts[nearIdx];
-        o[y*w+x]=clamp(px[Math.min(h-1,Math.round(cp.y))*w+Math.min(w-1,Math.round(cp.x))]);
+        let sv=clamp(px[Math.min(h-1,Math.round(cp.y))*w+Math.min(w-1,Math.round(cp.x))]);
+        if(p.gamma!==1) sv=Math.pow(sv/255,p.gamma)*255;
+        result=sv;
       }
+      o[y*w+x]=p.invert?255-clamp(result):clamp(result);
     }
     return o;
   }});
@@ -1793,53 +2138,66 @@ const DitherAlgorithms = (() => {
   }});
 
   A.push({ id:'solarize', name:'Solarize', category:'digital', params:[
-    {id:'threshold',label:'Threshold',min:60,max:200,step:5,default:128},
-    {id:'amount',label:'Amount',min:0,max:1,step:.05,default:1}
+    {id:'threshold',label:'Threshold',min:20,max:240,step:5,default:128},
+    {id:'amount',label:'Amount',min:0,max:1,step:.05,default:1},
+    {id:'curve',label:'Curve',type:'select',options:[{value:'linear',label:'Linear'},{value:'sine',label:'Sine Wave'},{value:'tri',label:'Triangle'}],default:'linear'},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h);
     for(let i=0;i<w*h;i++){
-      const v=clamp(px[i]);
-      const solarized=v>p.threshold?255-v:v;
+      let v=clamp(px[i]); if(p.gamma!==1) v=Math.pow(v/255,p.gamma)*255;
+      let solarized;
+      if(p.curve==='sine') solarized=Math.abs(Math.sin(v/255*Math.PI))*255;
+      else if(p.curve==='tri') solarized=v<128?v*2:510-v*2;
+      else solarized=v>p.threshold?255-v:v;
       o[i]=clamp(v*(1-p.amount)+solarized*p.amount);
     }
     return o;
   }});
 
   A.push({ id:'posterize', name:'Posterize', category:'digital', params:[
-    {id:'levels',label:'Levels',min:2,max:8,step:1,default:4},
+    {id:'levels',label:'Levels',min:2,max:16,step:1,default:4},
     {id:'dither',label:'Dither Amount',min:0,max:1,step:.05,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),r=mkRand(p.seed);
     for(let i=0;i<w*h;i++){
-      let v=clamp(px[i])/255;
+      let v=clamp(px[i])/255; if(p.gamma!==1) v=Math.pow(v,p.gamma);
       v+=((r()-.5)*p.dither/p.levels);
       const band=Math.round(Math.max(0,Math.min(1,v))*(p.levels-1));
-      o[i]=clamp(band/(p.levels-1)*255);
+      let result=clamp(band/(p.levels-1)*255);
+      o[i]=p.invert?255-result:result;
     }
     return o;
   }});
 
   A.push({ id:'glitch-blocks', name:'Glitch Blocks', category:'digital', params:[
-    {id:'blockSize',label:'Block Size',min:4,max:30,step:2,default:12},
-    {id:'probability',label:'Glitch Probability',min:.05,max:.5,step:.05,default:.15},
-    {id:'shift',label:'Max Shift',min:5,max:50,step:5,default:20},
+    {id:'blockSize',label:'Block Size',min:4,max:40,step:2,default:12},
+    {id:'probability',label:'Glitch Probability',min:.02,max:.7,step:.02,default:.15},
+    {id:'shift',label:'Max Shift',min:5,max:80,step:5,default:20},
+    {id:'corruption',label:'Corruption',type:'select',options:[{value:'shift',label:'Shift'},{value:'invert',label:'Invert'},{value:'noise',label:'Noise'},{value:'mirror',label:'Mirror'},{value:'mixed',label:'Mixed'}],default:'shift'},
+    {id:'vertShift',label:'Vertical Shift',min:0,max:1,step:.05,default:.25},
+    {id:'scanlines',label:'Scanlines',type:'checkbox',default:false},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     const o=new Uint8ClampedArray(w*h),r=mkRand(p.seed),bs=p.blockSize;
-    // Copy source first
     for(let i=0;i<w*h;i++) o[i]=clamp(px[i]);
-    // Apply random block shifts
     for(let y=0;y<h;y+=bs)for(let x=0;x<w;x+=bs){
       if(r()>p.probability)continue;
       const shiftX=Math.round((r()-.5)*p.shift*2);
-      const shiftY=Math.round((r()-.5)*p.shift*0.5);
+      const shiftY=Math.round((r()-.5)*p.shift*p.vertShift*2);
+      const mode=p.corruption==='mixed'?['shift','invert','noise','mirror'][Math.floor(r()*4)]:p.corruption;
       for(let dy=0;dy<bs&&y+dy<h;dy++)for(let dx=0;dx<bs&&x+dx<w;dx++){
-        const sx=((x+dx+shiftX)%w+w)%w;
-        const sy=((y+dy+shiftY)%h+h)%h;
-        o[(y+dy)*w+x+dx]=clamp(px[sy*w+sx]);
+        const di=(y+dy)*w+x+dx;
+        if(mode==='invert') o[di]=255-clamp(px[di]);
+        else if(mode==='noise') o[di]=clamp(px[di]+(r()-.5)*120);
+        else if(mode==='mirror') o[di]=clamp(px[(y+dy)*w+Math.min(w-1,Math.max(0,w-1-(x+dx)))]);
+        else{const sx=((x+dx+shiftX)%w+w)%w,sy=((y+dy+shiftY)%h+h)%h;o[di]=clamp(px[sy*w+sx]);}
       }
     }
+    if(p.scanlines){for(let y=0;y<h;y+=2)for(let x=0;x<w;x++) o[y*w+x]=clamp(o[y*w+x]*.85);}
     return o;
   }});
 
