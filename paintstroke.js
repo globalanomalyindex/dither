@@ -716,21 +716,31 @@ const PaintEngine = (() => {
     const d = imageData.data;
     const sz = Math.max(w, h);
     const mask = new Float32Array(sz * sz);
-    const th = threshold / 100;
-    const sf = softness / 100;
+    const th = threshold / 255;   // 0-1, pixels brighter than this become transparent
+    const sf = softness / 100;    // 0-1, feather width around threshold
 
     for (let y = 0; y < h && y < sz; y++) {
       for (let x = 0; x < w && x < sz; x++) {
         const i = (y * w + x) * 4;
-        let gray = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) / 255;
-        // invert: black = opaque (stamp on white bg). default: white = opaque
-        if (invert) gray = 1 - gray;
-        // Apply threshold with softness
-        const edge = sf > 0 ? sf * 0.5 : 0.01;
+        const brightness = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) / 255;
+        // Threshold removes bright pixels (white → transparent)
+        // Darker pixels stay opaque, preserving texture
+        const edge = sf > 0 ? sf * 0.5 : 0.005;
         const lo = Math.max(0, th - edge), hi = Math.min(1, th + edge);
-        if (gray <= lo) { mask[y * sz + x] = 0; }
-        else if (gray >= hi) { mask[y * sz + x] = 1; }
-        else { mask[y * sz + x] = (gray - lo) / (hi - lo); }
+        let alpha;
+        if (brightness >= hi) {
+          alpha = 0;          // above threshold = fully transparent
+        } else if (brightness <= lo) {
+          alpha = 1;          // well below threshold = fully opaque
+        } else {
+          alpha = 1 - (brightness - lo) / (hi - lo);  // smooth fade
+        }
+        // Preserve tonal texture: darks are more opaque, mids partially
+        // Scale by inverse brightness so texture detail is retained
+        const texture = 1 - brightness;
+        alpha = alpha * (0.3 + 0.7 * texture);
+        if (invert) alpha = brightness >= hi ? 1 : brightness <= lo ? 0 : (brightness - lo) / (hi - lo);
+        mask[y * sz + x] = Math.max(0, Math.min(1, alpha));
       }
     }
 
