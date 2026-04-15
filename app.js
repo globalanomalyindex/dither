@@ -182,7 +182,7 @@
       spaceHeld = false;
       if (activeTab === 'paintstroke') {
         canvasWrapper.style.cursor = 'none';
-        if (brushCursor) brushCursor.style.display = '';
+        if (brushCursor) brushCursor.style.display = 'block';
       }
     }
   });
@@ -292,6 +292,7 @@
   let isPanning = false;
   let isPainting = false;
   let spaceHeld = false;
+  let brushSelectionMode = false;
   let panStartX = 0, panStartY = 0;
   let panStartPanX = 0, panStartPanY = 0;
 
@@ -305,6 +306,8 @@
 
   canvasWrapper.addEventListener('mousedown', e => {
     if (e.button !== 0) return;
+    // Brush selection mode intercepts in capture phase — skip here
+    if (brushSelectionMode) return;
     e.preventDefault();
 
     // Paint mode: paintstroke tab active, Space not held, image loaded
@@ -1498,7 +1501,7 @@
       $('tab-grain').style.display = tab === 'grain' ? '' : 'none';
       $('tab-paintstroke').style.display = tab === 'paintstroke' ? '' : 'none';
       // Show/hide brush cursor
-      if (brushCursor) brushCursor.style.display = tab === 'paintstroke' ? '' : 'none';
+      if (brushCursor) brushCursor.style.display = tab === 'paintstroke' ? 'block' : 'none';
       // Set canvas cursor
       canvasWrapper.style.cursor = tab === 'paintstroke' ? 'none' : '';
     });
@@ -2083,7 +2086,8 @@
         { label: 'Smoothness', id: 'liq-smooth', min: 0, max: 2, step: 0.1, value: PaintEngine.getSettings().liquifySmooth, setter: v => PaintEngine.setLiquifySmooth(v) }
       ],
       blend: [{ label: 'Kernel', id: 'blend-kern', min: 1, max: 20, value: PaintEngine.getSettings().blendKernel, setter: v => PaintEngine.setBlendKernel(v) }],
-      spread: [{ label: 'Amount', id: 'spread-amt', min: 1, max: 100, value: PaintEngine.getSettings().spreadAmount, setter: v => PaintEngine.setSpreadAmount(v) }]
+      spread: [{ label: 'Amount', id: 'spread-amt', min: 1, max: 100, value: PaintEngine.getSettings().spreadAmount, setter: v => PaintEngine.setSpreadAmount(v) }],
+      pickup: []
     };
 
     const opts = toolOpts[tool] || [];
@@ -2159,25 +2163,105 @@
   buildBrushLibrary();
   updateBrushPreview();
 
-  // Brush upload with modal preview
-  const brushFileInput = $('brush-file-input');
-  const brushModal = $('brush-upload-modal');
-  const brushImportCanvas = $('brush-import-canvas');
-  const brushImportCtx = brushImportCanvas.getContext('2d');
-  let _importSourceData = null;
-  let _importFileName = '';
+  // Canvas brush maker — marquee selection mode
+  let marqueeStartX = 0, marqueeStartY = 0;
+  let marqueeActive = false;
+  const brushMarquee = $('brush-marquee');
+  const brushMakerModal = $('brush-maker-modal');
+  const brushMakerCanvas = $('brush-maker-canvas');
+  const brushMakerCtx = brushMakerCanvas.getContext('2d');
+  let _brushMakerSourceData = null;
+  let _brushMakerName = 'Canvas Brush';
 
-  $('btn-upload-brush').addEventListener('click', () => brushFileInput.click());
+  $('btn-make-brush').addEventListener('click', () => {
+    if (!DitherEngine.getSourceSize()) return;
+    brushSelectionMode = true;
+    canvasWrapper.style.cursor = 'crosshair';
+    if (brushCursor) brushCursor.style.display = 'none';
+  });
 
-  function renderBrushImportPreview() {
-    if (!_importSourceData) return;
-    const th = parseInt($('brush-import-threshold').value);
-    const sf = parseInt($('brush-import-softness').value);
-    const inv = $('brush-import-invert').checked;
-    $('brush-import-threshold-val').textContent = th;
-    $('brush-import-softness-val').textContent = sf;
+  // Override mousedown to intercept marquee selection
+  canvasWrapper.addEventListener('mousedown', e => {
+    if (brushSelectionMode && e.button === 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      marqueeActive = true;
+      marqueeStartX = e.clientX;
+      marqueeStartY = e.clientY;
+      brushMarquee.style.display = 'block';
+      brushMarquee.style.left = e.clientX + 'px';
+      brushMarquee.style.top = e.clientY + 'px';
+      brushMarquee.style.width = '0px';
+      brushMarquee.style.height = '0px';
+    }
+  }, true); // capture phase to intercept before paint/pan handler
 
-    const result = PaintEngine.extractBrushFromImage(_importSourceData, th, sf, inv);
+  document.addEventListener('mousemove', e => {
+    if (marqueeActive) {
+      const x = Math.min(marqueeStartX, e.clientX);
+      const y = Math.min(marqueeStartY, e.clientY);
+      const w = Math.abs(e.clientX - marqueeStartX);
+      const h = Math.abs(e.clientY - marqueeStartY);
+      brushMarquee.style.left = x + 'px';
+      brushMarquee.style.top = y + 'px';
+      brushMarquee.style.width = w + 'px';
+      brushMarquee.style.height = h + 'px';
+    }
+  });
+
+  document.addEventListener('mouseup', e => {
+    if (marqueeActive) {
+      marqueeActive = false;
+      brushMarquee.style.display = 'none';
+      brushSelectionMode = false;
+      canvasWrapper.style.cursor = activeTab === 'paintstroke' ? 'none' : '';
+      if (activeTab === 'paintstroke' && brushCursor) brushCursor.style.display = 'block';
+
+      // Compute the selected rectangle in canvas pixel space
+      const x1 = Math.min(marqueeStartX, e.clientX);
+      const y1 = Math.min(marqueeStartY, e.clientY);
+      const x2 = Math.max(marqueeStartX, e.clientX);
+      const y2 = Math.max(marqueeStartY, e.clientY);
+
+      // Need at least a 4px drag
+      if (x2 - x1 < 4 || y2 - y1 < 4) return;
+
+      // Convert screen coords to canvas pixel coords
+      const ptTL = canvasToImage(x1, y1);
+      const ptBR = canvasToImage(x2, y2);
+      const cx = Math.max(0, Math.floor(ptTL.x));
+      const cy = Math.max(0, Math.floor(ptTL.y));
+      const cw = Math.min(canvas.width - cx, Math.ceil(ptBR.x) - cx);
+      const ch = Math.min(canvas.height - cy, Math.ceil(ptBR.y) - cy);
+
+      if (cw < 2 || ch < 2) return;
+
+      // Capture the canvas pixels in that rect
+      _brushMakerSourceData = ctx.getImageData(cx, cy, cw, ch);
+      _brushMakerName = 'Canvas Brush ' + (PaintEngine.getBrushes().length + 1);
+
+      // Reset controls
+      $('brush-maker-threshold').value = 128;
+      $('brush-maker-softness').value = 20;
+      $('brush-maker-invert').checked = false;
+
+      // Show modal and render preview
+      brushMakerModal.style.display = '';
+      renderBrushMakerPreview();
+    }
+  });
+
+  function renderBrushMakerPreview() {
+    if (!_brushMakerSourceData) return;
+    const th = parseInt($('brush-maker-threshold').value);
+    const sf = parseInt($('brush-maker-softness').value);
+    const inv = $('brush-maker-invert').checked;
+    $('brush-maker-threshold-val').textContent = th;
+    $('brush-maker-softness-val').textContent = sf;
+
+    // extractBrushFromImage expects threshold 0-100 scale
+    const thNorm = th / 255 * 100;
+    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, thNorm, sf, inv);
     const sz = 128;
     const scaled = new Float32Array(sz * sz);
     const srcSz = result.size;
@@ -2189,67 +2273,41 @@
         scaled[y * sz + x] = result.mask[sy * srcSz + sx];
       }
     }
-    const img = brushImportCtx.createImageData(sz, sz);
+    const img = brushMakerCtx.createImageData(sz, sz);
     for (let i = 0; i < sz * sz; i++) {
       const v = Math.round(scaled[i] * 255);
       const idx = i * 4;
       img.data[idx] = v; img.data[idx + 1] = v; img.data[idx + 2] = v; img.data[idx + 3] = 255;
     }
-    brushImportCtx.putImageData(img, 0, 0);
+    brushMakerCtx.putImageData(img, 0, 0);
   }
 
-  brushFileInput.addEventListener('change', e => {
-    const file = e.target.files[0];
-    if (!file) return;
-    _importFileName = file.name.replace(/\.[^.]+$/, '');
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const c = document.createElement('canvas');
-        c.width = img.width; c.height = img.height;
-        const tctx = c.getContext('2d');
-        tctx.drawImage(img, 0, 0);
-        _importSourceData = tctx.getImageData(0, 0, img.width, img.height);
-        // Reset controls
-        $('brush-import-threshold').value = 50;
-        $('brush-import-softness').value = 20;
-        $('brush-import-invert').checked = false;
-        // Show modal and render preview
-        brushModal.style.display = '';
-        renderBrushImportPreview();
-      };
-      img.src = reader.result;
-    };
-    reader.readAsDataURL(file);
-    brushFileInput.value = '';
-  });
-
   // Live preview on slider change
-  $('brush-import-threshold').addEventListener('input', renderBrushImportPreview);
-  $('brush-import-softness').addEventListener('input', renderBrushImportPreview);
-  $('brush-import-invert').addEventListener('change', renderBrushImportPreview);
+  $('brush-maker-threshold').addEventListener('input', renderBrushMakerPreview);
+  $('brush-maker-softness').addEventListener('input', renderBrushMakerPreview);
+  $('brush-maker-invert').addEventListener('change', renderBrushMakerPreview);
 
   // Cancel
-  $('brush-import-cancel').addEventListener('click', () => {
-    brushModal.style.display = 'none';
-    _importSourceData = null;
+  $('brush-maker-cancel').addEventListener('click', () => {
+    brushMakerModal.style.display = 'none';
+    _brushMakerSourceData = null;
   });
 
   // Confirm — add the brush
-  $('brush-import-confirm').addEventListener('click', () => {
-    if (!_importSourceData) return;
-    const th = parseInt($('brush-import-threshold').value);
-    const sf = parseInt($('brush-import-softness').value);
-    const inv = $('brush-import-invert').checked;
-    const result = PaintEngine.extractBrushFromImage(_importSourceData, th, sf, inv);
-    PaintEngine.addBrush(_importFileName, result.mask, result.size);
+  $('brush-maker-confirm').addEventListener('click', () => {
+    if (!_brushMakerSourceData) return;
+    const th = parseInt($('brush-maker-threshold').value);
+    const sf = parseInt($('brush-maker-softness').value);
+    const inv = $('brush-maker-invert').checked;
+    const thNorm = th / 255 * 100;
+    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, thNorm, sf, inv);
+    PaintEngine.addBrush(_brushMakerName, result.mask, result.size);
     PaintEngine.selectBrush(PaintEngine.getBrushes().length - 1);
     PaintEngine.invalidateCursorCache();
     buildBrushLibrary();
     updateBrushPreview();
-    brushModal.style.display = 'none';
-    _importSourceData = null;
+    brushMakerModal.style.display = 'none';
+    _brushMakerSourceData = null;
   });
 
   // Brush angle + follow direction

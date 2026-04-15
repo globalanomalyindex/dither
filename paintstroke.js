@@ -342,6 +342,7 @@ const PaintEngine = (() => {
       case 'liquify': stampLiquify(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
       case 'blend':   stampBlend(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
       case 'spread':  stampSpread(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
+      case 'pickup':  stampPickup(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
     }
 
     ctx.putImageData(dstData, rx0, ry0);
@@ -564,6 +565,25 @@ const PaintEngine = (() => {
     }
   }
 
+  // ── Tool: Pickup (paint with sampled pixels) ──
+  function stampPickup(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
+    if (!hasPickup) return;
+    for (let my = 0; my < ms; my++) {
+      for (let mx = 0; mx < ms; mx++) {
+        const a = activeMask[my * ms + mx] * alpha;
+        if (a < 0.01) continue;
+        const px = bx0 + mx, py = by0 + my;
+        if (px < 0 || px >= w || py < 0 || py >= h) continue;
+        const idx = (py * w + px) * 4;
+        const mi = my * ms + mx;
+        // Paint the picked-up color buffer onto canvas
+        dst[idx]     = Math.round(src[idx]     + (pickupR[mi] - src[idx])     * a);
+        dst[idx + 1] = Math.round(src[idx + 1] + (pickupG[mi] - src[idx + 1]) * a);
+        dst[idx + 2] = Math.round(src[idx + 2] + (pickupB[mi] - src[idx + 2]) * a);
+      }
+    }
+  }
+
   // ── Stroke Handling ──
   function beginStroke(x, y) {
     if (!canvas) return;
@@ -574,7 +594,7 @@ const PaintEngine = (() => {
     strokeDirX = 0; strokeDirY = 0;
     updateActiveMask();
 
-    if (tool === 'smudge') initPickup(x, y);
+    if (tool === 'smudge' || tool === 'pickup') initPickup(x, y);
 
     applyStamp(x, y);
   }
