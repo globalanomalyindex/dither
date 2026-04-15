@@ -231,6 +231,26 @@ const DitherEngine = (() => {
     return Math.max(0, 1 - lockAmount);
   }
 
+  // ── Blend Modes ──
+  function blendPixel(a, b, mode) {
+    const an = a / 255, bn = b / 255;
+    let r;
+    switch (mode) {
+      case 'multiply': r = an * bn; break;
+      case 'screen': r = 1 - (1 - an) * (1 - bn); break;
+      case 'overlay': r = an < 0.5 ? 2 * an * bn : 1 - 2 * (1 - an) * (1 - bn); break;
+      case 'softLight': r = bn < 0.5 ? an - (1 - 2 * bn) * an * (1 - an) : an + (2 * bn - 1) * (an < 0.25 ? ((16 * an - 12) * an + 4) * an : Math.sqrt(an) - an); break;
+      case 'hardLight': r = bn < 0.5 ? 2 * an * bn : 1 - 2 * (1 - an) * (1 - bn); break;
+      case 'difference': r = Math.abs(an - bn); break;
+      case 'exclusion': r = an + bn - 2 * an * bn; break;
+      case 'darken': r = Math.min(an, bn); break;
+      case 'lighten': r = Math.max(an, bn); break;
+      case 'add': r = Math.min(1, an + bn); break;
+      default: r = bn; break;
+    }
+    return r * 255;
+  }
+
   // ── Main Process ──
   function process(pipeline, globals, previewMaxDim) {
     if (!sourceData) return null;
@@ -262,10 +282,12 @@ const DitherEngine = (() => {
 
     let current = new Float32Array(gray);
     const n = w * h;
+
     for (let pi = 0; pi < pipeline.length; pi++) {
       const step = pipeline[pi];
-      const input = new Float32Array(current);
-      const dithResult = step.algorithm.apply(input, w, h, step.params);
+      const useOrig = step.params._useOriginal || false;
+      const inputData = useOrig ? new Float32Array(origGray) : new Float32Array(current);
+      const dithResult = step.algorithm.apply(inputData, w, h, step.params);
       const mix = step.params._mix || 0;
       const inv = step.params._invert || false;
       const bp = step.params._blackPoint || 0;
@@ -274,11 +296,18 @@ const DitherEngine = (() => {
       const feather = step.params._feather === undefined ? 10 : step.params._feather;
       const edgeMode = step.params._edgeMode || 'soft';
       const toneResponse = step.params._toneResponse || 0;
+      const blendMode = step.params._blendMode || 'normal';
 
       const blended = new Float32Array(n);
       for (let j = 0; j < n; j++) {
         let v = dithResult[j];
         if (mix > 0) v = v * (1 - mix) + origGray[j] * mix;
+
+        // Apply blend mode between current accumulator and this step's result
+        if (pi > 0 && blendMode !== 'normal') {
+          v = blendPixel(current[j], v, blendMode);
+        }
+
         let effectAlpha = 1;
         if (hasBWClip) effectAlpha = calcEdgeAlpha(origGray[j], bp, wp, feather, edgeMode, j);
         if (toneResponse !== 0) effectAlpha *= calcToneAlpha(origGray[j], toneResponse);
@@ -319,7 +348,8 @@ const DitherEngine = (() => {
     for (let i = 0; i < n; i++) grayRef[i] = 0.2126 * origR[i] + 0.7152 * origG[i] + 0.0722 * origB[i];
     const toneLock = globals.toneLock;
 
-    for (const step of pipeline) {
+    for (let pi = 0; pi < pipeline.length; pi++) {
+      const step = pipeline[pi];
       const mix = step.params._mix || 0;
       const inv = step.params._invert || false;
       const bp = step.params._blackPoint || 0;
@@ -328,10 +358,15 @@ const DitherEngine = (() => {
       const feather = step.params._feather === undefined ? 10 : step.params._feather;
       const edgeMode = step.params._edgeMode || 'soft';
       const toneResponse = step.params._toneResponse || 0;
+      const blendMode = step.params._blendMode || 'normal';
+      const useOrig = step.params._useOriginal || false;
 
-      const drR = step.algorithm.apply(new Float32Array(rCh), w, h, step.params);
-      const drG = step.algorithm.apply(new Float32Array(gCh), w, h, step.params);
-      const drB = step.algorithm.apply(new Float32Array(bCh), w, h, step.params);
+      const inR = useOrig ? new Float32Array(origR) : new Float32Array(rCh);
+      const inG = useOrig ? new Float32Array(origG) : new Float32Array(gCh);
+      const inB = useOrig ? new Float32Array(origB) : new Float32Array(bCh);
+      const drR = step.algorithm.apply(inR, w, h, step.params);
+      const drG = step.algorithm.apply(inG, w, h, step.params);
+      const drB = step.algorithm.apply(inB, w, h, step.params);
       const prevR = new Float32Array(rCh), prevG = new Float32Array(gCh), prevB = new Float32Array(bCh);
       for (let j = 0; j < n; j++) {
         let vr = drR[j], vg = drG[j], vb = drB[j];
@@ -339,6 +374,11 @@ const DitherEngine = (() => {
           vr = vr*(1-mix) + origR[j]*mix;
           vg = vg*(1-mix) + origG[j]*mix;
           vb = vb*(1-mix) + origB[j]*mix;
+        }
+        if (pi > 0 && blendMode !== 'normal') {
+          vr = blendPixel(prevR[j], vr, blendMode);
+          vg = blendPixel(prevG[j], vg, blendMode);
+          vb = blendPixel(prevB[j], vb, blendMode);
         }
         let effectAlpha = 1;
         if (hasBWClip) effectAlpha = calcEdgeAlpha(grayRef[j], bp, wp, feather, edgeMode, j);
@@ -381,7 +421,8 @@ const DitherEngine = (() => {
       const grayRef = new Float32Array(n);
       for (let i = 0; i < n; i++) grayRef[i] = 0.2126 * origR[i] + 0.7152 * origG[i] + 0.0722 * origB[i];
 
-      for (const step of pipeline) {
+      for (let pi = 0; pi < pipeline.length; pi++) {
+        const step = pipeline[pi];
         const mix = step.params._mix || 0;
         const inv = step.params._invert || false;
         const bp = step.params._blackPoint || 0;
@@ -390,10 +431,15 @@ const DitherEngine = (() => {
         const feather = step.params._feather === undefined ? 10 : step.params._feather;
         const edgeMode = step.params._edgeMode || 'soft';
         const toneResponse = step.params._toneResponse || 0;
+        const blendMode = step.params._blendMode || 'normal';
+        const useOrig = step.params._useOriginal || false;
 
-        const drR = step.algorithm.apply(new Float32Array(rCh), w, h, step.params);
-        const drG = step.algorithm.apply(new Float32Array(gCh), w, h, step.params);
-        const drB = step.algorithm.apply(new Float32Array(bCh), w, h, step.params);
+        const inR = useOrig ? new Float32Array(origR) : new Float32Array(rCh);
+        const inG = useOrig ? new Float32Array(origG) : new Float32Array(gCh);
+        const inB = useOrig ? new Float32Array(origB) : new Float32Array(bCh);
+        const drR = step.algorithm.apply(inR, w, h, step.params);
+        const drG = step.algorithm.apply(inG, w, h, step.params);
+        const drB = step.algorithm.apply(inB, w, h, step.params);
         const prevR = new Float32Array(rCh), prevG = new Float32Array(gCh), prevB = new Float32Array(bCh);
         for (let j = 0; j < n; j++) {
           let vr = drR[j], vg = drG[j], vb = drB[j];
@@ -401,6 +447,11 @@ const DitherEngine = (() => {
             vr = vr*(1-mix) + origR[j]*mix;
             vg = vg*(1-mix) + origG[j]*mix;
             vb = vb*(1-mix) + origB[j]*mix;
+          }
+          if (pi > 0 && blendMode !== 'normal') {
+            vr = blendPixel(prevR[j], vr, blendMode);
+            vg = blendPixel(prevG[j], vg, blendMode);
+            vb = blendPixel(prevB[j], vb, blendMode);
           }
           let effectAlpha = 1;
           if (hasBWClip) effectAlpha = calcEdgeAlpha(grayRef[j], bp, wp, feather, edgeMode, j);

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=13">
+  <link rel="stylesheet" href="style.css?v=14">
 </head>
 <body>
   <div id="app">
@@ -127,7 +127,9 @@
                 </div>
               </div>
               <div class="param-group">
-                <button id="btn-extract-palette" class="btn-small">Extract from Image</button>
+                <button id="btn-extract-palette" class="btn-small">Extract from Source</button>
+                <button id="btn-extract-ref" class="btn-small" style="margin-top:4px">Extract from Reference...</button>
+                <input type="file" id="ref-image-input" accept="image/*" style="display:none">
               </div>
               <div id="palette-swatches" class="palette-swatches"></div>
             </div>
@@ -255,6 +257,10 @@
             <div class="algo-category" data-cat="effects">
               <div class="algo-category-header">Effects & Transforms</div>
               <div class="algorithm-list" data-category="effects"></div>
+            </div>
+            <div class="algo-category" data-cat="ascii">
+              <div class="algo-category-header">ASCII & Characters</div>
+              <div class="algorithm-list" data-category="ascii"></div>
             </div>
           </div>
 
@@ -512,10 +518,10 @@
     </div>
   </div>
 
-  <script src="dither.js?v=13"></script>
-  <script src="engine.js?v=13"></script>
-  <script src="grain.js?v=13"></script>
-  <script src="paintstroke.js?v=13"></script>
-  <script src="app.js?v=13"></script>
+  <script src="dither.js?v=14"></script>
+  <script src="engine.js?v=14"></script>
+  <script src="grain.js?v=14"></script>
+  <script src="paintstroke.js?v=14"></script>
+  <script src="app.js?v=14"></script>
 </body>
 </html>

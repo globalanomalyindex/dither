@@ -87,7 +87,7 @@ const DitherAlgorithms = (() => {
   // ORDERED & PATTERN (12)
   // ═══════════════════════════════════════════
   A.push({ id:'ordered', name:'Ordered (Bayer)', category:'ordered', params:[
-    {id:'size',label:'Matrix',type:'select',options:[{value:2,label:'2x2'},{value:4,label:'4x4'},{value:8,label:'8x8'},{value:16,label:'16x16'}],default:4},
+    {id:'size',label:'Matrix',type:'select',options:[{value:2,label:'2x2'},{value:4,label:'4x4'},{value:8,label:'8x8'},{value:16,label:'16x16'},{value:32,label:'32x32'},{value:64,label:'64x64'}],default:4},
     {id:'spread',label:'Spread',min:0,max:255,step:1,default:128},
     {id:'rotation',label:'Rotation',min:0,max:90,step:1,default:0},
     {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
@@ -2429,6 +2429,327 @@ const DitherAlgorithms = (() => {
         }
       }
       o[y*w+x]=clamp(wSum>0?sum/wSum:cv);
+    }
+    return o;
+  }});
+
+  // ═══════════════════════════════════════════
+  // ASCII & CHARACTER (8)
+  // ═══════════════════════════════════════════
+
+  // ASCII ramp lookup helper
+  function asciiRamp(charset) {
+    const ramps = {
+      'standard':    ' .:-=+*#%@',
+      'detailed':    ' .\'`^",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$',
+      'blocks':      ' ░▒▓█',
+      'blocks-ext':  ' ·░▒▓▊█',
+      'box-light':   ' ·┄┈╌─│┌┐└┘├┤┬┴┼',
+      'box-heavy':   ' ╍═║╔╗╚╝╠╣╦╩╬█',
+      'box-double':  ' ═║╔╗╚╝╠╣╦╩╬░▒▓█',
+      'slashes':     ' /\\|─XVY*#',
+      'dots':        ' ·•●○◦◎◉⊙⊚',
+      'braille':     ' ⠁⠂⠃⠄⠅⠆⠇⠈⠉⠊⠋⠌⠍⠎⠏⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿⡀⡁⡂⡃⡄⡅⡆⡇⣀⣄⣆⣇⣠⣤⣦⣧⣰⣴⣶⣷⣸⣼⣾⣿',
+      'math':        ' ·±×÷≈≠≤≥∞∑∏∫√∂∆Ω',
+      'stars':       ' ·✦✧★☆✪✫✬✭✮✯',
+      'arrows':      ' ←↑→↓↔↕↖↗↘↙⇐⇑⇒⇓',
+      'geometric':   ' ▪▫◊◇◆△▲▽▼□■○●',
+      'currency':    ' ¢€£¥₹₽₿$∮∯∰',
+    };
+    return ramps[charset] || ramps['standard'];
+  }
+
+  A.push({ id:'ascii-standard', name:'ASCII Art', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:2,max:16,step:1,default:6},
+    {id:'charset',label:'Characters',type:'select',options:[
+      {value:'standard',label:'Standard'},{value:'detailed',label:'Detailed'},
+      {value:'blocks',label:'Blocks ░▒▓█'},{value:'blocks-ext',label:'Blocks Extended'},
+      {value:'box-light',label:'Box Light ┌─┐'},{value:'box-heavy',label:'Box Heavy ╔═╗'},
+      {value:'box-double',label:'Box Double ═║╬'},{value:'slashes',label:'Slashes /\\|'},
+      {value:'dots',label:'Dots ·•●'},{value:'braille',label:'Braille ⠿⣿'},
+      {value:'math',label:'Math ±×÷∞'},{value:'stars',label:'Stars ★✦✯'},
+      {value:'arrows',label:'Arrows ←↑→↓'},{value:'geometric',label:'Geometric ◆▲●'},
+      {value:'currency',label:'Currency $€£¥'}
+    ],default:'standard'},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o=new Uint8ClampedArray(w*h);
+    const cs=p.cellSize, ramp=asciiRamp(p.charset), rLen=ramp.length;
+    for(let cy=0;cy<h;cy+=cs)for(let cx=0;cx<w;cx+=cs){
+      // Average value in cell
+      let sum=0,count=0;
+      for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+        sum+=clamp(px[(cy+dy)*w+cx+dx]); count++;
+      }
+      let avg=sum/count/255; if(p.gamma!==1) avg=Math.pow(avg,p.gamma);
+      if(p.invert) avg=1-avg;
+      // Map to character index → grayscale value
+      const charIdx=Math.min(rLen-1,Math.floor(avg*rLen));
+      const grayVal=Math.round(charIdx/(rLen-1)*255);
+      for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+        o[(cy+dy)*w+cx+dx]=grayVal;
+      }
+    }
+    return o;
+  }});
+
+  A.push({ id:'ascii-edge', name:'ASCII Edges', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:3,max:12,step:1,default:5},
+    {id:'charset',label:'Characters',type:'select',options:[
+      {value:'slashes',label:'Slashes /\\|─'},{value:'box-light',label:'Box Light ┌─┐'},
+      {value:'box-heavy',label:'Box Heavy ╔═╗'},{value:'arrows',label:'Arrows ←↑→↓'},
+      {value:'geometric',label:'Geometric ◆▲●'}
+    ],default:'slashes'},
+    {id:'edgeThreshold',label:'Edge Threshold',min:10,max:120,step:5,default:30},
+    {id:'fillChar',label:'Fill Shading',type:'checkbox',default:true},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
+    const cs=p.cellSize;
+    // Direction-based character mapping: 0=horiz,1=vert,2=diag-right,3=diag-left,4=no-edge
+    const dirMaps={
+      'slashes':    ['─','|','/',  '\\','·'],
+      'box-light':  ['─','│','╱','╲','·'],
+      'box-heavy':  ['═','║','╱','╲','·'],
+      'arrows':     ['→','↓','↗','↘','·'],
+      'geometric':  ['▬','▮','◣','◢','·']
+    };
+    const dm=dirMaps[p.charset]||dirMaps['slashes'];
+    for(let cy=0;cy<h;cy+=cs)for(let cx=0;cx<w;cx+=cs){
+      const midX=Math.min(w-2,Math.max(1,cx+Math.floor(cs/2)));
+      const midY=Math.min(h-2,Math.max(1,cy+Math.floor(cs/2)));
+      const e=sobelAt(px,midX,midY,w,h);
+      let sum=0,count=0;
+      for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+        sum+=clamp(px[(cy+dy)*w+cx+dx]); count++;
+      }
+      let avg=sum/count/255; if(p.gamma!==1) avg=Math.pow(avg,p.gamma);
+      if(p.invert) avg=1-avg;
+      let charGray;
+      if(e.mag>p.edgeThreshold){
+        // Direction-based
+        const a=(e.ang+Math.PI)%(Math.PI); // 0 to PI
+        if(a<Math.PI/6||a>5*Math.PI/6) charGray=40; // horizontal edge
+        else if(a>Math.PI/3&&a<2*Math.PI/3) charGray=40; // vertical edge
+        else if(a>=Math.PI/6&&a<=Math.PI/3) charGray=60; // diagonal
+        else charGray=60;
+      } else if(p.fillChar){
+        charGray=Math.round(avg*255);
+      } else {
+        charGray=p.invert?0:255;
+      }
+      for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+        o[(cy+dy)*w+cx+dx]=charGray;
+      }
+    }
+    return o;
+  }});
+
+  A.push({ id:'ascii-blocks', name:'Block Characters', category:'ascii', params:[
+    {id:'cellW',label:'Cell Width',min:1,max:8,step:1,default:2},
+    {id:'cellH',label:'Cell Height',min:1,max:8,step:1,default:4},
+    {id:'charset',label:'Style',type:'select',options:[
+      {value:'blocks',label:'Blocks ░▒▓█'},{value:'blocks-ext',label:'Extended ·░▒▓▊█'},
+      {value:'braille',label:'Braille ⠿⣿'},{value:'geometric',label:'Geometric □■'},
+      {value:'dots',label:'Dots ·•●'}
+    ],default:'blocks'},
+    {id:'dither',label:'Dither',min:0,max:1,step:.05,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o=new Uint8ClampedArray(w*h);
+    const cw=p.cellW,ch=p.cellH,ramp=asciiRamp(p.charset),rLen=ramp.length;
+    const r=p.dither>0?mkRand(p.seed):null;
+    for(let cy=0;cy<h;cy+=ch)for(let cx=0;cx<w;cx+=cw){
+      let sum=0,count=0;
+      for(let dy=0;dy<ch&&cy+dy<h;dy++)for(let dx=0;dx<cw&&cx+dx<w;dx++){
+        sum+=clamp(px[(cy+dy)*w+cx+dx]); count++;
+      }
+      let avg=sum/count/255; if(p.gamma!==1) avg=Math.pow(avg,p.gamma);
+      if(p.invert) avg=1-avg;
+      if(r) avg=Math.max(0,Math.min(1,avg+(r()-.5)*p.dither/rLen));
+      const charIdx=Math.min(rLen-1,Math.floor(avg*rLen));
+      const grayVal=Math.round(charIdx/(rLen-1)*255);
+      for(let dy=0;dy<ch&&cy+dy<h;dy++)for(let dx=0;dx<cw&&cx+dx<w;dx++){
+        o[(cy+dy)*w+cx+dx]=grayVal;
+      }
+    }
+    return o;
+  }});
+
+  A.push({ id:'ascii-halftone', name:'ASCII Halftone', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:3,max:12,step:1,default:6},
+    {id:'charset',label:'Characters',type:'select',options:[
+      {value:'standard',label:'Standard .:-=+*#%@'},{value:'blocks',label:'Blocks ░▒▓█'},
+      {value:'dots',label:'Dots ·•●○'},{value:'braille',label:'Braille ⠿⣿'},
+      {value:'stars',label:'Stars ·✦★'},{value:'geometric',label:'Geometric □◆●'}
+    ],default:'dots'},
+    {id:'angle',label:'Angle',min:0,max:90,step:5,default:45},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o=new Uint8ClampedArray(w*h);
+    const cs=p.cellSize, ramp=asciiRamp(p.charset), rLen=ramp.length;
+    const ang=p.angle*Math.PI/180,cosA=Math.cos(ang),sinA=Math.sin(ang);
+    for(let cy=0;cy<h;cy+=cs)for(let cx=0;cx<w;cx+=cs){
+      let sum=0,count=0;
+      for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+        sum+=clamp(px[(cy+dy)*w+cx+dx]); count++;
+      }
+      let avg=sum/count/255; if(p.gamma!==1) avg=Math.pow(avg,p.gamma);
+      if(p.invert) avg=1-avg;
+      // Halftone modulation within cell
+      for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+        const nx=((dx-cs/2)/cs)*2,ny=((dy-cs/2)/cs)*2;
+        const rx=nx*cosA+ny*sinA,ry=-nx*sinA+ny*cosA;
+        const d=Math.sqrt(rx*rx+ry*ry);
+        const modAvg=Math.max(0,Math.min(1,avg+(d-.7)*.3));
+        const charIdx=Math.min(rLen-1,Math.floor(modAvg*rLen));
+        o[(cy+dy)*w+cx+dx]=Math.round(charIdx/(rLen-1)*255);
+      }
+    }
+    return o;
+  }});
+
+  A.push({ id:'ascii-matrix', name:'Matrix Rain', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:3,max:10,step:1,default:5},
+    {id:'density',label:'Density',min:.1,max:1,step:.05,default:.6},
+    {id:'trail',label:'Trail Length',min:3,max:20,step:1,default:8},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o=new Uint8ClampedArray(w*h);o.fill(0);const r=mkRand(p.seed),cs=p.cellSize;
+    const cols=Math.ceil(w/cs);
+    // Generate column drops
+    for(let col=0;col<cols;col++){
+      if(r()>p.density) continue;
+      const startRow=Math.floor(r()*Math.ceil(h/cs));
+      for(let row=startRow;row<startRow+p.trail&&row*cs<h;row++){
+        const cy=row*cs,cx=col*cs;
+        let sum=0,count=0;
+        for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+          sum+=clamp(px[(cy+dy)*w+cx+dx]); count++;
+        }
+        let avg=sum/count/255; if(p.gamma!==1) avg=Math.pow(avg,p.gamma);
+        const fade=1-(row-startRow)/p.trail;
+        const grayVal=Math.round(avg*fade*255);
+        for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+          o[(cy+dy)*w+cx+dx]=Math.max(o[(cy+dy)*w+cx+dx],grayVal);
+        }
+      }
+    }
+    return o;
+  }});
+
+  A.push({ id:'ascii-braille', name:'Braille Dots', category:'ascii', params:[
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'noise',label:'Noise',min:0,max:60,step:1,default:0},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    // Braille: 2x4 dot grid per character (maps brightness per sub-pixel)
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
+    const r=p.noise>0?mkRand(p.seed):null;
+    // Process in 2x4 blocks
+    for(let by=0;by<h;by+=4)for(let bx=0;bx<w;bx+=2){
+      let darkCount=0,totalSub=0;
+      for(let dy=0;dy<4&&by+dy<h;dy++)for(let dx=0;dx<2&&bx+dx<w;dx++){
+        let v=clamp(px[(by+dy)*w+bx+dx]); if(p.gamma!==1) v=Math.pow(v/255,p.gamma)*255;
+        if(r) v+=((r()-.5)*p.noise);
+        if(v<p.threshold) darkCount++;
+        totalSub++;
+      }
+      const density=darkCount/totalSub;
+      const grayVal=p.invert?Math.round(density*255):Math.round((1-density)*255);
+      for(let dy=0;dy<4&&by+dy<h;dy++)for(let dx=0;dx<2&&bx+dx<w;dx++){
+        o[(by+dy)*w+bx+dx]=grayVal;
+      }
+    }
+    return o;
+  }});
+
+  A.push({ id:'ascii-box-drawing', name:'Box Drawing', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:3,max:12,step:1,default:6},
+    {id:'style',label:'Style',type:'select',options:[
+      {value:'light',label:'Light ┌─┐│└┘'},{value:'heavy',label:'Heavy ┏━┓┃┗┛'},
+      {value:'double',label:'Double ╔═╗║╚╝'},{value:'rounded',label:'Rounded ╭─╮│╰╯'}
+    ],default:'light'},
+    {id:'edgeThreshold',label:'Edge Threshold',min:10,max:100,step:5,default:30},
+    {id:'fillDensity',label:'Fill Density',min:0,max:1,step:.05,default:.5},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o=new Uint8ClampedArray(w*h);o.fill(p.invert?0:255);
+    const cs=p.cellSize;
+    for(let cy=0;cy<h;cy+=cs)for(let cx=0;cx<w;cx+=cs){
+      const midX=Math.min(w-2,Math.max(1,cx+Math.floor(cs/2)));
+      const midY=Math.min(h-2,Math.max(1,cy+Math.floor(cs/2)));
+      const e=sobelAt(px,midX,midY,w,h);
+      let sum=0,count=0;
+      for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+        sum+=clamp(px[(cy+dy)*w+cx+dx]); count++;
+      }
+      let avg=sum/count/255; if(p.gamma!==1) avg=Math.pow(avg,p.gamma);
+      if(p.invert) avg=1-avg;
+      let grayVal;
+      if(e.mag>p.edgeThreshold){
+        // Strong edge: dark
+        grayVal=Math.round(avg*80);
+      } else if(avg<p.fillDensity){
+        // Dark area fill
+        grayVal=Math.round(avg*180);
+      } else {
+        grayVal=p.invert?0:255;
+      }
+      for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+        o[(cy+dy)*w+cx+dx]=grayVal;
+      }
+    }
+    return o;
+  }});
+
+  A.push({ id:'ascii-typewriter', name:'Typewriter', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:3,max:10,step:1,default:5},
+    {id:'charset',label:'Characters',type:'select',options:[
+      {value:'standard',label:'Standard .:-=+*#%@'},{value:'detailed',label:'Detailed'},
+      {value:'blocks',label:'Blocks ░▒▓█'},{value:'dots',label:'Dots ·•●'},
+      {value:'braille',label:'Braille ⠿⣿'},{value:'math',label:'Math ±×÷∞'},
+      {value:'currency',label:'Currency $€£¥'}
+    ],default:'standard'},
+    {id:'overprint',label:'Overprint',min:1,max:4,step:1,default:1},
+    {id:'offsetJitter',label:'Registration Jitter',min:0,max:3,step:1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o=new Uint8ClampedArray(w*h);
+    const cs=p.cellSize, ramp=asciiRamp(p.charset), rLen=ramp.length;
+    const r=mkRand(p.seed);
+    // Start with paper color
+    o.fill(p.invert?0:245);
+    for(let pass=0;pass<p.overprint;pass++){
+      const ox=Math.round((r()-.5)*p.offsetJitter);
+      const oy=Math.round((r()-.5)*p.offsetJitter);
+      for(let cy=0;cy<h;cy+=cs)for(let cx=0;cx<w;cx+=cs){
+        let sum=0,count=0;
+        for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+          sum+=clamp(px[(cy+dy)*w+cx+dx]); count++;
+        }
+        let avg=sum/count/255; if(p.gamma!==1) avg=Math.pow(avg,p.gamma);
+        if(p.invert) avg=1-avg;
+        const charIdx=Math.min(rLen-1,Math.floor(avg*rLen));
+        const inkDarkness=(1-charIdx/(rLen-1))*0.4;
+        for(let dy=0;dy<cs&&cy+dy<h;dy++)for(let dx=0;dx<cs&&cx+dx<w;dx++){
+          const fy=cy+dy+oy,fx=cx+dx+ox;
+          if(fx>=0&&fx<w&&fy>=0&&fy<h){
+            o[fy*w+fx]=Math.max(0,Math.round(o[fy*w+fx]*(1-inkDarkness)));
+          }
+        }
+      }
     }
     return o;
   }});

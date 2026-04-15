@@ -516,6 +516,34 @@
     scheduleProcess();
   });
 
+  $('btn-extract-ref').addEventListener('click', () => {
+    $('ref-image-input').click();
+  });
+
+  $('ref-image-input').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = img.width; c.height = img.height;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const imgData = ctx.getImageData(0, 0, c.width, c.height);
+      const px = imgData.data, n = c.width * c.height;
+      const step = Math.max(1, Math.floor(n / 10000));
+      const samples = [];
+      for (let i = 0; i < n; i += step) samples.push([px[i*4], px[i*4+1], px[i*4+2]]);
+      const pal = DitherEngine.medianCut(samples, state.globals.maxColors);
+      state.globals.palette = pal;
+      renderPaletteSwatches();
+      scheduleProcess();
+      URL.revokeObjectURL(img.src);
+    };
+    img.src = URL.createObjectURL(file);
+    e.target.value = '';
+  });
+
   function renderPaletteSwatches() {
     const container = $('palette-swatches');
     container.innerHTML = '';
@@ -566,7 +594,7 @@
 
   // ── Algorithm List ──
   function buildAlgorithmList() {
-    const categories = ['classic', 'ordered', 'halftone', 'lines', 'artistic', 'reconstructive', 'sketch', 'exotic', 'digital', 'effects'];
+    const categories = ['classic', 'ordered', 'halftone', 'lines', 'artistic', 'reconstructive', 'sketch', 'exotic', 'digital', 'effects', 'ascii'];
     for (const cat of categories) {
       const container = document.querySelector(`.algorithm-list[data-category="${cat}"]`);
       if (!container) continue;
@@ -627,7 +655,8 @@
     } else {
       const algo = DitherAlgorithms.find(a => a.id === id);
       const params = { _mix: 0, _invert: false, _blackPoint: 0, _whitePoint: 255,
-        _feather: 10, _edgeMode: 'soft', _toneResponse: 0, _advancedOpen: false };
+        _feather: 10, _edgeMode: 'soft', _toneResponse: 0, _advancedOpen: false,
+        _blendMode: 'normal', _useOriginal: false };
       for (const p of algo.params) params[p.id] = p.default;
       state.selectedAlgorithms.push({ id, params });
     }
@@ -725,6 +754,28 @@
       html += `
         <div class="param-group" style="margin-top:10px; padding-top:8px; border-top:1px solid var(--border);">
           <span class="param-label" style="color:var(--fun); font-weight:600; font-size:10px; text-transform:uppercase; letter-spacing:0.06em;">Chain Controls</span>
+        </div>
+        <div class="param-group">
+          <span class="param-label">Blend Mode</span>
+          <select data-algo="${sel.id}" data-param="_blendMode">
+            <option value="normal" ${(sel.params._blendMode||'normal')==='normal'?'selected':''}>Normal</option>
+            <option value="multiply" ${sel.params._blendMode==='multiply'?'selected':''}>Multiply</option>
+            <option value="screen" ${sel.params._blendMode==='screen'?'selected':''}>Screen</option>
+            <option value="overlay" ${sel.params._blendMode==='overlay'?'selected':''}>Overlay</option>
+            <option value="softLight" ${sel.params._blendMode==='softLight'?'selected':''}>Soft Light</option>
+            <option value="hardLight" ${sel.params._blendMode==='hardLight'?'selected':''}>Hard Light</option>
+            <option value="difference" ${sel.params._blendMode==='difference'?'selected':''}>Difference</option>
+            <option value="exclusion" ${sel.params._blendMode==='exclusion'?'selected':''}>Exclusion</option>
+            <option value="darken" ${sel.params._blendMode==='darken'?'selected':''}>Darken</option>
+            <option value="lighten" ${sel.params._blendMode==='lighten'?'selected':''}>Lighten</option>
+            <option value="add" ${sel.params._blendMode==='add'?'selected':''}>Add</option>
+          </select>
+        </div>
+        <div class="param-group">
+          <label class="slider-row">
+            <input type="checkbox" data-algo="${sel.id}" data-param="_useOriginal" ${sel.params._useOriginal ? 'checked' : ''}>
+            <span class="param-label" style="margin:0 0 0 6px">Use Original as Input</span>
+          </label>
         </div>
         <div class="param-group">
           <span class="param-label">Mix (blend with original)</span>
@@ -1001,7 +1052,8 @@
       const algo = DitherAlgorithms.find(a => a.id === pAlgo.id);
       if (!algo) continue;
       const params = { _mix: 0, _invert: false, _blackPoint: 0, _whitePoint: 255,
-        _feather: 10, _edgeMode: 'soft', _toneResponse: 0, _advancedOpen: false };
+        _feather: 10, _edgeMode: 'soft', _toneResponse: 0, _advancedOpen: false,
+        _blendMode: 'normal', _useOriginal: false };
       for (const p of algo.params) params[p.id] = p.default;
       if (pAlgo.params) Object.assign(params, pAlgo.params);
       state.selectedAlgorithms.push({ id: pAlgo.id, params });
