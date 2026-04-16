@@ -3769,5 +3769,486 @@ const DitherAlgorithms = (() => {
     return o;
   }});
 
+  // ═══════════════════════════════════════════
+  // SCENE UNDERSTANDING
+  // Approximates global scene properties an artist would read first:
+  // where the light is coming from, mean tone, contrast, edge density,
+  // and tone-zone histogram peaks. Used by every "scene-aware" algo
+  // below so they can make artistic decisions, not just local ones.
+  // ═══════════════════════════════════════════
+  function analyzeScene(px, w, h) {
+    const n = w * h;
+    // Pass 1: weighted bright/dark centroids + sums
+    let bX = 0, bY = 0, bW = 0;
+    let dX = 0, dY = 0, dW = 0;
+    let sum = 0, sumSq = 0;
+    let pBright = 0, pMid = 0, pDark = 0;
+    // Sample-stride for big images (cap at ~150k samples)
+    const stride = Math.max(1, Math.floor(Math.sqrt(n / 150000)));
+    for (let y = 0; y < h; y += stride) for (let x = 0; x < w; x += stride) {
+      const v = clamp(px[y*w+x]);
+      const ln = v / 255;
+      sum += ln; sumSq += ln * ln;
+      if (ln > 0.5) { const wt = (ln - 0.5) * 2; bX += x*wt; bY += y*wt; bW += wt; pBright++; }
+      if (ln < 0.5) { const wt = (0.5 - ln) * 2; dX += x*wt; dY += y*wt; dW += wt; pDark++; }
+      if (ln >= 0.4 && ln <= 0.6) pMid++;
+    }
+    const samples = Math.ceil(w/stride) * Math.ceil(h/stride);
+    const meanLum = sum / samples;
+    const variance = sumSq / samples - meanLum * meanLum;
+    const contrast = Math.min(1, Math.sqrt(Math.max(0, variance)) * 2);
+    let lightX = 0, lightY = 0, lightStrength = 0;
+    if (bW > 0 && dW > 0) {
+      const bcx = bX / bW, bcy = bY / bW;
+      const dcx = dX / dW, dcy = dY / dW;
+      const vx = bcx - dcx, vy = bcy - dcy;
+      const m = Math.sqrt(vx*vx + vy*vy) || 1;
+      lightX = vx / m; lightY = vy / m;
+      // Strength: how separated bright vs dark are, normalized to image diagonal
+      const diag = Math.sqrt(w*w + h*h);
+      lightStrength = Math.min(1, m / (diag * 0.5));
+    }
+    // Pass 2: edge density (cheap sample on a coarse grid)
+    let edgeAcc = 0, edgeN = 0;
+    const eStride = Math.max(2, stride);
+    for (let y = 1; y < h - 1; y += eStride) for (let x = 1; x < w - 1; x += eStride) {
+      edgeAcc += sobelAt(px, x, y, w, h).mag; edgeN++;
+    }
+    const maxPossibleEdge = 1020; // 4*255 typical sobel ceiling
+    const edgeDensity = Math.min(1, (edgeAcc / Math.max(1, edgeN)) / maxPossibleEdge * 4);
+    return {
+      lightX, lightY, lightStrength,
+      meanLum, contrast, edgeDensity,
+      brightFrac: pBright / samples,
+      midFrac: pMid / samples,
+      darkFrac: pDark / samples,
+      // Suggested artistic stroke angle: perpendicular to light direction
+      hatchAngle: Math.atan2(lightY, lightX) + Math.PI / 2
+    };
+  }
+
+  // ═══════════════════════════════════════════
+  // SCENE-AWARE PATTERNS (3 advanced + 3 ASCII)
+  // ═══════════════════════════════════════════
+
+  // 6) Adaptive Bayer Pro — every dot's shape, size, color, edge, and
+  // anisotropy is steered by image content + global scene understanding.
+  A.push({ id:'adaptive-bayer-pro', name:'Adaptive Bayer Pro', category:'image-aware', params:[
+    {id:'matrixSize',label:'Matrix',type:'select',options:[
+      {value:4,label:'4x4'},{value:8,label:'8x8'},{value:16,label:'16x16'}
+    ],default:8},
+    {id:'cellSize',label:'Cell Size',min:2,max:32,step:1,default:6,
+     hint:'physical pixel size of each dot cell'},
+    {id:'sizeByDetail',label:'Size · Detail',min:-1,max:1,step:.05,default:.6,
+     hint:'+: shrink in detail, -: grow in detail'},
+    {id:'sizeByTone',label:'Size · Tone',min:-1,max:1,step:.05,default:.5,
+     hint:'+: bigger in shadows, -: bigger in highlights'},
+    {id:'shape',label:'Base Shape',type:'select',options:[
+      {value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},
+      {value:'square',label:'Square'},{value:'cross',label:'Cross'},{value:'star',label:'Star'}
+    ],default:'circle'},
+    {id:'shapeByZone',label:'Shape · Zone',min:0,max:1,step:.05,default:.5,
+     hint:'shape morphs across tone zones (shadow/mid/highlight)'},
+    {id:'edgeHalo',label:'Edge Halo',min:0,max:1,step:.05,default:.4,
+     hint:'soften dot edges near image edges'},
+    {id:'anisotropy',label:'Light Trails',min:0,max:1,step:.05,default:.3,
+     hint:'elongate dots toward scene light direction'},
+    {id:'modulation',label:'Modulation',min:0,max:1,step:.05,default:0,
+     hint:'sine-wave threshold for stripe interference'},
+    {id:'modFreq',label:'Mod Frequency',min:.01,max:.5,step:.01,default:.1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    o.fill(p.invert ? 0 : 255);
+    const ink = p.invert ? 255 : 0;
+    const matSize = +p.matrixSize, mat = normBayer(matSize);
+    const scene = analyzeScene(px, w, h);
+    const { mag } = gradientFields(px, w, h);
+    const cs = p.cellSize;
+    // Light-trail orientation: anisotropy stretches along scene light dir
+    const lightAng = Math.atan2(scene.lightY, scene.lightX);
+    const aniCos = Math.cos(lightAng), aniSin = Math.sin(lightAng);
+    function shapeDist(name, nx, ny) {
+      switch (name) {
+        case 'diamond': return Math.abs(nx) + Math.abs(ny);
+        case 'square':  return Math.max(Math.abs(nx), Math.abs(ny));
+        case 'cross':   return Math.min(Math.abs(nx), Math.abs(ny)) * 2;
+        case 'star': {
+          const r2 = Math.sqrt(nx*nx + ny*ny);
+          const a = Math.atan2(ny, nx);
+          return r2 * (1 + 0.5 * Math.cos(5 * a));
+        }
+        default: return Math.sqrt(nx*nx + ny*ny);
+      }
+    }
+    // Cell-grid loop: each cell renders a dot whose properties are scene/local-aware
+    for (let cy = 0; cy < h; cy += cs) for (let cx = 0; cx < w; cx += cs) {
+      const midX = Math.min(w-1, cx + (cs >> 1));
+      const midY = Math.min(h-1, cy + (cs >> 1));
+      const i = midY * w + midX;
+      // Per-cell tone, detail
+      let v = clamp(px[i]) / 255;
+      if (p.gamma !== 1) v = Math.pow(v, p.gamma);
+      const detail = mag[i]; // 0-1
+      // Bayer threshold offset for this cell
+      const bx = ((cx / cs) | 0) % matSize, by = ((cy / cs) | 0) % matSize;
+      const bayerT = mat[by][bx];
+      // Modulated threshold
+      const mod = p.modulation > 0
+        ? Math.sin((cx + cy) * p.modFreq) * 0.5 * p.modulation : 0;
+      // Per-cell dot radius driven by tone + detail
+      const toneR = (1 - v) * (1 + p.sizeByTone * (1 - v));
+      const detailMul = p.sizeByDetail >= 0
+        ? 1 - detail * p.sizeByDetail
+        : 1 + detail * (-p.sizeByDetail);
+      const radius = Math.max(0, Math.min(1, (toneR * detailMul + mod) * 1.2));
+      // Skip empty highlights
+      if (radius < bayerT - 0.4) continue;
+      // Shape morph: blend distance metrics across zones
+      const shapeIdx = ['circle','diamond','square','cross','star'].indexOf(p.shape);
+      const shapeOptions = ['circle','diamond','square','cross','star'];
+      let chosenShape = p.shape;
+      if (p.shapeByZone > 0) {
+        // Shadow → cross/star, mid → diamond/square, highlight → circle
+        let zoneShape;
+        if (v < 0.33) zoneShape = 'star';
+        else if (v < 0.66) zoneShape = 'diamond';
+        else zoneShape = 'circle';
+        // Probabilistic mix using bayerT as the dither (deterministic per cell)
+        chosenShape = bayerT < p.shapeByZone ? zoneShape : p.shape;
+      }
+      // Edge halo: soften near edges by widening fall-off
+      const halo = p.edgeHalo * detail;
+      // Render dot inside cell with anisotropy along scene light
+      const ani = p.anisotropy * scene.lightStrength;
+      for (let dy = 0; dy < cs && cy + dy < h; dy++) {
+        for (let dx = 0; dx < cs && cx + dx < w; dx++) {
+          const nx0 = (dx + 0.5) / cs * 2 - 1;
+          const ny0 = (dy + 0.5) / cs * 2 - 1;
+          // Anisotropic transform: stretch along light direction
+          let nx = nx0, ny = ny0;
+          if (ani > 0) {
+            // Rotate into light frame, scale, rotate back
+            const u = nx*aniCos + ny*aniSin;
+            const t = -nx*aniSin + ny*aniCos;
+            const stretch = 1 + ani * 1.2;
+            nx = (u/stretch) * aniCos - t * aniSin;
+            ny = (u/stretch) * aniSin + t * aniCos;
+          }
+          const d = shapeDist(chosenShape, nx, ny);
+          const insideR = radius;
+          const fx = cx + dx, fy = cy + dy;
+          const ii = fy*w + fx;
+          if (halo > 0) {
+            // Smooth falloff from 1 inside to 0 at radius+halo
+            const t = (insideR - d) / Math.max(0.0001, halo);
+            const a = Math.max(0, Math.min(1, t));
+            o[ii] = Math.round(o[ii] * (1 - a) + ink * a);
+          } else {
+            if (d < insideR) o[ii] = ink;
+          }
+        }
+      }
+    }
+    return o;
+  }});
+
+  // 7) Light-Aware Cross-Hatch — strokes drawn perpendicular to estimated
+  // scene light direction (the way a hatching artist would). Adds cross
+  // strokes in shadow zones, light strokes in highlights.
+  A.push({ id:'light-hatch', name:'Light-Aware Cross-Hatch', category:'image-aware', params:[
+    {id:'spacing',label:'Stroke Spacing',min:2,max:20,step:1,default:5},
+    {id:'length',label:'Stroke Length',min:3,max:30,step:1,default:8},
+    {id:'thickness',label:'Thickness',min:1,max:3,step:1,default:1},
+    {id:'crossThreshold',label:'Cross Threshold',min:0,max:1,step:.05,default:.5,
+     hint:'darkness above which cross-hatching kicks in'},
+    {id:'crossAngle',label:'Cross Angle',min:30,max:90,step:5,default:60,
+     hint:'degrees offset for the second hatch direction'},
+    {id:'lightOverride',label:'Light Direction',min:-180,max:180,step:5,default:0,
+     hint:'manual override: 0 uses scene-detected light'},
+    {id:'sketchiness',label:'Sketchiness',min:0,max:1,step:.05,default:.2,
+     hint:'wobble + breaks for hand-drawn feel'},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    o.fill(p.invert ? 0 : 255);
+    const ink = p.invert ? 255 : 0;
+    const r = mkRand(p.seed);
+    const scene = analyzeScene(px, w, h);
+    // Use scene hatch angle (perpendicular to light) unless overridden
+    const baseAng = p.lightOverride !== 0
+      ? p.lightOverride * Math.PI / 180
+      : scene.hatchAngle;
+    const cross1A = baseAng;
+    const cross2A = baseAng + p.crossAngle * Math.PI / 180;
+    const sp = p.spacing, lenBase = p.length;
+    function drawStroke(cx, cy, dirAng, density) {
+      const dx = Math.cos(dirAng), dy = Math.sin(dirAng);
+      const len = lenBase * density;
+      const wob = p.sketchiness * 1.5;
+      // Optional break in middle for sketchiness
+      const breakAt = p.sketchiness > 0.5 ? (r() < (p.sketchiness - 0.5) * 2 ? r() * len : -1) : -1;
+      for (let t = -len/2; t <= len/2; t += 0.5) {
+        if (breakAt > 0 && Math.abs(t - (breakAt - len/2)) < 0.6) continue;
+        const wx = wob > 0 ? Math.sin(t * 0.4) * wob : 0;
+        const sx = Math.round(cx + t * dx + (-dy) * wx);
+        const sy = Math.round(cy + t * dy + dx * wx);
+        if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+        for (let dty = -Math.floor(p.thickness/2); dty <= Math.floor(p.thickness/2); dty++)
+          for (let dtx = -Math.floor(p.thickness/2); dtx <= Math.floor(p.thickness/2); dtx++) {
+            const fx = sx + dtx, fy = sy + dty;
+            if (fx >= 0 && fx < w && fy >= 0 && fy < h) o[fy*w+fx] = ink;
+          }
+      }
+    }
+    for (let y = 0; y < h; y += sp) for (let x = 0; x < w; x += sp) {
+      let v = clamp(px[y*w+x]) / 255;
+      if (p.gamma !== 1) v = Math.pow(v, p.gamma);
+      const darkness = 1 - v;
+      if (darkness < 0.05) continue;
+      // Layer 1: always present, density scales with darkness
+      drawStroke(x, y, cross1A, Math.min(1, darkness * 1.2));
+      // Layer 2: cross-hatch only in zones above crossThreshold
+      if (darkness > p.crossThreshold) {
+        const d2 = (darkness - p.crossThreshold) / Math.max(0.05, 1 - p.crossThreshold);
+        drawStroke(x, y, cross2A, d2);
+      }
+    }
+    return o;
+  }});
+
+  // 8) Scene-Aware Halftone — combines tone-zone shape switching, edge
+  // proximity sizing, light-driven anisotropy, and global scene contrast
+  // adjustment in one image-aware halftone.
+  A.push({ id:'scene-halftone', name:'Scene-Aware Halftone', category:'image-aware', params:[
+    {id:'dotSize',label:'Cell Size',min:3,max:24,step:1,default:8},
+    {id:'shadowShape',label:'Shadow Shape',type:'select',options:[
+      {value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},
+      {value:'cross',label:'Cross'},{value:'star',label:'Star'},{value:'square',label:'Square'}
+    ],default:'star'},
+    {id:'midShape',label:'Mid Shape',type:'select',options:[
+      {value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},
+      {value:'cross',label:'Cross'},{value:'star',label:'Star'},{value:'square',label:'Square'}
+    ],default:'diamond'},
+    {id:'highlightShape',label:'Highlight Shape',type:'select',options:[
+      {value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},
+      {value:'cross',label:'Cross'},{value:'star',label:'Star'},{value:'square',label:'Square'}
+    ],default:'circle'},
+    {id:'lightTrails',label:'Light Trails',min:0,max:1,step:.05,default:.4,
+     hint:'dots stretch along detected light direction'},
+    {id:'edgeBoost',label:'Edge Boost',min:0,max:1.5,step:.05,default:.6},
+    {id:'autoContrast',label:'Auto Contrast',min:0,max:1,step:.05,default:.7,
+     hint:'use scene contrast to auto-tune dot gain'},
+    {id:'angle',label:'Base Angle',min:0,max:90,step:1,default:45},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    o.fill(p.invert ? 0 : 255);
+    const ink = p.invert ? 255 : 0;
+    const ds = p.dotSize;
+    const scene = analyzeScene(px, w, h);
+    const { mag } = gradientFields(px, w, h);
+    // Auto-tune dot gain by scene contrast (high-contrast scene → less gain)
+    const dotGain = (1.4 + (1 - scene.contrast) * 0.6) * (1 - p.autoContrast)
+                  + 1.4 * p.autoContrast * (1 + (1 - scene.contrast) * 0.4);
+    const ang = p.angle * Math.PI / 180, ca = Math.cos(ang), sa = Math.sin(ang);
+    const lightAng = Math.atan2(scene.lightY, scene.lightX);
+    const lc = Math.cos(lightAng), ls = Math.sin(lightAng);
+    function dist(name, nx, ny) {
+      switch (name) {
+        case 'diamond': return Math.abs(nx) + Math.abs(ny);
+        case 'square':  return Math.max(Math.abs(nx), Math.abs(ny));
+        case 'cross':   return Math.min(Math.abs(nx), Math.abs(ny)) * 2;
+        case 'star': {
+          const r2 = Math.sqrt(nx*nx + ny*ny), a = Math.atan2(ny, nx);
+          return r2 * (1 + 0.4 * Math.cos(5 * a));
+        }
+        default: return Math.sqrt(nx*nx + ny*ny);
+      }
+    }
+    const ani = p.lightTrails * scene.lightStrength;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y*w+x;
+      let val = clamp(px[i]) / 255;
+      if (p.gamma !== 1) val = Math.pow(val, p.gamma);
+      // Shape selection by tone zone
+      const shape = val < 0.33 ? p.shadowShape : (val < 0.66 ? p.midShape : p.highlightShape);
+      // Cell coords with rotation
+      const rx = x*ca + y*sa, ry = -x*sa + y*ca;
+      const cx = ((rx % ds) + ds) % ds, cy = ((ry % ds) + ds) % ds;
+      let nx = (cx/ds - .5) * 2, ny = (cy/ds - .5) * 2;
+      if (ani > 0) {
+        const u = nx*lc + ny*ls;
+        const t = -nx*ls + ny*lc;
+        const stretch = 1 + ani * 1.5;
+        nx = (u/stretch) * lc - t * ls;
+        ny = (u/stretch) * ls + t * lc;
+      }
+      const d = dist(shape, nx, ny);
+      const t = (1 - val) * dotGain * (1 + p.edgeBoost * mag[i]);
+      if (d < t) o[i] = ink;
+    }
+    return o;
+  }});
+
+  // ─────────────────────────────────────────────
+  // SCENE-AWARE ASCII (3)
+  // ─────────────────────────────────────────────
+
+  // 9) ASCII Light-Aware — character density falls off with distance
+  // from the scene's lit centroid, like a sketched chiaroscuro.
+  A.push({ id:'ascii-light', name:'ASCII Light-Aware', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:4,max:20,step:1,default:8},
+    {id:'charset',label:'Character Set',type:'select',options:charsetOptions,default:'standard'},
+    {id:'lightFalloff',label:'Light Falloff',min:0,max:1,step:.05,default:.5,
+     hint:'how strongly distance from lit centroid darkens characters'},
+    {id:'shadowDepth',label:'Shadow Depth',min:0,max:1,step:.05,default:.3,
+     hint:'extra darkness for cells far from light'},
+    {id:'invertLight',label:'Invert Light',type:'checkbox',default:false},
+    {id:'fontScale',label:'Font Scale',min:.5,max:1.5,step:.05,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'inkDark',label:'Ink Dark',min:0,max:255,step:1,default:0},
+    {id:'inkLight',label:'Ink Light',min:0,max:255,step:1,default:255}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h); o.fill(p.inkLight);
+    const ramp = asciiRamp(p.charset);
+    const cs = p.cellSize;
+    const g = getGlyphs(ramp, cs, cs, p.fontScale);
+    const scene = analyzeScene(px, w, h);
+    // Lit centroid in image coords (recompute from scene light direction
+    // by stepping from center along light vec)
+    const cx = w / 2, cy = h / 2;
+    const litX = cx + scene.lightX * w * 0.4;
+    const litY = cy + scene.lightY * h * 0.4;
+    const maxDist = Math.sqrt(w*w + h*h) / 2;
+    for (let y = 0; y < h; y += cs) for (let x = 0; x < w; x += cs) {
+      const stats = cellStats(px, x, y, cs, cs, w, h);
+      let v = stats.avg / 255;
+      if (p.gamma !== 1) v = Math.pow(v, p.gamma);
+      // Distance to lit centroid → 0 (at center) to 1 (corners)
+      const dx = (x + cs/2) - litX, dy = (y + cs/2) - litY;
+      const distNorm = Math.min(1, Math.sqrt(dx*dx + dy*dy) / maxDist);
+      const litFactor = p.invertLight ? distNorm : (1 - distNorm);
+      // Lit areas → lighter chars (lower coverage), shadow → darker chars
+      const adjusted = v * (1 - p.lightFalloff) + litFactor * p.lightFalloff;
+      const finalCov = Math.max(0, Math.min(1, 1 - adjusted - (1 - litFactor) * p.shadowDepth));
+      const idx = pickGlyphIdx(g.sortedCoverages, finalCov);
+      stampGlyph(o, g.sortedGlyphs[idx], x, y, cs, cs, w, h, p.inkDark, p.inkLight);
+    }
+    return o;
+  }});
+
+  // 10) ASCII Edge-Following — picks a glyph that matches the local edge
+  // orientation. Horizontal edges → "─", vertical → "│", diagonals → "/" "\".
+  A.push({ id:'ascii-edge-flow', name:'ASCII Edge-Following', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:4,max:20,step:1,default:8},
+    {id:'edgeThreshold',label:'Edge Threshold',min:5,max:200,step:5,default:60,
+     hint:'Sobel magnitude above which directional chars take over'},
+    {id:'fillCharset',label:'Fill Charset',type:'select',options:charsetOptions,default:'standard'},
+    {id:'edgeStyle',label:'Edge Glyphs',type:'select',options:[
+      {value:'box-light',label:'Light Lines  ─│┌┐'},
+      {value:'box-heavy',label:'Heavy Lines  ═║╔╗'},
+      {value:'slashes',label:'Slashes  /\\|─'},
+      {value:'arrows',label:'Arrows  ←↑→↓'}
+    ],default:'box-light'},
+    {id:'fontScale',label:'Font Scale',min:.5,max:1.5,step:.05,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'inkDark',label:'Ink Dark',min:0,max:255,step:1,default:0},
+    {id:'inkLight',label:'Ink Light',min:0,max:255,step:1,default:255}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h); o.fill(p.inkLight);
+    const cs = p.cellSize;
+    const fillRamp = asciiRamp(p.fillCharset);
+    const fillG = getGlyphs(fillRamp, cs, cs, p.fontScale);
+    // Build a directional glyph palette: horiz, vert, diag↘, diag↗
+    const dirs = {
+      'box-light':  ['─', '│', '╲', '╱', '┼'],
+      'box-heavy':  ['═', '║', '╲', '╱', '╬'],
+      'slashes':    ['─', '|', '\\', '/', 'X'],
+      'arrows':     ['→', '↑', '↘', '↗', '+']
+    };
+    const charSet = dirs[p.edgeStyle] || dirs['box-light'];
+    const dirGlyphs = charSet.map(c => getGlyphs(c, cs, cs, p.fontScale).glyphs[0]);
+    for (let y = 0; y < h; y += cs) for (let x = 0; x < w; x += cs) {
+      const stats = cellStats(px, x, y, cs, cs, w, h);
+      let v = stats.avg / 255;
+      if (p.gamma !== 1) v = Math.pow(v, p.gamma);
+      if (stats.edgeMag > p.edgeThreshold) {
+        // Pick directional glyph based on angle (4 buckets + cross)
+        // Sobel angle: 0 = →, π/2 = ↓, π = ←
+        let a = stats.edgeAng;
+        // Wrap to 0..π (orientation, not direction)
+        while (a < 0) a += Math.PI;
+        while (a >= Math.PI) a -= Math.PI;
+        // Edge orientation perpendicular to gradient: line direction = a + π/2
+        const lineA = (a + Math.PI / 2) % Math.PI;
+        let idx;
+        if      (lineA < Math.PI * 0.125 || lineA >= Math.PI * 0.875) idx = 0; // horizontal
+        else if (lineA < Math.PI * 0.375) idx = 3;                              // ↗
+        else if (lineA < Math.PI * 0.625) idx = 1;                              // vertical
+        else                                  idx = 2;                              // ↘
+        // High-contrast cells use the "cross" cell
+        if (stats.contrast > 200) idx = 4;
+        stampGlyph(o, dirGlyphs[idx], x, y, cs, cs, w, h, p.inkDark, p.inkLight);
+      } else {
+        const cov = 1 - v;
+        const gi = pickGlyphIdx(fillG.sortedCoverages, cov);
+        stampGlyph(o, fillG.sortedGlyphs[gi], x, y, cs, cs, w, h, p.inkDark, p.inkLight);
+      }
+    }
+    return o;
+  }});
+
+  // 11) ASCII Tone-Zone — separate character sets for shadows / midtones /
+  // highlights, with feathered transitions. Good for layered graphic looks.
+  A.push({ id:'ascii-tone-zone', name:'ASCII Tone-Zone', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:4,max:20,step:1,default:8},
+    {id:'shadowSet',label:'Shadow Charset',type:'select',options:charsetOptions,default:'blocks'},
+    {id:'midSet',label:'Mid Charset',type:'select',options:charsetOptions,default:'standard'},
+    {id:'highSet',label:'Highlight Charset',type:'select',options:charsetOptions,default:'dots'},
+    {id:'shadowMid',label:'Shadow/Mid Split',min:.05,max:.5,step:.05,default:.33},
+    {id:'midHigh',label:'Mid/Highlight Split',min:.5,max:.95,step:.05,default:.66},
+    {id:'feather',label:'Feather',min:0,max:.3,step:.01,default:.08},
+    {id:'fontScale',label:'Font Scale',min:.5,max:1.5,step:.05,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'inkDark',label:'Ink Dark',min:0,max:255,step:1,default:0},
+    {id:'inkLight',label:'Ink Light',min:0,max:255,step:1,default:255},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h); o.fill(p.inkLight);
+    const cs = p.cellSize;
+    const shG = getGlyphs(asciiRamp(p.shadowSet), cs, cs, p.fontScale);
+    const mdG = getGlyphs(asciiRamp(p.midSet),    cs, cs, p.fontScale);
+    const hiG = getGlyphs(asciiRamp(p.highSet),   cs, cs, p.fontScale);
+    const r = mkRand(p.seed);
+    for (let y = 0; y < h; y += cs) for (let x = 0; x < w; x += cs) {
+      const stats = cellStats(px, x, y, cs, cs, w, h);
+      let v = stats.avg / 255;
+      if (p.gamma !== 1) v = Math.pow(v, p.gamma);
+      // Determine zone weights with feathered transitions
+      const sm = p.shadowMid, mh = p.midHigh, fe = p.feather;
+      let wS = 0, wM = 0, wH = 0;
+      if (v <= sm - fe) wS = 1;
+      else if (v <= sm + fe) { const t = (v - (sm - fe)) / (fe * 2); wS = 1 - t; wM = t; }
+      else if (v <= mh - fe) wM = 1;
+      else if (v <= mh + fe) { const t = (v - (mh - fe)) / (fe * 2); wM = 1 - t; wH = t; }
+      else wH = 1;
+      // Probabilistic zone pick using cell-level rand for crisp boundaries
+      const pick = r();
+      let zoneG;
+      if (pick < wS) zoneG = shG;
+      else if (pick < wS + wM) zoneG = mdG;
+      else zoneG = hiG;
+      const cov = 1 - v;
+      const gi = pickGlyphIdx(zoneG.sortedCoverages, cov);
+      stampGlyph(o, zoneG.sortedGlyphs[gi], x, y, cs, cs, w, h, p.inkDark, p.inkLight);
+    }
+    return o;
+  }});
+
   return A;
 })();
