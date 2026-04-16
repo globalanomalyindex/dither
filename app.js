@@ -2148,10 +2148,18 @@
             <span class="param-value">${settings.pickupScatter}</span>
           </div>
         </div>
+        <div class="param-group">
+          <span class="param-label">Streak</span>
+          <div class="slider-row">
+            <input type="range" id="tool-opt-pickup-coherence" min="0" max="100" step="1" value="${settings.pickupCoherence}">
+            <span class="param-value">${settings.pickupCoherence}</span>
+          </div>
+        </div>
       `;
       $('btn-pickup-select').addEventListener('click', () => enterPickupMarquee());
       const jitterEl = $('tool-opt-pickup-jitter');
       const scatterEl = $('tool-opt-pickup-scatter');
+      const coherenceEl = $('tool-opt-pickup-coherence');
       if (jitterEl) jitterEl.addEventListener('input', () => {
         PaintEngine.setPickupJitter(parseInt(jitterEl.value));
         jitterEl.parentElement.querySelector('.param-value').textContent = jitterEl.value;
@@ -2159,6 +2167,10 @@
       if (scatterEl) scatterEl.addEventListener('input', () => {
         PaintEngine.setPickupScatter(parseInt(scatterEl.value));
         scatterEl.parentElement.querySelector('.param-value').textContent = scatterEl.value;
+      });
+      if (coherenceEl) coherenceEl.addEventListener('input', () => {
+        PaintEngine.setPickupCoherence(parseInt(coherenceEl.value));
+        coherenceEl.parentElement.querySelector('.param-value').textContent = coherenceEl.value;
       });
       return;
     }

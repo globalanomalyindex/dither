@@ -35,6 +35,7 @@ const PaintEngine = (() => {
   // Pickup tool params
   let pickupJitter = 30;      // % — randomize sample position within stamp
   let pickupScatter = 10;     // px — scatter individual pixels
+  let pickupCoherence = 50;   // 0=noise, 100=solid streaks — controls spatial block size of randomization
 
   // Tapering
   let taperIn = 20;            // % of stroke length for taper in
@@ -625,13 +626,34 @@ const PaintEngine = (() => {
     const nx = strokeDirX, ny = strokeDirY;
     const hasDir = Math.abs(nx) > 0.01 || Math.abs(ny) > 0.01;
 
-    // Push displacement distance — canvas pixels behind get shoved forward
+    // Push displacement distance
     const dist = pushDistance * alpha;
 
-    // Texture scroll: the stamp "feeds" through as you stroke,
-    // like an ink roller picking up new texture with each revolution
+    // Texture scroll: stamp feeds through as you stroke
     const scrollX = strokeStampCount * nx * (sw / ms) * 1.5;
     const scrollY = strokeStampCount * ny * (sh / ms) * 1.5;
+
+    // Coherence controls the block size for jitter randomization.
+    // At 0: block=1px (every pixel gets its own random offset = noise)
+    // At 100: block=brush size (entire brush shares one offset = solid streak)
+    // In between: groups of pixels share offsets, creating color streaks
+    const coh = pickupCoherence / 100;
+    const blockSize = Math.max(1, Math.round(1 + (ms - 1) * coh * coh));
+
+    // Pre-compute one jitter offset per block (grid of offsets)
+    const blocksX = Math.ceil(ms / blockSize);
+    const blocksY = Math.ceil(ms / blockSize);
+    const blockOffsetsX = new Float32Array(blocksX * blocksY);
+    const blockOffsetsY = new Float32Array(blocksX * blocksY);
+    for (let i = 0; i < blocksX * blocksY; i++) {
+      blockOffsetsX[i] = (rng() - 0.5) * sw * jit;
+      blockOffsetsY[i] = (rng() - 0.5) * sh * jit;
+    }
+
+    // Perpendicular to stroke for streak elongation at high coherence
+    // Streaks run ALONG stroke direction, noise is suppressed along that axis
+    const perpX = hasDir ? -ny : 0;
+    const perpY = hasDir ? nx : 0;
 
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
@@ -646,15 +668,35 @@ const PaintEngine = (() => {
         let sampleX = (mx / ms) * sw + scrollX;
         let sampleY = (my / ms) * sh + scrollY;
 
-        // Per-pixel jitter: randomize within stamp for organic variation
+        // Block-based jitter: pixels in the same block share the same offset
         if (jit > 0) {
-          sampleX += (rng() - 0.5) * sw * jit;
-          sampleY += (rng() - 0.5) * sh * jit;
+          const bx = Math.floor(mx / blockSize);
+          const by = Math.floor(my / blockSize);
+          const bi = by * blocksX + bx;
+          // At high coherence, elongate jitter along stroke direction (streaks)
+          // and suppress jitter perpendicular to stroke
+          if (coh > 0.3 && hasDir) {
+            // Project block offset onto stroke-parallel axis (keep) vs perpendicular (suppress)
+            const offX = blockOffsetsX[bi];
+            const offY = blockOffsetsY[bi];
+            // Parallel component (along stroke) — keep full
+            const parDot = offX * nx + offY * ny;
+            // Perpendicular component — suppress based on coherence
+            const perpDot = offX * perpX + offY * perpY;
+            const perpSuppress = 1 - coh * 0.8; // high coherence = kill perp noise
+            sampleX += parDot * nx + perpDot * perpX * perpSuppress;
+            sampleY += parDot * ny + perpDot * perpY * perpSuppress;
+          } else {
+            sampleX += blockOffsetsX[bi];
+            sampleY += blockOffsetsY[bi];
+          }
         }
-        // Per-pixel scatter: spatial noise
+
+        // Per-pixel scatter (reduced by coherence — streaks stay clean)
         if (scat > 0) {
-          sampleX += (rng() - 0.5) * scat * 2;
-          sampleY += (rng() - 0.5) * scat * 2;
+          const scatScale = 1 - coh * 0.7;
+          sampleX += (rng() - 0.5) * scat * 2 * scatScale;
+          sampleY += (rng() - 0.5) * scat * 2 * scatScale;
         }
 
         // Wrap within stamp (tiling — infinite texture from finite capture)
@@ -676,16 +718,12 @@ const PaintEngine = (() => {
         }
 
         // --- Blend: stamp feeds the push ---
-        // At brush center (high mask), stamp dominates = fresh generative pixels
-        // At brush edge (low mask), push dominates = displaced canvas pixels
-        // This creates the "engine spitting out pixels" feel
-        const stampWeight = maskVal;  // center = stamp, edge = push
+        const stampWeight = maskVal;
         const r = stampR * stampWeight + pushR * (1 - stampWeight);
         const g = stampG * stampWeight + pushG * (1 - stampWeight);
         const b = stampB * stampWeight + pushB * (1 - stampWeight);
 
-        // Direct pixel replacement — NOT alpha-blended with canvas.
-        // Brush mask controls coverage; within coverage, pixels are PLACED.
+        // Direct pixel placement
         dst[di]     = Math.round(r);
         dst[di + 1] = Math.round(g);
         dst[di + 2] = Math.round(b);
@@ -900,13 +938,14 @@ const PaintEngine = (() => {
   function setFollowDirection(v) { followDirection = !!v; }
   function setPickupJitter(v) { pickupJitter = Math.max(0, Math.min(100, v)); }
   function setPickupScatter(v) { pickupScatter = Math.max(0, Math.min(50, v)); }
+  function setPickupCoherence(v) { pickupCoherence = Math.max(0, Math.min(100, v)); }
   function setTaperIn(v) { taperIn = Math.max(0, Math.min(100, v)); }
   function setTaperOut(v) { taperOut = Math.max(0, Math.min(100, v)); }
   function setTaperSize(v) { taperSize = !!v; }
   function setTaperOpacity(v) { taperOpacity = !!v; }
 
   function getSettings() {
-    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection, pickupJitter, pickupScatter, taperIn, taperOut, taperSize, taperOpacity };
+    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection, pickupJitter, pickupScatter, pickupCoherence, taperIn, taperOut, taperSize, taperOpacity };
   }
 
   // ── Brush Thumbnails ──
@@ -968,7 +1007,7 @@ const PaintEngine = (() => {
     setSmudgeDecay, setPushDistance, setScatterRadius, setSwirlAngle,
     setLiquifySmooth, setBlendKernel, setSpreadAmount,
     setBrushAngle, setFollowDirection,
-    setPickupJitter, setPickupScatter,
+    setPickupJitter, setPickupScatter, setPickupCoherence,
     setTaperIn, setTaperOut, setTaperSize, setTaperOpacity,
     selectBrush, getBrushes, getSelectedBrush, getBrushThumbnail,
     addBrush, extractBrushFromImage, capturePickupStamp, hasStamp, getStampSize,
