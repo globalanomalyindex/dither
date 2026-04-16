@@ -3385,5 +3385,389 @@ const DitherAlgorithms = (() => {
     return o;
   }});
 
+  // ═══════════════════════════════════════════
+  // ADVANCED IMAGE-AWARE PATTERNS (5)
+  // Ordered & halftone algorithms that read the image deeply: they let
+  // image gradients, edges, tone zones, or local detail steer pattern
+  // size, screen angle, dot density, and stroke flow.
+  // ═══════════════════════════════════════════
+
+  // Reusable detail field: returns 0-1 per pixel.
+  // mode: 'edges' (sobel mag), 'variance' (windowed stddev), 'luminance' (raw).
+  // radius: post-smoothing box-blur radius.
+  function detailField(px, w, h, mode, radius) {
+    const n = w * h;
+    let field = new Float32Array(n);
+    if (mode === 'luminance') {
+      for (let i = 0; i < n; i++) field[i] = clamp(px[i]) / 255;
+    } else if (mode === 'variance') {
+      const winR = 3, winK = (winR*2+1)*(winR*2+1);
+      let maxV = 0;
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let s = 0, ss = 0;
+        for (let dy = -winR; dy <= winR; dy++) for (let dx = -winR; dx <= winR; dx++) {
+          const xx = Math.max(0, Math.min(w-1, x+dx));
+          const yy = Math.max(0, Math.min(h-1, y+dy));
+          const v = px[yy*w+xx];
+          s += v; ss += v*v;
+        }
+        const mean = s / winK;
+        const variance = ss / winK - mean * mean;
+        const sd = Math.sqrt(Math.max(0, variance));
+        field[y*w+x] = sd;
+        if (sd > maxV) maxV = sd;
+      }
+      if (maxV > 0) for (let i = 0; i < n; i++) field[i] /= maxV;
+    } else {
+      // edges
+      const g = gradientFields(px, w, h);
+      field = g.mag;
+    }
+    if (radius > 0) {
+      const r = radius, k = r * 2 + 1;
+      const tmp = new Float32Array(n), out2 = new Float32Array(n);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let s = 0; for (let dx = -r; dx <= r; dx++) {
+          const xx = Math.max(0, Math.min(w-1, x+dx)); s += field[y*w+xx];
+        } tmp[y*w+x] = s/k;
+      }
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let s = 0; for (let dy = -r; dy <= r; dy++) {
+          const yy = Math.max(0, Math.min(h-1, y+dy)); s += tmp[yy*w+x];
+        } out2[y*w+x] = s/k;
+      }
+      field = out2;
+    }
+    return field;
+  }
+
+  // Local-region gradient: average gradient direction over a region of
+  // `regionSize` pixels so the orientation is stable (not per-pixel noise).
+  function regionGradients(px, w, h, regionSize) {
+    const { mag, ang } = gradientFields(px, w, h);
+    if (regionSize <= 1) return { mag, ang };
+    const r = Math.max(1, Math.floor(regionSize / 2));
+    const k = r * 2 + 1;
+    const angOut = new Float32Array(w * h);
+    const magOut = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let sumX = 0, sumY = 0, sumM = 0, n = 0;
+      for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+        const xx = Math.max(0, Math.min(w-1, x+dx));
+        const yy = Math.max(0, Math.min(h-1, y+dy));
+        const i = yy*w+xx;
+        const m = mag[i];
+        if (m > 0) {
+          // Use vector with double-angle to handle 180° symmetry of orientation
+          const a2 = ang[i] * 2;
+          sumX += Math.cos(a2) * m;
+          sumY += Math.sin(a2) * m;
+        }
+        sumM += m; n++;
+      }
+      angOut[y*w+x] = Math.atan2(sumY, sumX) / 2;
+      magOut[y*w+x] = sumM / n;
+    }
+    return { mag: magOut, ang: angOut };
+  }
+
+  // 1) Adaptive Bayer — matrix size varies per pixel based on detail.
+  // High-detail areas get small matrices (more dither resolution),
+  // flat areas get big matrices (smoother gradients).
+  A.push({ id:'adaptive-bayer', name:'Adaptive Bayer', category:'image-aware', params:[
+    {id:'minSize',label:'Min Matrix',type:'select',options:[
+      {value:2,label:'2x2'},{value:4,label:'4x4'},{value:8,label:'8x8'}
+    ],default:2},
+    {id:'maxSize',label:'Max Matrix',type:'select',options:[
+      {value:8,label:'8x8'},{value:16,label:'16x16'},{value:32,label:'32x32'},{value:64,label:'64x64'}
+    ],default:16},
+    {id:'detailMode',label:'Detail Source',type:'select',options:[
+      {value:'edges',label:'Edges (Sobel)'},
+      {value:'variance',label:'Local Variance'},
+      {value:'luminance',label:'Luminance'}
+    ],default:'edges'},
+    {id:'detailRadius',label:'Smoothing',min:0,max:10,step:1,default:2,
+     hint:'blur the detail map before sampling'},
+    {id:'detailInfluence',label:'Influence',min:-1,max:1,step:.05,default:1,
+     hint:'+1: detail = small matrix · 0: fixed · -1: inverted'},
+    {id:'spread',label:'Spread',min:0,max:255,step:1,default:128},
+    {id:'rotation',label:'Rotation',min:0,max:90,step:1,default:0},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    const minS = +p.minSize, maxS = +p.maxSize;
+    // Pre-build all Bayer matrices we might need (powers of 2)
+    const sizes = [];
+    for (let s = minS; s <= maxS; s *= 2) sizes.push(s);
+    if (sizes[sizes.length-1] !== maxS) sizes.push(maxS);
+    const mats = {};
+    for (const s of sizes) mats[s] = normBayer(s);
+    const field = detailField(px, w, h, p.detailMode, p.detailRadius);
+    const ang = p.rotation * Math.PI / 180, ca = Math.cos(ang), sa = Math.sin(ang);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y*w+x;
+      let d = field[i]; // 0-1
+      // Map detail to matrix size choice
+      // detailInfluence > 0: high detail → small matrix
+      const t = p.detailInfluence >= 0 ? 1 - d * p.detailInfluence : 1 + d * p.detailInfluence;
+      const tt = Math.max(0, Math.min(1, t));
+      // Pick a matrix size by linear interpolation across the size list, snap to nearest
+      const idxF = tt * (sizes.length - 1);
+      const idx = Math.round(idxF);
+      const sz = sizes[idx];
+      const mat = mats[sz];
+      const rx = Math.round(x*ca + y*sa), ry = Math.round(-x*sa + y*ca);
+      const bx = ((rx % sz) + sz) % sz, by = ((ry % sz) + sz) % sz;
+      let v = clamp(px[i]); if (p.gamma !== 1) v = Math.pow(v/255, p.gamma) * 255;
+      v += (mat[by][bx] - .5) * p.spread;
+      const result = v > p.threshold ? 255 : 0;
+      o[i] = p.invert ? 255 - result : result;
+    }
+    return o;
+  }});
+
+  // 2) Gradient-Aligned Halftone — screen angle follows local image
+  // gradient. Dots along edges become coherent flowing rows instead of
+  // a fixed grid. Region size lets you control coarse vs fine alignment.
+  A.push({ id:'gradient-halftone', name:'Gradient-Aligned Halftone', category:'image-aware', params:[
+    {id:'dotSize',label:'Dot Size',min:3,max:24,step:1,default:8},
+    {id:'baseAngle',label:'Base Angle',min:0,max:180,step:1,default:45},
+    {id:'gradInfluence',label:'Gradient Follow',min:0,max:1,step:.05,default:.7,
+     hint:'0 = fixed angle, 1 = fully follow image gradient'},
+    {id:'regionSize',label:'Sample Region',min:1,max:32,step:1,default:8,
+     hint:'larger = smoother orientation, smaller = more local'},
+    {id:'shape',label:'Shape',type:'select',options:[
+      {value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},
+      {value:'square',label:'Square'},{value:'line',label:'Line'},
+      {value:'cross',label:'Cross'},{value:'ellipse',label:'Ellipse'}
+    ],default:'circle'},
+    {id:'softness',label:'Softness',min:0,max:1,step:.05,default:.1},
+    {id:'dotGain',label:'Dot Gain',min:.5,max:2.5,step:.05,default:1.42},
+    {id:'edgeBoost',label:'Edge Boost',min:0,max:1,step:.05,default:0,
+     hint:'enlarge dots near edges to outline detail'},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h), ds = p.dotSize;
+    const baseRad = p.baseAngle * Math.PI / 180;
+    const { mag, ang } = regionGradients(px, w, h, p.regionSize);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y*w+x;
+      // Per-pixel screen angle: lerp between base angle and gradient-tangent angle
+      const tangent = (ang[i] || 0) + Math.PI / 2;
+      const a = baseRad * (1 - p.gradInfluence) + tangent * p.gradInfluence;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      const rx = x*ca + y*sa, ry = -x*sa + y*ca;
+      const cx = ((rx % ds) + ds) % ds, cy = ((ry % ds) + ds) % ds;
+      const nx = (cx/ds - .5) * 2, ny = (cy/ds - .5) * 2;
+      let d;
+      if (p.shape === 'diamond') d = Math.abs(nx) + Math.abs(ny);
+      else if (p.shape === 'square') d = Math.max(Math.abs(nx), Math.abs(ny));
+      else if (p.shape === 'line') d = Math.abs(ny);
+      else if (p.shape === 'cross') d = Math.min(Math.abs(nx), Math.abs(ny));
+      else if (p.shape === 'ellipse') d = Math.sqrt(nx*nx*1.5 + ny*ny*0.7);
+      else d = Math.sqrt(nx*nx + ny*ny);
+      let val = clamp(px[i]) / 255;
+      if (p.gamma !== 1) val = Math.pow(val, p.gamma);
+      const t = (1 - val) * p.dotGain * (1 + p.edgeBoost * mag[i]);
+      let result;
+      if (p.softness > 0) { const s2 = d - t; result = clamp(128 - s2/p.softness*128); }
+      else result = d < t ? 255 : 0;
+      o[i] = p.invert ? 255 - result : result;
+    }
+    return o;
+  }});
+
+  // 3) Tone-Zone Pattern — three different patterns blended by image tone.
+  // Different look for shadows, midtones, and highlights with smooth bands.
+  A.push({ id:'tone-zone-pattern', name:'Tone-Zone Pattern', category:'image-aware', params:[
+    {id:'shadowPattern',label:'Shadows',type:'select',options:[
+      {value:'bayer-2',label:'Bayer 2x2'},{value:'bayer-4',label:'Bayer 4x4'},
+      {value:'bayer-8',label:'Bayer 8x8'},{value:'lines-h',label:'Lines H'},
+      {value:'lines-v',label:'Lines V'},{value:'cross',label:'Cross-hatch'},
+      {value:'dots',label:'Dots'},{value:'noise',label:'Noise'}
+    ],default:'lines-h'},
+    {id:'midPattern',label:'Midtones',type:'select',options:[
+      {value:'bayer-2',label:'Bayer 2x2'},{value:'bayer-4',label:'Bayer 4x4'},
+      {value:'bayer-8',label:'Bayer 8x8'},{value:'lines-h',label:'Lines H'},
+      {value:'lines-v',label:'Lines V'},{value:'cross',label:'Cross-hatch'},
+      {value:'dots',label:'Dots'},{value:'noise',label:'Noise'}
+    ],default:'bayer-4'},
+    {id:'highPattern',label:'Highlights',type:'select',options:[
+      {value:'bayer-2',label:'Bayer 2x2'},{value:'bayer-4',label:'Bayer 4x4'},
+      {value:'bayer-8',label:'Bayer 8x8'},{value:'lines-h',label:'Lines H'},
+      {value:'lines-v',label:'Lines V'},{value:'cross',label:'Cross-hatch'},
+      {value:'dots',label:'Dots'},{value:'noise',label:'Noise'}
+    ],default:'dots'},
+    {id:'shadowMid',label:'Shadow/Mid Split',min:30,max:120,step:1,default:80},
+    {id:'midHigh',label:'Mid/High Split',min:130,max:230,step:1,default:175},
+    {id:'feather',label:'Band Feather',min:1,max:60,step:1,default:25},
+    {id:'patternScale',label:'Pattern Scale',min:1,max:8,step:1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    const r = mkRand(p.seed);
+    const noise = new Float32Array(w*h);
+    for (let i = 0; i < w*h; i++) noise[i] = r();
+    const bay2 = normBayer(2), bay4 = normBayer(4), bay8 = normBayer(8);
+    const sc = p.patternScale;
+    function patternThresh(name, x, y) {
+      const xs = Math.floor(x / sc), ys = Math.floor(y / sc);
+      switch (name) {
+        case 'bayer-2': return bay2[ys%2][xs%2];
+        case 'bayer-4': return bay4[ys%4][xs%4];
+        case 'bayer-8': return bay8[ys%8][xs%8];
+        case 'lines-h': return ((ys % 4) < 2) ? 0.3 : 0.7;
+        case 'lines-v': return ((xs % 4) < 2) ? 0.3 : 0.7;
+        case 'cross': {
+          const a = (xs % 4) < 2, b = (ys % 4) < 2;
+          return (a !== b) ? 0.35 : 0.65;
+        }
+        case 'dots': {
+          const dx = (xs % 4) - 2, dy = (ys % 4) - 2;
+          return Math.sqrt(dx*dx + dy*dy) / 3;
+        }
+        case 'noise': return noise[(y%h)*w + (x%w)];
+        default: return 0.5;
+      }
+    }
+    const sm = p.shadowMid, mh = p.midHigh, fe = p.feather;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y*w+x;
+      let v = clamp(px[i]);
+      if (p.gamma !== 1) v = Math.pow(v/255, p.gamma) * 255;
+      // Compute per-zone weights using soft transitions
+      let wS = 0, wM = 0, wH = 0;
+      if (v <= sm - fe) wS = 1;
+      else if (v <= sm + fe) {
+        const t = (v - (sm - fe)) / (fe * 2);
+        wS = 1 - t; wM = t;
+      } else if (v <= mh - fe) wM = 1;
+      else if (v <= mh + fe) {
+        const t = (v - (mh - fe)) / (fe * 2);
+        wM = 1 - t; wH = t;
+      } else wH = 1;
+      // Blend pattern thresholds by zone weight
+      const tS = patternThresh(p.shadowPattern, x, y);
+      const tM = patternThresh(p.midPattern, x, y);
+      const tH = patternThresh(p.highPattern, x, y);
+      const blendT = (tS * wS + tM * wM + tH * wH) * 255;
+      const result = v > blendT ? 255 : 0;
+      o[i] = p.invert ? 255 - result : result;
+    }
+    return o;
+  }});
+
+  // 4) Flow Halftone — halftone "rows" curve to follow image gradient
+  // streamlines instead of being a rigid grid. Creates intricate
+  // contour-following dot patterns.
+  A.push({ id:'flow-halftone', name:'Flow Halftone', category:'image-aware', params:[
+    {id:'dotSize',label:'Dot Size',min:3,max:20,step:1,default:7},
+    {id:'lineSpacing',label:'Row Spacing',min:3,max:24,step:1,default:8},
+    {id:'flowStrength',label:'Flow Strength',min:0,max:1,step:.05,default:.7,
+     hint:'0 = straight grid, 1 = fully curved'},
+    {id:'regionSize',label:'Sample Region',min:2,max:32,step:1,default:10},
+    {id:'shape',label:'Shape',type:'select',options:[
+      {value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},
+      {value:'square',label:'Square'}
+    ],default:'circle'},
+    {id:'dotGain',label:'Dot Gain',min:.5,max:2.5,step:.05,default:1.4},
+    {id:'softness',label:'Softness',min:0,max:1,step:.05,default:.1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    o.fill(p.invert ? 0 : 255);
+    const ink = p.invert ? 255 : 0;
+    const { ang } = regionGradients(px, w, h, p.regionSize);
+    const ds = p.dotSize, sp = p.lineSpacing;
+    // Build cumulative-warp coordinates: each pixel's "row" follows the
+    // gradient field. We construct a warped Y coordinate by integrating
+    // the perpendicular component of a unit-along-isophote direction.
+    const warpY = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      let acc = y;
+      for (let x = 0; x < w; x++) {
+        const i = y*w+x;
+        // Tangent direction (perpendicular to gradient)
+        const a = (ang[i] || 0) + Math.PI/2;
+        // Warp Y coordinate by tangent's Y component scaled by flowStrength
+        if (x > 0) acc += -Math.sin(a) * p.flowStrength;
+        warpY[i] = acc;
+      }
+    }
+    const warpX = new Float32Array(w * h);
+    for (let x = 0; x < w; x++) {
+      let acc = x;
+      for (let y = 0; y < h; y++) {
+        const i = y*w+x;
+        const a = (ang[i] || 0) + Math.PI/2;
+        if (y > 0) acc += Math.cos(a) * p.flowStrength;
+        warpX[i] = acc;
+      }
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y*w+x;
+      const wx = warpX[i], wy = warpY[i];
+      const cellY = Math.floor(wy / sp);
+      const localY = wy - cellY * sp; // 0..sp
+      const cellX = Math.floor(wx / ds);
+      const localX = wx - cellX * ds; // 0..ds
+      // Map to dot-cell normalized coords (-1..1)
+      const nx = (localX/ds - .5) * 2;
+      const ny = (localY/sp - .5) * 2;
+      let d;
+      if (p.shape === 'diamond') d = Math.abs(nx) + Math.abs(ny);
+      else if (p.shape === 'square') d = Math.max(Math.abs(nx), Math.abs(ny));
+      else d = Math.sqrt(nx*nx + ny*ny);
+      let val = clamp(px[i]) / 255;
+      if (p.gamma !== 1) val = Math.pow(val, p.gamma);
+      const t = (1 - val) * p.dotGain;
+      let inside;
+      if (p.softness > 0) { const s2 = d - t; inside = (128 - s2/p.softness*128) > 128; }
+      else inside = d < t;
+      if (inside) o[i] = ink;
+    }
+    return o;
+  }});
+
+  // 5) Hyper-Ordered — Bayer with per-pixel rotation set by gradient angle.
+  // Pattern itself rotates to follow image features at every pixel.
+  A.push({ id:'hyper-ordered', name:'Hyper-Ordered (Rotating Bayer)', category:'image-aware', params:[
+    {id:'size',label:'Matrix',type:'select',options:[
+      {value:4,label:'4x4'},{value:8,label:'8x8'},{value:16,label:'16x16'},{value:32,label:'32x32'}
+    ],default:8},
+    {id:'rotInfluence',label:'Rotation Follow',min:0,max:1,step:.05,default:.6,
+     hint:'how much gradient rotates the pattern locally'},
+    {id:'regionSize',label:'Region Size',min:2,max:32,step:1,default:6},
+    {id:'spread',label:'Spread',min:0,max:255,step:1,default:128},
+    {id:'edgePush',label:'Edge Threshold Bias',min:-1,max:1,step:.05,default:0,
+     hint:'+: brighten edges. -: darken edges.'},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const sz = +p.size, mat = normBayer(sz), o = new Uint8ClampedArray(w*h);
+    const { mag, ang } = regionGradients(px, w, h, p.regionSize);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y*w+x;
+      // Rotation angle follows local gradient (lerp from 0)
+      const theta = (ang[i] || 0) * p.rotInfluence;
+      const ca = Math.cos(theta), sa = Math.sin(theta);
+      const rx = Math.round(x*ca + y*sa), ry = Math.round(-x*sa + y*ca);
+      const bx = ((rx % sz) + sz) % sz, by = ((ry % sz) + sz) % sz;
+      let v = clamp(px[i]); if (p.gamma !== 1) v = Math.pow(v/255, p.gamma) * 255;
+      v += (mat[by][bx] - .5) * p.spread;
+      const thr = p.threshold - p.edgePush * 80 * mag[i];
+      const result = v > thr ? 255 : 0;
+      o[i] = p.invert ? 255 - result : result;
+    }
+    return o;
+  }});
+
   return A;
 })();
