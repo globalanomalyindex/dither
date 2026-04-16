@@ -326,7 +326,12 @@
     };
   }
 
-  canvasWrapper.addEventListener('mousedown', e => {
+  // Prevent touch scrolling / gesture defaults so pen input is captured cleanly
+  if (canvasWrapper) canvasWrapper.style.touchAction = 'none';
+
+  let _paintPointerId = null;
+
+  canvasWrapper.addEventListener('pointerdown', e => {
     if (e.button !== 0) return;
     // Brush/pickup selection mode intercepts in capture phase — skip here
     if (brushSelectionMode || pickupSelectionMode) return;
@@ -336,7 +341,21 @@
     if (activeTab === 'paintstroke' && !spaceHeld && DitherEngine.getSourceSize()) {
       isPainting = true;
       const pt = canvasToImage(e.clientX, e.clientY);
-      PaintEngine.beginStroke(pt.x, pt.y);
+      const isPen = e.pointerType === 'pen';
+      // Pens report 0..1. Some pens report 0 on initial contact before pressure
+      // is sampled — fall back to 0.5 so the first stamp isn't invisible.
+      const pressure = isPen ? (e.pressure > 0 ? e.pressure : 0.5) : 1;
+      const opts = {
+        tiltX: (typeof e.tiltX === 'number') ? e.tiltX : 0,
+        tiltY: (typeof e.tiltY === 'number') ? e.tiltY : 0,
+        twist: (typeof e.twist === 'number') ? e.twist : 0,
+        time: (typeof e.timeStamp === 'number') ? e.timeStamp : performance.now()
+      };
+      try {
+        canvasWrapper.setPointerCapture(e.pointerId);
+        _paintPointerId = e.pointerId;
+      } catch (_) {}
+      PaintEngine.beginStroke(pt.x, pt.y, pressure, isPen, opts);
       return;
     }
 
@@ -387,7 +406,7 @@
     });
   }
 
-  document.addEventListener('mousemove', e => {
+  document.addEventListener('pointermove', e => {
     // Update brush cursor position only when shown
     if (activeTab === 'paintstroke' && brushCursor && _cursorOverCanvas) {
       brushCursor.style.left = e.clientX + 'px';
@@ -396,8 +415,40 @@
     }
 
     if (isPainting) {
-      const pt = canvasToImage(e.clientX, e.clientY);
-      PaintEngine.continueStroke(pt.x, pt.y);
+      const isPen = e.pointerType === 'pen';
+      // High-resolution sub-events coalesced by the browser — play them back
+      // in order so fast flicks and curves don't lose fidelity.
+      let events = null;
+      if (isPen && typeof e.getCoalescedEvents === 'function') {
+        try {
+          const c = e.getCoalescedEvents();
+          if (c && c.length > 1) events = c;
+        } catch (_) {}
+      }
+      if (events) {
+        for (let i = 0; i < events.length; i++) {
+          const ce = events[i];
+          const pt = canvasToImage(ce.clientX, ce.clientY);
+          const pressure = (ce.pressure > 0) ? ce.pressure : undefined;
+          const copts = {
+            tiltX: (typeof ce.tiltX === 'number') ? ce.tiltX : 0,
+            tiltY: (typeof ce.tiltY === 'number') ? ce.tiltY : 0,
+            twist: (typeof ce.twist === 'number') ? ce.twist : 0,
+            time:  (typeof ce.timeStamp === 'number') ? ce.timeStamp : performance.now()
+          };
+          PaintEngine.continueStroke(pt.x, pt.y, pressure, copts);
+        }
+      } else {
+        const pt = canvasToImage(e.clientX, e.clientY);
+        const pressure = isPen ? (e.pressure > 0 ? e.pressure : undefined) : undefined;
+        const copts = isPen ? {
+          tiltX: (typeof e.tiltX === 'number') ? e.tiltX : 0,
+          tiltY: (typeof e.tiltY === 'number') ? e.tiltY : 0,
+          twist: (typeof e.twist === 'number') ? e.twist : 0,
+          time:  (typeof e.timeStamp === 'number') ? e.timeStamp : performance.now()
+        } : undefined;
+        PaintEngine.continueStroke(pt.x, pt.y, pressure, copts);
+      }
       return;
     }
 
@@ -407,11 +458,15 @@
     updateCanvasTransform();
   });
 
-  document.addEventListener('mouseup', () => {
+  document.addEventListener('pointerup', () => {
     if (isPainting) {
       isPainting = false;
       PaintEngine.endStroke();
       updateStrokeCount();
+      if (_paintPointerId != null) {
+        try { canvasWrapper.releasePointerCapture(_paintPointerId); } catch (_) {}
+        _paintPointerId = null;
+      }
       return;
     }
     if (isPanning) {
@@ -1485,6 +1540,16 @@
       state.globals.brightness = 0;
       state.globals.contrast = 0;
       state.globals.gamma = 1.0;
+      // WYSIWYG bake: the baked imageData already contains the final RGB pixels
+      // (paint, grain, color tints, all composited). Force colorMode='color'
+      // and reset any dark/light tint so the empty-pipeline render passes
+      // those RGB pixels through verbatim instead of collapsing to grayscale
+      // and re-tinting.
+      state.globals.colorMode = 'color';
+      state.globals.colorDark = '#000000';
+      state.globals.colorLight = '#ffffff';
+      // Reset tone lock (which would also mask the baked pixels)
+      state.globals.toneLock = { shadows: false, midtones: false, highlights: false, shadowMid: 64, midHighlight: 192 };
       // Reset grain
       grainLayers.length = 0;
       updateGrainUI();
@@ -2140,8 +2205,6 @@
   paintSlider('paint-spacing', v => PaintEngine.setSpacing(v));
   paintSlider('paint-strength', v => PaintEngine.setStrength(v));
   paintSlider('paint-opacity', v => PaintEngine.setOpacity(v));
-  paintSlider('paint-taper-in', v => PaintEngine.setTaperIn(v));
-  paintSlider('paint-taper-out', v => PaintEngine.setTaperOut(v));
 
   // Brush shape influence + wet-paint sliders
   paintSlider('brush-shape-influence', v => PaintEngine.setShapeInfluence(v));
@@ -2152,10 +2215,35 @@
   paintSlider('paint-wet-lifetime', v => PaintEngine.setWetLifetime(v));
   paintSlider('paint-wet-evolve', v => PaintEngine.setWetEvolveRate(v));
 
-  const taperOpacityCheck = $('paint-taper-opacity');
-  if (taperOpacityCheck) {
-    taperOpacityCheck.addEventListener('change', () => PaintEngine.setTaperOpacity(taperOpacityCheck.checked));
-  }
+  // ── Pen pressure controls ──
+  const pSizeCheck = $('paint-pressure-size');
+  if (pSizeCheck) pSizeCheck.addEventListener('change', () => PaintEngine.setPressureSize(pSizeCheck.checked));
+  const pOpCheck = $('paint-pressure-opacity');
+  if (pOpCheck) pOpCheck.addEventListener('change', () => PaintEngine.setPressureOpacity(pOpCheck.checked));
+  paintSlider('paint-pressure-size-min', v => PaintEngine.setPressureSizeMin(v / 100));
+  paintSlider('paint-pressure-opacity-min', v => PaintEngine.setPressureOpacityMin(v / 100));
+
+  // Extended pen pressure / tilt / twist / velocity controls
+  const pStrCheck = $('paint-pressure-strength');
+  if (pStrCheck) pStrCheck.addEventListener('change', () => PaintEngine.setPressureStrength(pStrCheck.checked));
+  paintSlider('paint-pressure-strength-min', v => PaintEngine.setPressureStrengthMin(v / 100));
+  const pSpcCheck = $('paint-pressure-spacing');
+  if (pSpcCheck) pSpcCheck.addEventListener('change', () => PaintEngine.setPressureSpacing(pSpcCheck.checked));
+  // Curve is stored as 0.1..5, slider holds 10..500 (×100) for integer step
+  paintSlider('paint-pressure-curve', v => PaintEngine.setPressureCurve(v / 100));
+
+  const tiltCheck = $('paint-tilt-enabled');
+  if (tiltCheck) tiltCheck.addEventListener('change', () => PaintEngine.setTiltEnabled(tiltCheck.checked));
+  paintSlider('paint-tilt-angle', v => PaintEngine.setTiltAngleInfluence(v / 100));
+  paintSlider('paint-tilt-size',  v => PaintEngine.setTiltSizeInfluence(v / 100));
+
+  const twistCheck = $('paint-twist-enabled');
+  if (twistCheck) twistCheck.addEventListener('change', () => PaintEngine.setTwistEnabled(twistCheck.checked));
+  paintSlider('paint-twist-influence', v => PaintEngine.setTwistInfluence(v / 100));
+
+  const velCheck = $('paint-velocity-enabled');
+  if (velCheck) velCheck.addEventListener('change', () => PaintEngine.setVelocityEnabled(velCheck.checked));
+  paintSlider('paint-velocity-size', v => PaintEngine.setVelocitySizeInfluence(v / 100));
 
   // ── Paint layer composite mode + opacity ──
   const paintCompModeEl = $('paint-composite-mode');

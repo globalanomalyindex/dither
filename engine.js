@@ -326,9 +326,14 @@ const DitherEngine = (() => {
         let v = dithResult[j];
         if (mix > 0) v = v * (1 - mix) + origGray[j] * mix;
 
-        // Apply blend mode between current accumulator and this step's result
-        if (pi > 0 && blendMode !== 'normal') {
-          v = blendPixel(current[j], v, blendMode);
+        // Apply blend mode. For pi>0 we blend against the accumulated pipeline
+        // so far. For pi===0 there is no prior step, so we blend against the
+        // ORIGINAL image — that way a single-step pipeline with e.g. 'overlay'
+        // actually composites the dither against the source instead of being
+        // a no-op. Also apply when useOrig is set to force the same behavior.
+        if (blendMode !== 'normal') {
+          const base = pi > 0 ? current[j] : origGray[j];
+          v = blendPixel(base, v, blendMode);
         }
 
         let effectAlpha = 1;
@@ -398,10 +403,13 @@ const DitherEngine = (() => {
           vg = vg*(1-mix) + origG[j]*mix;
           vb = vb*(1-mix) + origB[j]*mix;
         }
-        if (pi > 0 && blendMode !== 'normal') {
-          vr = blendPixel(prevR[j], vr, blendMode);
-          vg = blendPixel(prevG[j], vg, blendMode);
-          vb = blendPixel(prevB[j], vb, blendMode);
+        if (blendMode !== 'normal') {
+          const br = pi > 0 ? prevR[j] : origR[j];
+          const bg = pi > 0 ? prevG[j] : origG[j];
+          const bb = pi > 0 ? prevB[j] : origB[j];
+          vr = blendPixel(br, vr, blendMode);
+          vg = blendPixel(bg, vg, blendMode);
+          vb = blendPixel(bb, vb, blendMode);
         }
         let effectAlpha = 1;
         if (hasBWClip) effectAlpha = calcEdgeAlpha(grayRef[j], bp, wp, feather, edgeMode, j);
@@ -471,10 +479,13 @@ const DitherEngine = (() => {
             vg = vg*(1-mix) + origG[j]*mix;
             vb = vb*(1-mix) + origB[j]*mix;
           }
-          if (pi > 0 && blendMode !== 'normal') {
-            vr = blendPixel(prevR[j], vr, blendMode);
-            vg = blendPixel(prevG[j], vg, blendMode);
-            vb = blendPixel(prevB[j], vb, blendMode);
+          if (blendMode !== 'normal') {
+            const br = pi > 0 ? prevR[j] : origR[j];
+            const bg = pi > 0 ? prevG[j] : origG[j];
+            const bb = pi > 0 ? prevB[j] : origB[j];
+            vr = blendPixel(br, vr, blendMode);
+            vg = blendPixel(bg, vg, blendMode);
+            vb = blendPixel(bb, vb, blendMode);
           }
           let effectAlpha = 1;
           if (hasBWClip) effectAlpha = calcEdgeAlpha(grayRef[j], bp, wp, feather, edgeMode, j);

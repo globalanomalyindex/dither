@@ -4250,5 +4250,430 @@ const DitherAlgorithms = (() => {
     return o;
   }});
 
+  // ═══════════════════════════════════════════
+  // ASCII BINARY — 0s and 1s only, dithered
+  // ═══════════════════════════════════════════
+  // Each cell becomes either '0' or '1' based on local brightness. Uses a
+  // Bayer matrix for controlled patterning (not random) so you can dial
+  // between hard threshold (posterized) and heavily dithered "Matrix"
+  // printouts. Optional edge-bias picks '1' (denser glyph) on strong edges
+  // to preserve silhouettes.
+  A.push({ id:'ascii-binary', name:'ASCII Binary 01', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:4,max:20,step:1,default:8},
+    {id:'fontScale',label:'Font Scale',min:.5,max:2,step:.1,default:1},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'bayer',label:'Bayer Size',type:'select',options:[
+      {value:0,label:'None (hard)'},{value:2,label:'2×2'},
+      {value:4,label:'4×4'},{value:8,label:'8×8'},{value:16,label:'16×16'}
+    ],default:4},
+    {id:'spread',label:'Dither Spread',min:0,max:255,step:1,default:128},
+    {id:'edgeBias',label:'Edge Bias',min:0,max:2,step:.05,default:.6},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'inkDark',label:'Ink Dark',min:0,max:255,step:1,default:0},
+    {id:'inkLight',label:'Ink Light',min:0,max:255,step:1,default:255},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h); o.fill(p.inkLight);
+    const cs = p.cellSize;
+    // Build glyph bitmaps for '0' and '1' at the chosen cell size/scale
+    const gSet = getGlyphs(' 01', cs, cs, p.fontScale);
+    // Indices: 0 = space, 1 = '0', 2 = '1' (in input order; gSet.glyphs preserves order)
+    const gZero = gSet.glyphs[1];
+    const gOne = gSet.glyphs[2];
+    const bSize = +p.bayer;
+    const b = bSize > 0 ? normBayer(bSize) : null;
+    for (let y = 0; y < h; y += cs) {
+      for (let x = 0; x < w; x += cs) {
+        const stats = cellStats(px, x, y, cs, cs, w, h);
+        let v = stats.avg;
+        if (p.gamma !== 1) v = Math.pow(v/255, p.gamma) * 255;
+        if (b) {
+          const by = ((y/cs)|0) % bSize, bx = ((x/cs)|0) % bSize;
+          v += (b[by][bx] - 0.5) * p.spread;
+        }
+        // Edge pixels bias toward '1' (denser glyph) so silhouettes pop
+        if (p.edgeBias > 0 && stats.edgeMag > 25) {
+          v -= stats.edgeMag * p.edgeBias * 0.4;
+        }
+        let isOne = v < p.threshold;
+        if (p.invert) isOne = !isOne;
+        const gl = isOne ? gOne : gZero;
+        stampGlyph(o, gl, x, y, cs, cs, w, h, p.inkDark, p.inkLight);
+      }
+    }
+    return o;
+  }});
+
+  // ═══════════════════════════════════════════
+  // ASCII PRO — ultimate image-aware ASCII
+  // ═══════════════════════════════════════════
+  // Combines ALL charsets (rare math/stars/arrows/currency glyphs included)
+  // into one huge coverage-sorted ramp, then picks the best glyph per cell
+  // by BOTH coverage AND edge direction. When a cell has a strong gradient,
+  // we prefer an orientation-matching glyph (|, /, ─, \) regardless of
+  // coverage — this preserves structure like hair strands, skylines, wires.
+  // A blue-noise jitter lets the same brightness level pick different
+  // "synonymous" glyphs in adjacent cells so flat regions don't repeat.
+  A.push({ id:'ascii-pro', name:'ASCII Pro', category:'ascii', params:[
+    {id:'cellSize',label:'Cell Size',min:4,max:20,step:1,default:8},
+    {id:'fontScale',label:'Font Scale',min:.5,max:2,step:.1,default:1},
+    {id:'charPool',label:'Character Pool',type:'select',options:[
+      {value:'ultra',label:'Ultra (all sets + rare)'},
+      {value:'wide',label:'Wide (letters + symbols)'},
+      {value:'structural',label:'Structural (box + slashes)'},
+      {value:'celestial',label:'Celestial (stars + math)'}
+    ],default:'ultra'},
+    {id:'edgeAware',label:'Edge Awareness',min:0,max:1,step:.05,default:.7},
+    {id:'edgeThreshold',label:'Edge Threshold',min:5,max:200,step:5,default:40},
+    {id:'contrastBoost',label:'Contrast Boost',min:0,max:2,step:.05,default:.5},
+    {id:'shadowDetail',label:'Shadow Detail',min:0,max:2,step:.1,default:1.2},
+    {id:'highlightDetail',label:'Highlight Detail',min:0,max:2,step:.1,default:0.8},
+    {id:'jitter',label:'Synonym Jitter',min:0,max:1,step:.05,default:.25},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'inkDark',label:'Ink Dark',min:0,max:255,step:1,default:0},
+    {id:'inkLight',label:'Ink Light',min:0,max:255,step:1,default:255},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h); o.fill(p.inkLight);
+    const cs = p.cellSize;
+
+    // Build the combined character pool. We also tag each character by
+    // whether it's orientation-biased (which axis it "leans" toward).
+    const pools = {
+      ultra:      ' .\'`^",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$·•●○◦◎◉⊙⊚░▒▓█┄┈╌─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬±×÷≈≠≤≥∞∑∏∫√∂∆Ω✦✧★☆✪✫✬✭✮✯◊◇◆△▲▽▼□■',
+      wide:       ' .\'`^",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$',
+      structural: ' ·─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬/\\|—┄┈╌╍_=-',
+      celestial:  ' ·✦✧★☆✪✫✬✭✮✯±×÷≈≠≤≥∞∑∏∫√∂∆Ω◊◇◆'
+    };
+    const rampStr = pools[p.charPool] || pools.ultra;
+    const gSet = getGlyphs(rampStr, cs, cs, p.fontScale);
+
+    // Tag orientation for each character: 0=none, 1=vertical, 2=horizontal,
+    // 3=diag-down-right (/), 4=diag-down-left (\). Checked against input-order
+    // character list, then mapped through sortIdx below.
+    const chars = [...rampStr];
+    const inputOri = chars.map(c => {
+      if ('|│║┃╎╏╽╿⎸⎹'.includes(c)) return 1;
+      if ('─━═╌╍━┄┈_-—–'.includes(c)) return 2;
+      if ('/╱⁄'.includes(c)) return 3;
+      if ('\\╲'.includes(c)) return 4;
+      return 0;
+    });
+    // sortedOri[i] = orientation of the i-th glyph in sortedGlyphs
+    const sortedOri = gSet.sortIdx.map(i => inputOri[i]);
+    const sortedGlyphs = gSet.sortedGlyphs, sortedCov = gSet.sortedCoverages;
+
+    // For edge-aware picks: partition sorted-index ranges by orientation
+    // so we can quickly find an oriented glyph with ~target coverage.
+    function pickOriented(targetCov, ori) {
+      // Find nearest sorted index matching that orientation
+      let best = -1, bestD = Infinity;
+      for (let i = 0; i < sortedOri.length; i++) {
+        if (sortedOri[i] !== ori) continue;
+        const d = Math.abs(sortedCov[i] - targetCov);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      return best;
+    }
+
+    const rnd = mkRand(p.seed);
+
+    for (let y = 0; y < h; y += cs) {
+      for (let x = 0; x < w; x += cs) {
+        const stats = cellStats(px, x, y, cs, cs, w, h);
+        let vN = stats.avg / 255;
+        if (p.gamma !== 1) vN = Math.pow(vN, p.gamma);
+
+        // Contrast boost near zone boundaries
+        if (p.contrastBoost > 0) {
+          const mid = 0.5;
+          vN = mid + (vN - mid) * (1 + p.contrastBoost);
+          vN = Math.max(0, Math.min(1, vN));
+        }
+        // Zone-specific detail weighting
+        if (vN < 0.4 && p.shadowDetail !== 1) {
+          // Dark: push toward darker glyphs as shadowDetail rises
+          vN = Math.max(0, vN * (1 / Math.max(0.1, p.shadowDetail)));
+        } else if (vN > 0.6 && p.highlightDetail !== 1) {
+          // Bright: push toward lighter glyphs when highlightDetail < 1
+          vN = 1 - (1 - vN) * (1 / Math.max(0.1, p.highlightDetail));
+        }
+        if (p.invert) vN = 1 - vN;
+
+        // Target coverage = darkness
+        let targetCov = 1 - vN;
+
+        // Edge-aware glyph override: if gradient is strong enough, try to
+        // pick an orientation-aligned glyph with similar coverage.
+        let glyphIdx = -1;
+        if (p.edgeAware > 0 && stats.edgeMag > p.edgeThreshold) {
+          const ang = stats.edgeAng;
+          const deg = (ang * 180 / Math.PI + 360) % 180;
+          // Gradient direction is perpendicular to the edge line itself, so
+          // map gradient angle to the best matching stroke orientation.
+          let ori;
+          if (deg < 22.5 || deg >= 157.5) ori = 1;       // gradient ~horizontal → vertical stroke
+          else if (deg < 67.5) ori = 3;                   // diag-down-right stroke
+          else if (deg < 112.5) ori = 2;                  // horizontal stroke
+          else ori = 4;                                   // diag-down-left
+          const oi = pickOriented(targetCov, ori);
+          if (oi >= 0) {
+            // Mix between plain coverage pick and oriented pick
+            const purePick = pickGlyphIdx(sortedCov, targetCov);
+            const mix = Math.min(1, (stats.edgeMag - p.edgeThreshold) / 80 * p.edgeAware);
+            glyphIdx = rnd() < mix ? oi : purePick;
+          }
+        }
+        if (glyphIdx < 0) {
+          glyphIdx = pickGlyphIdx(sortedCov, targetCov);
+          // Synonym jitter: in flat areas pick a neighboring glyph with
+          // near-identical coverage to break up repetition
+          if (p.jitter > 0 && stats.contrast < 25) {
+            const j = Math.round((rnd() - 0.5) * p.jitter * 6);
+            glyphIdx = Math.max(0, Math.min(sortedGlyphs.length - 1, glyphIdx + j));
+          }
+        }
+        stampGlyph(o, sortedGlyphs[glyphIdx], x, y, cs, cs, w, h, p.inkDark, p.inkLight);
+      }
+    }
+    return o;
+  }});
+
+  // ═══════════════════════════════════════════
+  // BRAILLE ADVANCED — image-aware variable block sizes
+  // ═══════════════════════════════════════════
+  // Unlike the basic Braille Render (uniform cellW=2*ds × cellH=4*ds grid),
+  // this one picks per-region BLOCK SIZE based on local image complexity:
+  //   • High edge magnitude → small blocks (preserve detail)
+  //   • High contrast      → small-to-medium blocks
+  //   • Low contrast flat  → large blocks (abstract/stylized)
+  //   • Shadow vs highlight → different dot-density bias
+  // Blocks are placed via a greedy quad-tree style pass: start with coarse
+  // blocks and subdivide any that exceed a complexity threshold.
+  A.push({ id:'ascii-braille-pro', name:'Braille Advanced (Image-Aware)', category:'ascii', params:[
+    {id:'minDot',label:'Min Dot Size',min:1,max:4,step:1,default:2},
+    {id:'maxDot',label:'Max Dot Size',min:2,max:8,step:1,default:5},
+    {id:'edgeSensitivity',label:'Edge Sensitivity',min:0,max:2,step:.05,default:1},
+    {id:'contrastSensitivity',label:'Contrast Sensitivity',min:0,max:2,step:.05,default:.8},
+    {id:'shadowBias',label:'Shadow Dot Bias',min:-1,max:1,step:.05,default:.2},
+    {id:'highlightBias',label:'Highlight Dot Bias',min:-1,max:1,step:.05,default:-.2},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'adaptiveThreshold',label:'Adaptive Threshold',min:0,max:1,step:.05,default:.4},
+    {id:'opArtMoire',label:'Op-Art Moiré',min:0,max:1,step:.05,default:0},
+    {id:'dotShape',label:'Dot Shape',type:'select',options:[
+      {value:'round',label:'Round'},{value:'square',label:'Square'},{value:'diamond',label:'Diamond'}
+    ],default:'round'},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w * h);
+    o.fill(p.invert ? 0 : 255);
+    const minD = Math.min(p.minDot, p.maxDot);
+    const maxD = Math.max(p.minDot, p.maxDot);
+    const rnd = mkRand(p.seed);
+
+    // Precompute a local complexity score per coarse block so we can
+    // choose dot sizes. Score combines edge magnitude and contrast.
+    function complexityAt(cx, cy, cw, ch) {
+      const stats = cellStats(px, cx, cy, cw, ch, w, h);
+      const edgeN = Math.min(1, stats.edgeMag / 255) * p.edgeSensitivity;
+      const contN = Math.min(1, stats.contrast / 128) * p.contrastSensitivity;
+      return { score: Math.max(edgeN, contN), stats };
+    }
+
+    // Walk the image in coarse chunks (maxD * 2 wide, maxD * 4 tall = one
+    // braille cell at maximum dot size). For each chunk, compute complexity
+    // and pick a dot size that scales with 1 - complexity.
+    const coarseW = maxD * 2, coarseH = maxD * 4;
+    for (let cy = 0; cy < h; cy += coarseH) {
+      for (let cx = 0; cx < w; cx += coarseW) {
+        const comp = complexityAt(cx, cy, coarseW, coarseH);
+        // score=1 → minD, score=0 → maxD
+        const range = maxD - minD;
+        const ds = Math.max(1, Math.round(maxD - comp.score * range));
+        const dotR = ds / 2;
+
+        // For each sub-cell at this dot size inside the coarse region
+        for (let by = cy; by < cy + coarseH && by < h; by += ds * 4) {
+          for (let bx = cx; bx < cx + coarseW && bx < w; bx += ds * 2) {
+            // Local luminance for adaptive threshold inside this sub-cell
+            let localSum = 0, localCount = 0;
+            for (let dy = 0; dy < ds * 4 && by + dy < h; dy++) {
+              for (let dx = 0; dx < ds * 2 && bx + dx < w; dx++) {
+                localSum += clamp(px[(by + dy) * w + bx + dx]);
+                localCount++;
+              }
+            }
+            const localAvg = localCount > 0 ? localSum / localCount : 128;
+            const thr0 = p.threshold * (1 - p.adaptiveThreshold) + localAvg * p.adaptiveThreshold;
+            // Luminance-based dot bias: dark regions get extra dots
+            // (shadowBias>0), highlights fewer dots (highlightBias<0).
+            const lumN = localAvg / 255;
+            let bias = 0;
+            if (lumN < 0.4) bias = p.shadowBias * (1 - lumN / 0.4) * 30;
+            else if (lumN > 0.6) bias = p.highlightBias * ((lumN - 0.6) / 0.4) * 30;
+            const thr = thr0 + bias;
+
+            // Emit the 2×4 dot pattern for this braille cell
+            for (let dotY = 0; dotY < 4; dotY++) {
+              for (let dotX = 0; dotX < 2; dotX++) {
+                const scy = by + dotY * ds, scx = bx + dotX * ds;
+                if (scy >= h || scx >= w) continue;
+                let sum = 0, cnt = 0;
+                for (let sy = 0; sy < ds && scy + sy < h; sy++) {
+                  for (let sx = 0; sx < ds && scx + sx < w; sx++) {
+                    sum += clamp(px[(scy + sy) * w + scx + sx]);
+                    cnt++;
+                  }
+                }
+                if (cnt === 0) continue;
+                let val = sum / cnt;
+                if (p.gamma !== 1) val = Math.pow(val/255, p.gamma) * 255;
+                // Op-Art moiré: add rotating sinusoidal bias based on block
+                // index so alternating grids create a Riley-style illusion
+                if (p.opArtMoire > 0) {
+                  const mx = (scx + scy) * 0.22;
+                  const my = (scx - scy) * 0.18;
+                  val += (Math.sin(mx) + Math.cos(my)) * 40 * p.opArtMoire;
+                }
+                const isDark = p.invert ? val > thr : val < thr;
+                if (isDark) {
+                  const centerX = dotR, centerY = dotR;
+                  for (let sy = 0; sy < ds && scy + sy < h; sy++) {
+                    for (let sx = 0; sx < ds && scx + sx < w; sx++) {
+                      let inside = false;
+                      if (p.dotShape === 'round') {
+                        const ddx = sx - centerX + 0.5, ddy = sy - centerY + 0.5;
+                        inside = Math.sqrt(ddx * ddx + ddy * ddy) <= dotR;
+                      } else if (p.dotShape === 'diamond') {
+                        inside = Math.abs(sx - centerX + 0.5) + Math.abs(sy - centerY + 0.5) <= dotR;
+                      } else {
+                        inside = true;
+                      }
+                      if (inside) {
+                        o[(scy + sy) * w + scx + sx] = p.invert ? 255 : 0;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return o;
+  }});
+
+  // ═══════════════════════════════════════════
+  // IMPRESSIONISM — directional dabs + op-art illusion modes
+  // ═══════════════════════════════════════════
+  // Inspired by Monet/Van Gogh: short brush dabs aligned to the perpendicular
+  // of the local image gradient, colored/shaded by local luminance. Supports
+  // several "optical illusion" variants that bend the dab placement to
+  // produce Riley-style op-art or subtle chromatic-aberration feel.
+  A.push({ id:'impressionism', name:'Impressionism / Op-Art', category:'artistic', params:[
+    {id:'dabCount',label:'Dab Count',min:500,max:20000,step:100,default:4000},
+    {id:'dabLen',label:'Dab Length',min:2,max:30,step:1,default:8},
+    {id:'dabWidth',label:'Dab Width',min:1,max:8,step:1,default:2},
+    {id:'flowStrength',label:'Gradient Alignment',min:0,max:1,step:.05,default:.85},
+    {id:'lumModulation',label:'Luminance Modulation',min:0,max:2,step:.05,default:1},
+    {id:'edgeBoost',label:'Edge Dab Density',min:0,max:2,step:.05,default:.8},
+    {id:'illusion',label:'Illusion Mode',type:'select',options:[
+      {value:'none',label:'None'},
+      {value:'riley',label:'Riley Moiré (wavy bands)'},
+      {value:'radial',label:'Radial Starburst'},
+      {value:'chromabber',label:'Chromatic Split'},
+      {value:'spiral',label:'Spiral Twist'}
+    ],default:'none'},
+    {id:'illusionStrength',label:'Illusion Strength',min:0,max:1,step:.05,default:.5},
+    {id:'bgTone',label:'Background Tone',min:0,max:255,step:1,default:255},
+    {id:'softness',label:'Dab Softness',min:0,max:1,step:.05,default:.4},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    o.fill(p.bgTone);
+    const rnd = mkRand(p.seed);
+    const cx0 = w / 2, cy0 = h / 2;
+    const maxR = Math.sqrt(cx0 * cx0 + cy0 * cy0);
+
+    // Importance-sampled density: sample more in high-edge regions
+    // (computed cheaply by rejection against local edge magnitude)
+    function trySample() {
+      const x = Math.floor(rnd() * w), y = Math.floor(rnd() * h);
+      if (p.edgeBoost > 0) {
+        const e = sobelAt(px, Math.min(w-2, Math.max(1, x)), Math.min(h-2, Math.max(1, y)), w, h);
+        const accept = 0.4 + Math.min(1, e.mag / 120) * p.edgeBoost * 0.6;
+        if (rnd() > accept) return null;
+      }
+      return [x, y];
+    }
+
+    for (let i = 0; i < p.dabCount; i++) {
+      const s = trySample();
+      if (!s) continue;
+      const [x, y] = s;
+      const srcVal = clamp(px[y * w + x]);
+      const ink = 255 - srcVal;  // dark dabs where image is dark
+      if (ink < 8 && p.lumModulation > 0.5) continue;  // skip white zones
+
+      // Base stroke direction: perpendicular to gradient
+      const e = sobelAt(px, Math.min(w-2, Math.max(1, x)), Math.min(h-2, Math.max(1, y)), w, h);
+      let dirAng = e.mag > 5 ? e.ang + Math.PI / 2 : rnd() * Math.PI * 2;
+      dirAng = dirAng * p.flowStrength + (rnd() * Math.PI * 2) * (1 - p.flowStrength);
+
+      // Apply illusion modulation to the dab's direction and position
+      let ox = 0, oy = 0;
+      const dx0 = x - cx0, dy0 = y - cy0;
+      const rN = Math.sqrt(dx0*dx0 + dy0*dy0) / maxR;
+      const phi = Math.atan2(dy0, dx0);
+      if (p.illusion === 'riley') {
+        // Wavy bands: sine based on distance from center of canvas
+        dirAng += Math.sin(y * 0.05) * p.illusionStrength * 1.2;
+      } else if (p.illusion === 'radial') {
+        // Align dabs toward center so everything radiates out
+        dirAng = phi * (1 - p.illusionStrength) + dirAng * (1 - p.illusionStrength) * 0.5 + phi * p.illusionStrength;
+      } else if (p.illusion === 'chromabber') {
+        // Offset dabs by an amount proportional to radius → chromatic split
+        const ofs = rN * p.illusionStrength * 6;
+        ox = Math.cos(phi) * ofs;
+        oy = Math.sin(phi) * ofs;
+      } else if (p.illusion === 'spiral') {
+        dirAng += (phi + rN * Math.PI * 2 * p.illusionStrength);
+      }
+
+      // Dab length modulated by luminance (darker = longer stroke)
+      const lenMul = 1 + (1 - srcVal/255) * p.lumModulation * 0.4;
+      const len = p.dabLen * lenMul;
+      const width = p.dabWidth;
+      const cosA = Math.cos(dirAng), sinA = Math.sin(dirAng);
+
+      // Rasterize a soft elliptical dab
+      const halfLen = len / 2, halfW = width / 2;
+      const bboxR = Math.ceil(Math.max(halfLen, halfW)) + 1;
+      for (let ty = -bboxR; ty <= bboxR; ty++) {
+        for (let tx = -bboxR; tx <= bboxR; tx++) {
+          // Rotate tx/ty into stroke-local space
+          const lx = tx * cosA + ty * sinA;
+          const ly = -tx * sinA + ty * cosA;
+          const dn = Math.abs(lx) / halfLen, dw = Math.abs(ly) / halfW;
+          const r2 = dn*dn + dw*dw;
+          if (r2 > 1) continue;
+          const soft = p.softness > 0 ? (1 - Math.pow(r2, 0.5 + p.softness * 2)) : 1;
+          const px_x = Math.round(x + tx + ox);
+          const px_y = Math.round(y + ty + oy);
+          if (px_x < 0 || px_x >= w || px_y < 0 || px_y >= h) continue;
+          const idx = px_y * w + px_x;
+          const blend = soft * (0.4 + Math.min(1, ink/128) * 0.6);
+          // Darken the output toward ink (alpha-style stamp)
+          o[idx] = Math.round(o[idx] * (1 - blend) + (255 - ink) * blend);
+        }
+      }
+    }
+    return o;
+  }});
+
   return A;
 })();

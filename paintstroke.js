@@ -53,6 +53,43 @@ const PaintEngine = (() => {
   let strokeTotalDist = 0;     // accumulated distance this stroke
   let strokeStampCount = 0;    // stamps applied this stroke
 
+  // ── Pen input (Pointer Events API) ──
+  // Pressure mappings
+  let pressureSizeEnabled = true;         // map pressure → stamp size
+  let pressureOpacityEnabled = true;      // map pressure → stamp opacity
+  let pressureStrengthEnabled = false;    // map pressure → effect strength (bite)
+  let pressureSpacingEnabled = false;     // map pressure → tighter spacing
+  let pressureSizeMin = 0.15;             // size multiplier at pressure=0 (0..1)
+  let pressureOpacityMin = 0.0;           // opacity multiplier at pressure=0 (0..1)
+  let pressureStrengthMin = 0.3;          // strength multiplier at pressure=0 (0..1)
+  let pressureCurve = 1.0;                // response curve exponent (0.3 soft, 3 hard)
+
+  // Tilt mappings (pen angle relative to surface)
+  let tiltEnabled = true;                 // enable tilt-to-brush modulation
+  let tiltAngleInfluence = 1.0;           // 0..1 — tilt direction → brush rotation
+  let tiltSizeInfluence = 0.4;            // 0..1 — tilt magnitude → brush size (rake)
+
+  // Twist mapping (barrel rotation)
+  let twistEnabled = true;                // enable twist-to-angle
+  let twistInfluence = 1.0;               // 0..1 — twist angle → brush rotation
+
+  // Velocity mappings
+  let velocityEnabled = false;            // enable velocity-aware modulation
+  let velocitySizeInfluence = 0.3;        // 0..1 — faster strokes = thinner
+
+  // Current-stroke pen state (updated each stamp sample)
+  let currentPressure = 1;                // 0..1
+  let pressureActive = false;             // pen pointer driving this stroke
+  let currentTiltX = 0, currentTiltY = 0; // -90..90 degrees
+  let currentTwist = 0;                   // 0..359 degrees
+  let currentVelocity = 0;                // px / ms
+
+  // Velocity tracking
+  let _lastMoveTime = 0, _lastMoveX = 0, _lastMoveY = 0;
+
+  // In-stroke cache for pressure-scaled masks (keyed by integer size)
+  let _pressureMaskCache = { size: -1, mask: null, brush: -1 };
+
   // Brush angle
   let brushAngle = 0;          // manual rotation in degrees
   let followDirection = false;  // rotate brush to follow stroke direction
@@ -101,11 +138,24 @@ const PaintEngine = (() => {
 
   // Wet layer params (0..100 scale unless noted)
   let wetDrip      = 0;     // gravity: wet pixels pull color from above
-  let wetBleed     = 0;     // capillary: averaging with neighbors
+  let wetBleed     = 0;     // capillary: spreading random neighbor swaps
   let wetSmear     = 0;     // continued smear along stroke direction
   let wetSeparate  = 0;     // separation: pull contrast outward (paint splitting)
   let wetLifetime  = 50;    // how long wetness persists (50 = balanced)
   let wetEvolveRate = 1;    // evolution iterations per stamp (subdivides for smoothness)
+
+  // Creative / "super digital" wet effects (all crisp, displacement-based)
+  let wetSort      = 0;     // pixel-sort along stroke direction
+  let wetGlitch    = 0;     // RGB channel separation displacement
+  let wetMosaic    = 0;     // block quantization within wet area
+  let wetMosaicSize = 6;    // block size (px)
+  let wetWave      = 0;     // sine-wave perpendicular displacement
+  let wetWaveFreq  = 50;    // wave frequency
+  let wetShred     = 0;     // VHS-style row shifts
+  let wetEcho      = 0;     // ghost echo of pre-paint base showing through
+  let wetKaleido   = 0;     // radial mirror around stroke center
+  let wetVortex    = 0;     // swirl wet pixels around stroke axis
+  let wetBitcrush  = 0;     // bit-depth quantize via crisp swap
 
   // Brush-shape influence (how much the mask shape dominates per-pixel
   // displacement amplitude; 100 = current, >100 = sharper bristly behavior).
@@ -358,8 +408,18 @@ const PaintEngine = (() => {
   }
 
   function wetEnabled() {
-    return wetDrip > 0 || wetBleed > 0 || wetSmear > 0 || wetSeparate > 0;
+    return wetDrip > 0 || wetBleed > 0 || wetSmear > 0 || wetSeparate > 0 ||
+           wetSort > 0 || wetGlitch > 0 || wetMosaic > 0 || wetWave > 0 ||
+           wetShred > 0 || wetEcho > 0 || wetKaleido > 0 || wetVortex > 0 ||
+           wetBitcrush > 0;
   }
+
+  // Snapshot of canvas at stroke start, used by Echo (ghost) effect so wet
+  // pixels can periodically swap back to the original pre-paint pixel value.
+  let wetEchoSnap = null;
+  let wetEchoBoundsX = 0, wetEchoBoundsY = 0, wetEchoBoundsW = 0, wetEchoBoundsH = 0;
+  // Stroke center for kaleidoscope / vortex
+  let wetStrokeCx = 0, wetStrokeCy = 0;
 
   // Mark pixels under the brush footprint as wet. Wetness adds (clamped to 1)
   // so repeated strokes over the same area remain very wet.
@@ -421,11 +481,24 @@ const PaintEngine = (() => {
     const bleed     = wetBleed / 100;
     const smear     = wetSmear / 100;
     const separate  = wetSeparate / 100;
+    const sortP     = wetSort / 100;
+    const glitch    = wetGlitch / 100;
+    const mosaic    = wetMosaic / 100;
+    const mosaicSz  = Math.max(2, wetMosaicSize | 0);
+    const wave      = wetWave / 100;
+    const waveFreq  = wetWaveFreq / 100; // 0..1
+    const shred     = wetShred / 100;
+    const echo      = wetEcho / 100;
+    const kaleido   = wetKaleido / 100;
+    const vortex    = wetVortex / 100;
+    const bitcrush  = wetBitcrush / 100;
     const dirX = smoothDirX, dirY = smoothDirY;
     const hasDir = (dirX * dirX + dirY * dirY) > 0.001;
     const lifeN = wetLifetime / 100;
     const decay = Math.pow(0.45 + lifeN * 0.5, 1 / Math.max(1, wetEvolveRate));
     const drySub = (1 - lifeN) * 0.012 + 0.003;
+    // Stroke center in region-local coords (for kaleidoscope/vortex)
+    const cxL = wetStrokeCx - x0, cyL = wetStrokeCy - y0;
 
     // Per-frame seed so consecutive passes get fresh randomness but identical
     // pixels in the same pass make consistent decisions
@@ -542,6 +615,199 @@ const PaintEngine = (() => {
           }
         }
 
+        // PIXEL SORT — datamosh-style. Compare luminance of self and the
+        // next pixel in stroke direction; if probability fires AND order is
+        // wrong (depending on direction sign), swap their positions. Over
+        // many frames this gradually sorts wet pixels along the stroke axis.
+        if (sortP > 0 && hasDir) {
+          const p = sortP * wet * 0.95;
+          if (rnd(gx + 5, gy + 7, frameSeed) < p) {
+            const stepX = Math.round(dirX);
+            const stepY = Math.round(dirY);
+            const nx = x + stepX, ny = y + stepY;
+            if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+              const ni = (ny * w + nx) * 4;
+              const lA = sd[di] * 0.299 + sd[di+1] * 0.587 + sd[di+2] * 0.114;
+              const lB = sd[ni] * 0.299 + sd[ni+1] * 0.587 + sd[ni+2] * 0.114;
+              if (lA > lB) { sx = nx; sy = ny; swapped = true; }
+            }
+          }
+        }
+
+        // GLITCH — RGB channel separation. Each color channel may be
+        // independently displaced from a neighbor pixel, producing crisp
+        // RGB-fringe glitches. Channels stay quantized to source values.
+        if (glitch > 0) {
+          const p = glitch * wet * 0.6;
+          // Roll for each channel
+          if (rnd(gx + 11, gy + 13, frameSeed) < p) {
+            const off = 1 + (glitch * 6) | 0;
+            const rx = x + (hasDir ? Math.round(-dirX * off) : -off);
+            const ry = y + (hasDir ? Math.round(-dirY * off) : 0);
+            const cx2 = rx < 0 ? 0 : rx > w - 1 ? w - 1 : rx;
+            const cy2 = ry < 0 ? 0 : ry > h - 1 ? h - 1 : ry;
+            const ci = (cy2 * w + cx2) * 4;
+            out[di] = sd[ci];           // R from displaced position
+            // Keep current G, take B from opposite displacement
+            const bx = x + (hasDir ? Math.round(dirX * off) : off);
+            const by = y + (hasDir ? Math.round(dirY * off) : 0);
+            const cx3 = bx < 0 ? 0 : bx > w - 1 ? w - 1 : bx;
+            const cy3 = by < 0 ? 0 : by > h - 1 ? h - 1 : by;
+            const bi = (cy3 * w + cx3) * 4;
+            out[di + 1] = sd[di + 1];   // G stays
+            out[di + 2] = sd[bi + 2];   // B from opposite
+            // Skip the regular swap since we wrote channels directly
+            swapped = false;
+            // Mark as written (reuse sx==-1 sentinel via flag)
+            wetMap[wi] = wet * decay - drySub;
+            if (wetMap[wi] > 0.015) {
+              anyAlive = true;
+              if (gx     < nx0) nx0 = gx;
+              if (gy     < ny0) ny0 = gy;
+              if (gx + 1 > nx1) nx1 = gx + 1;
+              if (gy + 1 > ny1) ny1 = gy + 1;
+            } else { wetMap[wi] = 0; }
+            continue; // jump to next pixel; we already wrote out[]
+          }
+        }
+
+        // MOSAIC — block quantize: snap pixel to its block-anchor color.
+        // Within wet area only, every pixel in an N×N block becomes the
+        // exact color of the top-left pixel of that block. Probability
+        // controls how often the snap fires per pixel per pass.
+        if (mosaic > 0) {
+          const p = mosaic * wet * 0.85;
+          if (rnd(gx + 17, gy + 19, frameSeed) < p) {
+            const ax = (gx - (gx % mosaicSz)) - x0;
+            const ay = (gy - (gy % mosaicSz)) - y0;
+            sx = ax < 0 ? 0 : ax > w - 1 ? w - 1 : ax;
+            sy = ay < 0 ? 0 : ay > h - 1 ? h - 1 : ay;
+            swapped = true;
+          }
+        }
+
+        // WAVE — sine-wave perpendicular displacement.
+        if (wave > 0) {
+          const p = wave * wet * 0.95;
+          if (rnd(gx + 23, gy + 29, frameSeed) < p) {
+            // Use stroke axis if known, else canvas-x as the parameter
+            let alongPos, perpX, perpY;
+            if (hasDir) {
+              alongPos = gx * dirX + gy * dirY;
+              perpX = -dirY; perpY = dirX;
+            } else {
+              alongPos = gx; perpX = 0; perpY = 1;
+            }
+            const amp = (wave * 12) | 0; // up to 12 px
+            const f = 0.05 + waveFreq * 0.6;
+            const off = Math.round(Math.sin(alongPos * f) * amp);
+            const tx = x + Math.round(perpX * off);
+            const ty = y + Math.round(perpY * off);
+            sx = tx < 0 ? 0 : tx > w - 1 ? w - 1 : tx;
+            sy = ty < 0 ? 0 : ty > h - 1 ? h - 1 : ty;
+            swapped = true;
+          }
+        }
+
+        // SHRED — VHS-style: pixels in a row all shift by the same random
+        // amount. We hash by row-y so all pixels in the same row get the
+        // same shift, producing crisp horizontal bars.
+        if (shred > 0) {
+          const p = shred * wet * 0.85;
+          if (rnd(gx + 31, gy + 37, frameSeed) < p) {
+            const rowR = rnd(gy, frameSeed, 41) - 0.5;
+            const rowShift = Math.round(rowR * shred * 30);
+            const tx = x + rowShift;
+            sx = tx < 0 ? 0 : tx > w - 1 ? w - 1 : tx;
+            swapped = true;
+          }
+        }
+
+        // ECHO — ghost of original (pre-wet) canvas peeks through.
+        // wetEchoSnap holds the canvas right before this stroke started;
+        // probability swaps the wet pixel back to its original color,
+        // creating crisp ghost trails.
+        if (echo > 0 && wetEchoSnap) {
+          const p = echo * wet * 0.7;
+          if (rnd(gx + 43, gy + 47, frameSeed) < p) {
+            // gx,gy are global canvas coords; wetEchoSnap is full-canvas
+            // ImageData with the same dims as canvas
+            const ei = (gy * cw + gx) * 4;
+            const ed = wetEchoSnap.data;
+            out[di]     = ed[ei];
+            out[di + 1] = ed[ei + 1];
+            out[di + 2] = ed[ei + 2];
+            swapped = false;
+            // Decay & continue (we wrote out[] directly)
+            wetMap[wi] = wet * decay - drySub;
+            if (wetMap[wi] > 0.015) {
+              anyAlive = true;
+              if (gx     < nx0) nx0 = gx;
+              if (gy     < ny0) ny0 = gy;
+              if (gx + 1 > nx1) nx1 = gx + 1;
+              if (gy + 1 > ny1) ny1 = gy + 1;
+            } else { wetMap[wi] = 0; }
+            continue;
+          }
+        }
+
+        // KALEIDOSCOPE — radial mirror around stroke center. Reflects the
+        // pixel through angular sectors so the stroke produces a symmetric
+        // crisp pattern. Each sector samples from sector 0 of the wet area.
+        if (kaleido > 0) {
+          const p = kaleido * wet * 0.9;
+          if (rnd(gx + 53, gy + 59, frameSeed) < p) {
+            const rdx = x - cxL, rdy = y - cyL;
+            const rDist = Math.sqrt(rdx * rdx + rdy * rdy);
+            if (rDist > 0.5) {
+              let ang = Math.atan2(rdy, rdx);
+              const nSec = 2 + Math.round(kaleido * 10); // 2..12 sectors
+              const sec = (Math.PI * 2) / nSec;
+              ang = Math.abs(((ang + Math.PI) % sec) - sec * 0.5);
+              const tx = Math.round(cxL + Math.cos(ang) * rDist);
+              const ty = Math.round(cyL + Math.sin(ang) * rDist);
+              sx = tx < 0 ? 0 : tx > w - 1 ? w - 1 : tx;
+              sy = ty < 0 ? 0 : ty > h - 1 ? h - 1 : ty;
+              swapped = true;
+            }
+          }
+        }
+
+        // VORTEX — swirl around stroke center. Wet pixels rotate around the
+        // current stamp center; angle scales with distance for spiral.
+        if (vortex > 0) {
+          const p = vortex * wet * 0.95;
+          if (rnd(gx + 67, gy + 71, frameSeed) < p) {
+            const rdx = x - cxL, rdy = y - cyL;
+            const rDist = Math.sqrt(rdx * rdx + rdy * rdy);
+            if (rDist > 0.5) {
+              const ang = vortex * 0.6 * (1 - Math.min(1, rDist / 50));
+              const cosA = Math.cos(ang), sinA = Math.sin(ang);
+              const tx = Math.round(cxL + (rdx * cosA - rdy * sinA));
+              const ty = Math.round(cyL + (rdx * sinA + rdy * cosA));
+              sx = tx < 0 ? 0 : tx > w - 1 ? w - 1 : tx;
+              sy = ty < 0 ? 0 : ty > h - 1 ? h - 1 : ty;
+              swapped = true;
+            }
+          }
+        }
+
+        // BITCRUSH — quantize pixel coordinates to a coarser grid then
+        // sample. Effectively a coarse mosaic but with a different grid
+        // alignment per channel for chromatic crunch.
+        if (bitcrush > 0) {
+          const p = bitcrush * wet * 0.9;
+          if (rnd(gx + 73, gy + 79, frameSeed) < p) {
+            const bits = 1 + Math.round(bitcrush * 4); // 1..5
+            const mask = ~((1 << bits) - 1);
+            const tx = (x & mask);
+            const ty = (y & mask);
+            sx = tx < 0 ? 0 : tx > w - 1 ? w - 1 : tx;
+            sy = ty < 0 ? 0 : ty > h - 1 ? h - 1 : ty;
+            swapped = true;
+          }
+        }
+
         if (swapped) copyPixel(di, sx, sy);
 
         const newWet = wet * decay - drySub;
@@ -581,6 +847,58 @@ const PaintEngine = (() => {
   // ── Stamp Application ──
   function applyStamp(cx, cy) {
     if (!activeMask || !canvas) return;
+
+    // ── Pen-input modulation ──
+    // Raw pressure (pen-driven only; mouse/touch get neutral 1)
+    const pRaw = pressureActive ? currentPressure : 1;
+    // Pressure response curve (1 = linear; <1 = soft/sensitive; >1 = hard)
+    const pmul = (pressureCurve === 1 || !pressureActive) ? pRaw : Math.pow(pRaw, pressureCurve);
+
+    // Size: pressure base × optional velocity shrink × optional tilt growth
+    let sizeMul = pressureSizeEnabled ? (pressureSizeMin + (1 - pressureSizeMin) * pmul) : 1;
+    if (velocityEnabled && pressureActive && currentVelocity > 0) {
+      // Velocity normalized: 2 px/ms is "fast" — reduce size up to influence
+      const vN = Math.min(1, currentVelocity / 2);
+      sizeMul *= Math.max(0.05, 1 - vN * velocitySizeInfluence);
+    }
+    // Tilt magnitude: 0 (vertical pen) .. 1 (fully flat, ~60deg tilt)
+    let tiltMag = 0;
+    if (tiltEnabled && pressureActive && (currentTiltX !== 0 || currentTiltY !== 0)) {
+      tiltMag = Math.min(1, Math.sqrt(currentTiltX * currentTiltX + currentTiltY * currentTiltY) / 60);
+      // Tilting grows the brush footprint (rake): flat pen covers more
+      sizeMul *= (1 + tiltMag * tiltSizeInfluence);
+    }
+
+    // Opacity: pressure-modulated
+    const opaMul = pressureOpacityEnabled ? (pressureOpacityMin + (1 - pressureOpacityMin) * pmul) : 1;
+    // Strength: pressure-modulated
+    const strengthMul = (pressureStrengthEnabled && pressureActive)
+      ? (pressureStrengthMin + (1 - pressureStrengthMin) * pmul)
+      : 1;
+
+    const _savedPreMask = activeMask;
+    const _savedPreMaskSize = activeMaskSize;
+    // Rescale the mask by sizeMul (rounded to integer size, cached)
+    if (Math.abs(sizeMul - 1) > 0.01) {
+      const newSize = Math.max(1, Math.round(activeMaskSize * sizeMul));
+      if (newSize !== activeMaskSize) {
+        let m = null;
+        if (_pressureMaskCache.size === newSize && _pressureMaskCache.brush === selectedBrush && _pressureMaskCache.mask) {
+          m = _pressureMaskCache.mask;
+        } else {
+          const brush = brushLibrary[selectedBrush];
+          if (brush) {
+            m = scaleMask(brush.mask, brush.size, newSize);
+            _pressureMaskCache = { size: newSize, mask: m, brush: selectedBrush };
+          }
+        }
+        if (m) {
+          activeMask = m;
+          activeMaskSize = newSize;
+        }
+      }
+    }
+
     const ms = activeMaskSize;
     const half = ms / 2;
 
@@ -600,10 +918,19 @@ const PaintEngine = (() => {
     }
     prevStampX = cx; prevStampY = cy;
 
-    // Apply brush rotation (manual angle + follow direction)
+    // Apply brush rotation (manual angle + follow direction + tilt + twist)
     let effectiveAngle = brushAngle;
     if (followDirection && (Math.abs(strokeDirX) > 0.01 || Math.abs(strokeDirY) > 0.01)) {
       effectiveAngle += Math.atan2(strokeDirY, strokeDirX) * 180 / Math.PI;
+    }
+    // Tilt direction: which way the pen is leaning → rake the brush that way
+    if (tiltEnabled && pressureActive && (currentTiltX !== 0 || currentTiltY !== 0)) {
+      const tiltDir = Math.atan2(currentTiltY, currentTiltX) * 180 / Math.PI;
+      effectiveAngle += tiltDir * tiltAngleInfluence;
+    }
+    // Barrel twist: pen rotation about its own axis → rotates the brush
+    if (twistEnabled && pressureActive && currentTwist !== 0) {
+      effectiveAngle += currentTwist * twistInfluence;
     }
     const savedMask = activeMask;
     if (Math.abs(effectiveAngle % 360) > 0.5) {
@@ -643,8 +970,8 @@ const PaintEngine = (() => {
 
     strokeStampCount++;
     const taperMul = getTaperMultiplier();
-    const str = strength / 100;
-    const opa = (opacity / 100) * (taperOpacity ? taperMul : 1);
+    const str = (strength / 100) * strengthMul;
+    const opa = (opacity / 100) * (taperOpacity ? taperMul : 1) * opaMul;
 
     switch (tool) {
       case 'smudge':  stampSmudge(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
@@ -659,11 +986,17 @@ const PaintEngine = (() => {
 
     ctx.putImageData(dstData, rx0, ry0);
     activeMask = savedMask;
+    // Restore pre-pressure mask (outer layer)
+    activeMask = _savedPreMask;
+    activeMaskSize = _savedPreMaskSize;
 
     // Live wet-layer: mark the just-stamped footprint as wet, then evolve
     // the entire wet region (so previously-painted pixels keep changing —
     // dripping, bleeding, smearing — as the stroke continues).
     if (wetEnabled()) {
+      // Track stroke-current center for kaleidoscope / vortex effects so
+      // their symmetry origin follows the brush.
+      wetStrokeCx = cx; wetStrokeCy = cy;
       ensureWetMap();
       markWet(cx, cy, ms);
       stepWetLayer();
@@ -860,9 +1193,33 @@ const PaintEngine = (() => {
     }
   }
 
-  // ── Tool: Blend ──
+  // ── Tool: Blend (CRISP — kernel pixel pick, no averaging) ──
+  // Replaces the old neighborhood averaging (which produced blurry
+  // intermediate colors and destroyed the dither pattern) with a CRISP
+  // kernel-pick: the output pixel is REPLACED with one specific pixel
+  // from the kernel chosen by the active blend mode. All output values
+  // come from the source palette so dither stays sharp.
+  //
+  // Modes (set via setBlendMode):
+  //   median   — kernel pixel with median luminance (natural-feeling)
+  //   mode     — most-frequent color in kernel (true crisp posterize)
+  //   dilate   — brightest pixel (highlights expand into mids)
+  //   erode    — darkest pixel (shadows expand)
+  //   sort     — kernel sorted by luminance, picked by mask value (banding)
+  //   closest  — kernel pixel closest in color to current (sharpens edges)
+  //   farthest — kernel pixel farthest in color (extreme contrast pump)
+  //   random   — random kernel pixel (crisp scatter / shuffle)
   function stampBlend(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
-    const kr = blendKernel;
+    const kr = blendKernel | 0;
+    const mode = blendMode || 'median';
+    const stampSeed = (strokeStampCount * 2654435761) | 0;
+    const rnd = (a, b) => {
+      let h2 = (a * 374761393 + b * 668265263 + stampSeed) | 0;
+      h2 = (h2 ^ (h2 >>> 13)) * 1274126177 | 0;
+      h2 = h2 ^ (h2 >>> 16);
+      return ((h2 >>> 0) / 4294967295);
+    };
+
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
         const m0 = activeMask[my * ms + mx];
@@ -870,26 +1227,93 @@ const PaintEngine = (() => {
         const a = shapedMask(m0) * alpha;
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
+        const idx = (py * w + px) * 4;
 
-        // Average neighborhood
-        let sr = 0, sg = 0, sb = 0, cnt = 0;
-        for (let ky = -kr; ky <= kr; ky++) {
-          for (let kx = -kr; kx <= kr; kx++) {
-            const sx = px + kx, sy = py + ky;
-            if (sx >= 0 && sx < w && sy >= 0 && sy < h) {
+        // Probabilistic gating — keeps low-mask regions of the brush
+        // crisp / unmodified rather than uniformly applying the effect.
+        if (rnd(mx, my) > a) continue;
+
+        let pickIdx = -1;
+
+        if (mode === 'median' || mode === 'sort') {
+          const lums = [];
+          const idxs = [];
+          for (let ky = -kr; ky <= kr; ky++) {
+            for (let kx = -kr; kx <= kr; kx++) {
+              const sx = px + kx, sy = py + ky;
+              if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
               const si = (sy * w + sx) * 4;
-              sr += src[si]; sg += src[si + 1]; sb += src[si + 2];
-              cnt++;
+              lums.push(src[si] * 0.299 + src[si+1] * 0.587 + src[si+2] * 0.114);
+              idxs.push(si);
             }
           }
+          if (lums.length === 0) continue;
+          const order = idxs.map((_, i) => i).sort((A, B) => lums[A] - lums[B]);
+          let pick;
+          if (mode === 'median') {
+            pick = order[order.length >> 1];
+          } else { // sort
+            const t = m0 < 0 ? 0 : m0 > 0.999 ? 0.999 : m0;
+            pick = order[(t * order.length) | 0];
+          }
+          pickIdx = idxs[pick];
+        } else if (mode === 'mode') {
+          const counts = new Map();
+          let bestCnt = 0, bestI = -1;
+          for (let ky = -kr; ky <= kr; ky++) {
+            for (let kx = -kr; kx <= kr; kx++) {
+              const sx = px + kx, sy = py + ky;
+              if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+              const si = (sy * w + sx) * 4;
+              const key = (src[si] << 16) | (src[si+1] << 8) | src[si+2];
+              const c = (counts.get(key) || 0) + 1;
+              counts.set(key, c);
+              if (c > bestCnt) { bestCnt = c; bestI = si; }
+            }
+          }
+          pickIdx = bestI;
+        } else if (mode === 'dilate' || mode === 'erode') {
+          let bestL = mode === 'dilate' ? -1 : 99999;
+          for (let ky = -kr; ky <= kr; ky++) {
+            for (let kx = -kr; kx <= kr; kx++) {
+              const sx = px + kx, sy = py + ky;
+              if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+              const si = (sy * w + sx) * 4;
+              const l = src[si] * 0.299 + src[si+1] * 0.587 + src[si+2] * 0.114;
+              if (mode === 'dilate' ? (l > bestL) : (l < bestL)) {
+                bestL = l; pickIdx = si;
+              }
+            }
+          }
+        } else if (mode === 'closest' || mode === 'farthest') {
+          const cR = src[idx], cG = src[idx+1], cB = src[idx+2];
+          let bestD = mode === 'closest' ? 99999 : -1;
+          for (let ky = -kr; ky <= kr; ky++) {
+            for (let kx = -kr; kx <= kr; kx++) {
+              const sx = px + kx, sy = py + ky;
+              if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+              if (kx === 0 && ky === 0) continue;
+              const si = (sy * w + sx) * 4;
+              const dr = src[si] - cR, dg = src[si+1] - cG, db = src[si+2] - cB;
+              const d = dr*dr + dg*dg + db*db;
+              if (mode === 'closest' ? (d < bestD) : (d > bestD)) {
+                bestD = d; pickIdx = si;
+              }
+            }
+          }
+        } else { // 'random'
+          const xR = (px + ((rnd(mx + 5, my + 7) - 0.5) * (kr * 2 + 1))) | 0;
+          const yR = (py + ((rnd(mx + 13, my + 17) - 0.5) * (kr * 2 + 1))) | 0;
+          const sx = xR < 0 ? 0 : xR >= w ? w - 1 : xR;
+          const sy = yR < 0 ? 0 : yR >= h ? h - 1 : yR;
+          pickIdx = (sy * w + sx) * 4;
         }
-        if (cnt === 0) continue;
-        sr /= cnt; sg /= cnt; sb /= cnt;
 
-        const idx = (py * w + px) * 4;
-        dst[idx]     = Math.round(src[idx]     + (sr - src[idx])     * a);
-        dst[idx + 1] = Math.round(src[idx + 1] + (sg - src[idx + 1]) * a);
-        dst[idx + 2] = Math.round(src[idx + 2] + (sb - src[idx + 2]) * a);
+        if (pickIdx < 0) continue;
+        // Crisp replacement — exact source pixel value, no blending
+        dst[idx]     = src[pickIdx];
+        dst[idx + 1] = src[pickIdx + 1];
+        dst[idx + 2] = src[pickIdx + 2];
       }
     }
   }
@@ -1198,7 +1622,7 @@ const PaintEngine = (() => {
     return Math.max(0.05, taper);
   }
 
-  function beginStroke(x, y) {
+  function beginStroke(x, y, pressure, isPen, opts) {
     if (!canvas) return;
     pushPaintUndo();
     painting = true;
@@ -1209,6 +1633,25 @@ const PaintEngine = (() => {
     strokeTotalDist = 0;
     strokeStampCount = 0;
     pickupStrokeDist = 0;
+    wetStrokeCx = x; wetStrokeCy = y;
+    // Pen state for this stroke
+    pressureActive = !!isPen;
+    currentPressure = (pressure == null) ? 1 : Math.max(0, Math.min(1, pressure));
+    const o = opts || {};
+    currentTiltX = o.tiltX || 0;
+    currentTiltY = o.tiltY || 0;
+    currentTwist = o.twist || 0;
+    currentVelocity = 0;
+    _lastMoveTime = (o.time != null) ? o.time : (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    _lastMoveX = x; _lastMoveY = y;
+    _pressureMaskCache = { size: -1, mask: null, brush: selectedBrush };
+    // Snapshot pre-stroke canvas for ECHO effect (only when needed)
+    if (wetEcho > 0) {
+      try { wetEchoSnap = ctx.getImageData(0, 0, canvas.width, canvas.height); }
+      catch (e) { wetEchoSnap = null; }
+    } else {
+      wetEchoSnap = null;
+    }
     updateActiveMask();
 
     // Reset pickup RNG each stroke for varied but reproducible results
@@ -1226,27 +1669,60 @@ const PaintEngine = (() => {
     applyStamp(x, y);
   }
 
-  function continueStroke(x, y) {
+  function continueStroke(x, y, pressure, opts) {
     if (!painting || !canvas) return;
     const dx = x - lastX, dy = y - lastY;
     const dist = Math.sqrt(dx * dx + dy * dy);
 
-    // Pickup uses ultra-tight spacing for a true continuous-ribbon feel.
-    // Other tools use the user-defined spacing.
+    // Update velocity from time delta (used by velocity-aware mappings)
+    const o = opts || {};
+    const now = (o.time != null) ? o.time : (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const dt = Math.max(1, now - _lastMoveTime);
+    const movedDist = Math.sqrt((x - _lastMoveX) * (x - _lastMoveX) + (y - _lastMoveY) * (y - _lastMoveY));
+    // Low-pass filter the velocity so single slow samples don't flicker size
+    currentVelocity = currentVelocity * 0.6 + (movedDist / dt) * 0.4;
+    _lastMoveTime = now; _lastMoveX = x; _lastMoveY = y;
+
+    // Pressure-modulated spacing: higher pressure → tighter spacing (denser paint)
     const isPickup = tool === 'pickup';
     const spacingPct = isPickup ? Math.min(spacing, 8) : spacing;
-    const spacingPx = Math.max(1, activeMaskSize * spacingPct / 100);
+    let spacingFactor = 1;
+    if (pressureSpacingEnabled && pressureActive) {
+      const pN = Math.pow(currentPressure, pressureCurve);
+      // at full pressure, spacing drops to 50% of set value
+      spacingFactor = 1 - 0.5 * pN;
+    }
+    const spacingPx = Math.max(1, activeMaskSize * spacingPct / 100 * spacingFactor);
 
     if (dist < spacingPx * 0.5) return;
     strokeTotalDist += dist;
+
+    // Interpolate pressure + tilt + twist linearly across sub-stamps
+    const prevPressure = currentPressure;
+    const newPressure = (pressure == null) ? currentPressure : Math.max(0, Math.min(1, pressure));
+    const prevTiltX = currentTiltX, prevTiltY = currentTiltY, prevTwist = currentTwist;
+    const newTiltX = (o.tiltX != null) ? o.tiltX : currentTiltX;
+    const newTiltY = (o.tiltY != null) ? o.tiltY : currentTiltY;
+    const newTwist = (o.twist != null) ? o.twist : currentTwist;
 
     const steps = Math.max(1, Math.ceil(dist / spacingPx));
     for (let i = 1; i <= steps; i++) {
       const t = i / steps;
       const sx = lastX + dx * t;
       const sy = lastY + dy * t;
+      currentPressure = prevPressure + (newPressure - prevPressure) * t;
+      currentTiltX = prevTiltX + (newTiltX - prevTiltX) * t;
+      currentTiltY = prevTiltY + (newTiltY - prevTiltY) * t;
+      // Twist wraps at 360 — shortest-path interp
+      let dT = newTwist - prevTwist;
+      if (dT > 180) dT -= 360; else if (dT < -180) dT += 360;
+      currentTwist = (prevTwist + dT * t + 360) % 360;
       applyStamp(sx, sy);
     }
+    currentPressure = newPressure;
+    currentTiltX = newTiltX;
+    currentTiltY = newTiltY;
+    currentTwist = newTwist;
     lastX = x; lastY = y;
   }
 
@@ -1482,6 +1958,26 @@ const PaintEngine = (() => {
   function setTaperSize(v) { taperSize = !!v; }
   function setTaperOpacity(v) { taperOpacity = !!v; }
 
+  // Pen pressure setters
+  function setPressureSize(v)       { pressureSizeEnabled = !!v; }
+  function setPressureOpacity(v)    { pressureOpacityEnabled = !!v; }
+  function setPressureSizeMin(v)    { pressureSizeMin = Math.max(0, Math.min(1, v)); }
+  function setPressureOpacityMin(v) { pressureOpacityMin = Math.max(0, Math.min(1, v)); }
+  function setPressureStrength(v)      { pressureStrengthEnabled = !!v; }
+  function setPressureStrengthMin(v)   { pressureStrengthMin = Math.max(0, Math.min(1, v)); }
+  function setPressureSpacing(v)       { pressureSpacingEnabled = !!v; }
+  function setPressureCurve(v)         { pressureCurve = Math.max(0.1, Math.min(5, v)); }
+  // Tilt
+  function setTiltEnabled(v)           { tiltEnabled = !!v; }
+  function setTiltAngleInfluence(v)    { tiltAngleInfluence = Math.max(0, Math.min(1, v)); }
+  function setTiltSizeInfluence(v)     { tiltSizeInfluence  = Math.max(0, Math.min(1, v)); }
+  // Twist
+  function setTwistEnabled(v)          { twistEnabled = !!v; }
+  function setTwistInfluence(v)        { twistInfluence = Math.max(0, Math.min(1, v)); }
+  // Velocity
+  function setVelocityEnabled(v)       { velocityEnabled = !!v; }
+  function setVelocitySizeInfluence(v) { velocitySizeInfluence = Math.max(0, Math.min(1, v)); }
+
   // Wet layer setters
   function setWetDrip(v)      { wetDrip      = Math.max(0, Math.min(100, v)); }
   function setWetBleed(v)     { wetBleed     = Math.max(0, Math.min(100, v)); }
@@ -1494,7 +1990,13 @@ const PaintEngine = (() => {
   function setShapeInfluence(v) { shapeInfluence = Math.max(0, Math.min(300, v)); }
 
   function getSettings() {
-    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection, pickupJitter, pickupScatter, pickupCoherence, pickupFiberDensity, pickupFiberLength, pickupFiberFlow, pickupFiberWander, pickupColorVariety, pickupFiberTaper, taperIn, taperOut, taperSize, taperOpacity, wetDrip, wetBleed, wetSmear, wetSeparate, wetLifetime, wetEvolveRate, shapeInfluence };
+    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection, pickupJitter, pickupScatter, pickupCoherence, pickupFiberDensity, pickupFiberLength, pickupFiberFlow, pickupFiberWander, pickupColorVariety, pickupFiberTaper, taperIn, taperOut, taperSize, taperOpacity, wetDrip, wetBleed, wetSmear, wetSeparate, wetLifetime, wetEvolveRate, shapeInfluence,
+      pressureSizeEnabled, pressureOpacityEnabled, pressureSizeMin, pressureOpacityMin,
+      pressureStrengthEnabled, pressureStrengthMin, pressureSpacingEnabled, pressureCurve,
+      tiltEnabled, tiltAngleInfluence, tiltSizeInfluence,
+      twistEnabled, twistInfluence,
+      velocityEnabled, velocitySizeInfluence
+    };
   }
 
   // ── Brush Thumbnails ──
@@ -1560,6 +2062,11 @@ const PaintEngine = (() => {
     setPickupFiberDensity, setPickupFiberLength, setPickupFiberFlow,
     setPickupFiberWander, setPickupColorVariety, setPickupFiberTaper,
     setTaperIn, setTaperOut, setTaperSize, setTaperOpacity,
+    setPressureSize, setPressureOpacity, setPressureSizeMin, setPressureOpacityMin,
+    setPressureStrength, setPressureStrengthMin, setPressureSpacing, setPressureCurve,
+    setTiltEnabled, setTiltAngleInfluence, setTiltSizeInfluence,
+    setTwistEnabled, setTwistInfluence,
+    setVelocityEnabled, setVelocitySizeInfluence,
     setWetDrip, setWetBleed, setWetSmear, setWetSeparate,
     setWetLifetime, setWetEvolveRate, setShapeInfluence,
     selectBrush, getBrushes, getSelectedBrush, getBrushThumbnail,

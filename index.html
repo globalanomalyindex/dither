@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=21">
+  <link rel="stylesheet" href="style.css?v=25">
 </head>
 <body>
   <div id="app">
@@ -436,26 +436,89 @@
               </div>
             </div>
 
-            <!-- TAPER -->
+            <!-- PEN / STYLUS (replaces TAPER) -->
             <div class="sidebar-section">
-              <div class="section-header"><h2>Taper</h2></div>
+              <div class="section-header"><h2>Pen / Stylus</h2></div>
+              <label class="param-check">
+                <input type="checkbox" id="paint-pressure-size" checked> Pressure → size
+              </label>
               <div class="param-group">
-                <span class="param-label">Taper In</span>
+                <span class="param-label">Min size</span>
                 <div class="slider-row">
-                  <input type="range" id="paint-taper-in" min="0" max="100" value="20" step="5">
-                  <span class="param-value" data-for="paint-taper-in">20</span>
-                </div>
-              </div>
-              <div class="param-group">
-                <span class="param-label">Taper Out</span>
-                <div class="slider-row">
-                  <input type="range" id="paint-taper-out" min="0" max="100" value="20" step="5">
-                  <span class="param-value" data-for="paint-taper-out">20</span>
+                  <input type="range" id="paint-pressure-size-min" min="0" max="100" value="15" step="1">
+                  <span class="param-value" data-for="paint-pressure-size-min">15</span>
                 </div>
               </div>
               <label class="param-check">
-                <input type="checkbox" id="paint-taper-opacity" checked> Taper opacity
+                <input type="checkbox" id="paint-pressure-opacity" checked> Pressure → opacity
               </label>
+              <div class="param-group">
+                <span class="param-label">Min opacity</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-pressure-opacity-min" min="0" max="100" value="0" step="1">
+                  <span class="param-value" data-for="paint-pressure-opacity-min">0</span>
+                </div>
+              </div>
+              <label class="param-check">
+                <input type="checkbox" id="paint-pressure-strength"> Pressure → strength
+              </label>
+              <div class="param-group">
+                <span class="param-label">Min strength</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-pressure-strength-min" min="0" max="100" value="30" step="1">
+                  <span class="param-value" data-for="paint-pressure-strength-min">30</span>
+                </div>
+              </div>
+              <label class="param-check">
+                <input type="checkbox" id="paint-pressure-spacing"> Pressure → spacing
+              </label>
+              <div class="param-group">
+                <span class="param-label">Response curve</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-pressure-curve" min="30" max="300" value="100" step="5">
+                  <span class="param-value" data-for="paint-pressure-curve">100</span>
+                </div>
+              </div>
+              <!-- Tilt -->
+              <label class="param-check">
+                <input type="checkbox" id="paint-tilt-enabled" checked> Tilt → brush rake
+              </label>
+              <div class="param-group">
+                <span class="param-label">Tilt → angle</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-tilt-angle" min="0" max="100" value="100" step="1">
+                  <span class="param-value" data-for="paint-tilt-angle">100</span>
+                </div>
+              </div>
+              <div class="param-group">
+                <span class="param-label">Tilt → size</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-tilt-size" min="0" max="100" value="40" step="1">
+                  <span class="param-value" data-for="paint-tilt-size">40</span>
+                </div>
+              </div>
+              <!-- Twist -->
+              <label class="param-check">
+                <input type="checkbox" id="paint-twist-enabled" checked> Twist → rotation
+              </label>
+              <div class="param-group">
+                <span class="param-label">Twist influence</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-twist-influence" min="0" max="100" value="100" step="1">
+                  <span class="param-value" data-for="paint-twist-influence">100</span>
+                </div>
+              </div>
+              <!-- Velocity -->
+              <label class="param-check">
+                <input type="checkbox" id="paint-velocity-enabled"> Velocity → thin
+              </label>
+              <div class="param-group">
+                <span class="param-label">Velocity → size</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-velocity-size" min="0" max="100" value="30" step="1">
+                  <span class="param-value" data-for="paint-velocity-size">30</span>
+                </div>
+              </div>
             </div>
 
             <!-- TOOL OPTIONS (dynamic per tool) -->
@@ -641,10 +704,10 @@
     </div>
   </div>
 
-  <script src="dither.js?v=21"></script>
-  <script src="engine.js?v=21"></script>
-  <script src="grain.js?v=21"></script>
-  <script src="paintstroke.js?v=21"></script>
-  <script src="app.js?v=21"></script>
+  <script src="dither.js?v=25"></script>
+  <script src="engine.js?v=25"></script>
+  <script src="grain.js?v=25"></script>
+  <script src="paintstroke.js?v=25"></script>
+  <script src="app.js?v=25"></script>
 </body>
 </html>
