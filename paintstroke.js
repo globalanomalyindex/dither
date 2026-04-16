@@ -391,10 +391,15 @@ const PaintEngine = (() => {
     }
   }
 
-  // Run one physical-paint evolution pass over the wet bounds. Reads the
-  // current canvas region, computes drip / bleed / smear / separate
-  // displacements weighted by per-pixel wetness, writes back, then decays
-  // wetness and shrinks the dirty rect.
+  // Run one physical-paint evolution pass over the wet bounds.
+  //
+  // CRISP/DISPLACEMENT-ONLY MODEL:
+  //   Every wet pixel either keeps its current color or COPIES the exact
+  //   color of a nearby pixel — no blending, no averaging, no interpolation.
+  //   This guarantees the dithered palette is preserved: only existing pixel
+  //   values appear in the output, never new colors. Drip/bleed/smear/separate
+  //   are implemented as probabilistic *swaps* whose probability scales with
+  //   wetness × parameter strength.
   function evolveWetLayer() {
     if (!wetMap || !wetBounds || !wetEnabled() || !ctx) return;
     const cw = wetCanvasW, ch = wetCanvasH;
@@ -408,7 +413,8 @@ const PaintEngine = (() => {
 
     const reg = ctx.getImageData(x0, y0, w, h);
     const sd = reg.data;
-    // Working copy for read-source while we write back
+    // Working copy: write into `out`, read from `sd`, so a single pass acts
+    // simultaneously across the region (avoids cascade artifacts).
     const out = new Uint8ClampedArray(sd);
 
     const drip      = wetDrip / 100;
@@ -417,11 +423,30 @@ const PaintEngine = (() => {
     const separate  = wetSeparate / 100;
     const dirX = smoothDirX, dirY = smoothDirY;
     const hasDir = (dirX * dirX + dirY * dirY) > 0.001;
-    // Lifetime → decay. lifetime=100 → very slow decay (paint stays wet),
-    // lifetime=0 → fast dry (one frame).
     const lifeN = wetLifetime / 100;
     const decay = Math.pow(0.45 + lifeN * 0.5, 1 / Math.max(1, wetEvolveRate));
     const drySub = (1 - lifeN) * 0.012 + 0.003;
+
+    // Per-frame seed so consecutive passes get fresh randomness but identical
+    // pixels in the same pass make consistent decisions
+    const frameSeed = (Date.now() & 0xffff) ^ ((wetBounds.x0 << 5) | wetBounds.y0);
+    // Cheap deterministic hash → [0,1)
+    const rnd = (a, b, c) => {
+      let h = (a * 73856093) ^ (b * 19349663) ^ (c * 83492791);
+      h = (h ^ (h >>> 13)) * 1274126177 | 0;
+      h = h ^ (h >>> 16);
+      return ((h >>> 0) / 4294967295);
+    };
+
+    // Helper: copy pixel from (sx,sy) → out[di] with bounds clamp
+    const copyPixel = (di, sx, sy) => {
+      if (sx < 0) sx = 0; else if (sx > w - 1) sx = w - 1;
+      if (sy < 0) sy = 0; else if (sy > h - 1) sy = h - 1;
+      const si = (sy * w + sx) * 4;
+      out[di]     = sd[si];
+      out[di + 1] = sd[si + 1];
+      out[di + 2] = sd[si + 2];
+    };
 
     let nx0 = cw, ny0 = ch, nx1 = 0, ny1 = 0;
     let anyAlive = false;
@@ -434,76 +459,90 @@ const PaintEngine = (() => {
         const wet = wetMap[wi];
         if (wet < 0.015) continue;
         const di = (y * w + x) * 4;
-        let r = sd[di], g = sd[di+1], b = sd[di+2];
 
-        // DRIP — pull from the pixel above (paint sags downward)
+        // Source position starts at self — only changes via swaps below.
+        // Each operation rolls its own dice so multiple effects can compose
+        // (drip + smear can cooperate to drag pixels diagonally, etc.).
+        let sx = x, sy = y;
+        let swapped = false;
+
+        // DRIP — gravity. Probability scales with drip × wet. When fired,
+        // copy color from the pixel directly above. Distance grows with
+        // strength (1..2 pixels) so heavy drip falls faster.
         if (drip > 0) {
-          const ay = y - 1;
-          if (ay >= 0) {
-            const ai = (ay * w + x) * 4;
-            const m = drip * wet * 0.55;
-            r = r + (sd[ai]   - r) * m;
-            g = g + (sd[ai+1] - g) * m;
-            b = b + (sd[ai+2] - b) * m;
+          const p = drip * wet * 0.85;
+          if (rnd(gx, gy, frameSeed) < p) {
+            const dStep = drip > 0.6 ? 2 : 1;
+            sy -= dStep;
+            swapped = true;
           }
         }
 
-        // BLEED — capillary: average with 4-neighbors weighted by wetness
+        // BLEED — capillary. Pick ONE of the 4 neighbors at random
+        // (probability scales with bleed × wet) and swap into it. Because
+        // we copy a neighbor's exact color the dither pattern stays crisp
+        // — bleed creates "spreading patches" of existing pixel values
+        // rather than a soft gradient.
         if (bleed > 0) {
-          let sr = 0, sg = 0, sb = 0, c = 0;
-          if (x > 0)     { const i = (y*w + x-1)*4;   sr += sd[i]; sg += sd[i+1]; sb += sd[i+2]; c++; }
-          if (x < w - 1) { const i = (y*w + x+1)*4;   sr += sd[i]; sg += sd[i+1]; sb += sd[i+2]; c++; }
-          if (y > 0)     { const i = ((y-1)*w + x)*4; sr += sd[i]; sg += sd[i+1]; sb += sd[i+2]; c++; }
-          if (y < h - 1) { const i = ((y+1)*w + x)*4; sr += sd[i]; sg += sd[i+1]; sb += sd[i+2]; c++; }
-          if (c > 0) {
-            sr /= c; sg /= c; sb /= c;
-            const m = bleed * wet * 0.45;
-            r = r + (sr - r) * m;
-            g = g + (sg - g) * m;
-            b = b + (sb - b) * m;
+          const p = bleed * wet * 0.7;
+          if (rnd(gx + 1, gy, frameSeed) < p) {
+            const r4 = (rnd(gx, gy + 1, frameSeed) * 4) | 0;
+            const ddx = r4 === 0 ? 1 : r4 === 1 ? -1 : 0;
+            const ddy = r4 === 2 ? 1 : r4 === 3 ? -1 : 0;
+            sx += ddx; sy += ddy;
+            swapped = true;
           }
         }
 
-        // SMEAR — continue dragging pixels along the stroke direction
+        // SMEAR — continued drag along stroke. Stronger probability and
+        // larger step than drip so smear feels deliberate.
         if (smear > 0 && hasDir) {
-          const sx = x - dirX * smear * 1.5;
-          const sy = y - dirY * smear * 1.5;
-          const ix = sx < 0 ? 0 : sx > w - 1 ? w - 1 : Math.round(sx);
-          const iy = sy < 0 ? 0 : sy > h - 1 ? h - 1 : Math.round(sy);
-          const si = (iy * w + ix) * 4;
-          const m = smear * wet * 0.5;
-          r = r + (sd[si]   - r) * m;
-          g = g + (sd[si+1] - g) * m;
-          b = b + (sd[si+2] - b) * m;
-        }
-
-        // SEPARATE — paint splitting: amplify local contrast (push toward
-        // brighter or darker neighbor depending on which is closer)
-        if (separate > 0) {
-          // Sample two opposite neighbors along stroke perpendicular
-          let pX, pY;
-          if (hasDir) { pX = -dirY; pY = dirX; }
-          else { pX = 1; pY = 0; }
-          const a1x = x + Math.round(pX * 1), a1y = y + Math.round(pY * 1);
-          const a2x = x - Math.round(pX * 1), a2y = y - Math.round(pY * 1);
-          if (a1x >= 0 && a1x < w && a1y >= 0 && a1y < h &&
-              a2x >= 0 && a2x < w && a2y >= 0 && a2y < h) {
-            const i1 = (a1y * w + a1x) * 4;
-            const i2 = (a2y * w + a2x) * 4;
-            // Push self away from the average toward the more extreme side
-            const avgR = (sd[i1]   + sd[i2])   * 0.5;
-            const avgG = (sd[i1+1] + sd[i2+1]) * 0.5;
-            const avgB = (sd[i1+2] + sd[i2+2]) * 0.5;
-            const m = separate * wet * 0.35;
-            r = r + (r - avgR) * m;
-            g = g + (g - avgG) * m;
-            b = b + (b - avgB) * m;
+          const p = smear * wet * 1.0;
+          if (rnd(gx, gy + 2, frameSeed) < p) {
+            const stepN = 1 + (smear * 2) | 0; // 1..3 px upstream
+            sx -= Math.round(dirX * stepN);
+            sy -= Math.round(dirY * stepN);
+            swapped = true;
           }
         }
 
-        out[di]     = r < 0 ? 0 : r > 255 ? 255 : r;
-        out[di + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
-        out[di + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+        // SEPARATE — paint splitting via crisp picking. Compare brightness
+        // of two opposite perpendicular neighbors; pick the one whose
+        // brightness is FURTHER from this pixel's brightness (amplifies
+        // contrast). No averaging — the chosen neighbor's exact color
+        // replaces this pixel.
+        if (separate > 0) {
+          const p = separate * wet * 0.65;
+          if (rnd(gx + 3, gy, frameSeed) < p) {
+            let pX, pY;
+            if (hasDir) { pX = -dirY; pY = dirX; }
+            else { pX = 1; pY = 0; }
+            const a1x = x + Math.round(pX), a1y = y + Math.round(pY);
+            const a2x = x - Math.round(pX), a2y = y - Math.round(pY);
+            const inB1 = a1x >= 0 && a1x < w && a1y >= 0 && a1y < h;
+            const inB2 = a2x >= 0 && a2x < w && a2y >= 0 && a2y < h;
+            if (inB1 || inB2) {
+              const sLum = sd[di] * 0.299 + sd[di+1] * 0.587 + sd[di+2] * 0.114;
+              let pickX = sx, pickY = sy, bestDelta = -1;
+              if (inB1) {
+                const i1 = (a1y * w + a1x) * 4;
+                const l1 = sd[i1] * 0.299 + sd[i1+1] * 0.587 + sd[i1+2] * 0.114;
+                const d1 = Math.abs(l1 - sLum);
+                if (d1 > bestDelta) { bestDelta = d1; pickX = a1x; pickY = a1y; }
+              }
+              if (inB2) {
+                const i2 = (a2y * w + a2x) * 4;
+                const l2 = sd[i2] * 0.299 + sd[i2+1] * 0.587 + sd[i2+2] * 0.114;
+                const d2 = Math.abs(l2 - sLum);
+                if (d2 > bestDelta) { bestDelta = d2; pickX = a2x; pickY = a2y; }
+              }
+              sx = pickX; sy = pickY;
+              swapped = true;
+            }
+          }
+        }
+
+        if (swapped) copyPixel(di, sx, sy);
 
         const newWet = wet * decay - drySub;
         if (newWet > 0.015) {
@@ -632,30 +671,52 @@ const PaintEngine = (() => {
   }
 
   // ── Tool: Smudge ──
+  // CRISP smudge: instead of color-averaging the pickup buffer with the
+  // canvas (which created blended intermediate colors and destroyed the
+  // dither pattern), the pickup buffer is now treated as a STORE OF
+  // DISCRETE PIXEL VALUES being carried by the brush.
+  //
+  // At each stamp:
+  //   1. With probability ~ shapedMask, the output pixel is REPLACED by
+  //      the pickup-buffer pixel (no blending).
+  //   2. With probability ~ (1 - decay), the pickup buffer at this slot
+  //      is REPLACED by the current canvas pixel (no averaging).
+  //
+  // Decay = 1 → buffer never refreshes → pure long smear of original
+  // sampled pixels. Decay = 0 → buffer refreshes every stamp → very short
+  // smear. All values stay crisp source-palette colors.
   function stampSmudge(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
+    if (!hasPickup) return;
     const decay = smudgeDecay / 100;
+    const stampSeed = (strokeStampCount * 2654435761) | 0;
+    const rnd = (a, b) => {
+      let h2 = (a * 374761393 + b * 668265263 + stampSeed) | 0;
+      h2 = (h2 ^ (h2 >>> 13)) * 1274126177 | 0;
+      h2 = h2 ^ (h2 >>> 16);
+      return ((h2 >>> 0) / 4294967295);
+    };
+
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
         const m0 = activeMask[my * ms + mx];
         if (m0 < 0.01) continue;
-        // Brush-shape influence: shape per-pixel transfer with the mask
-        // contrast so the brush's actual texture (bristles, stipple, holes)
-        // shows up clearly in the smear.
         const a = shapedMask(m0) * alpha;
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
         const idx = (py * w + px) * 4;
         const mi = my * ms + mx;
 
-        if (hasPickup) {
-          // Blend pickup with canvas
-          dst[idx]     = Math.round(src[idx]     + (pickupR[mi] - src[idx])     * a);
-          dst[idx + 1] = Math.round(src[idx + 1] + (pickupG[mi] - src[idx + 1]) * a);
-          dst[idx + 2] = Math.round(src[idx + 2] + (pickupB[mi] - src[idx + 2]) * a);
-          // Update pickup with decay
-          pickupR[mi] = pickupR[mi] * decay + src[idx]     * (1 - decay);
-          pickupG[mi] = pickupG[mi] * decay + src[idx + 1] * (1 - decay);
-          pickupB[mi] = pickupB[mi] * decay + src[idx + 2] * (1 - decay);
+        // 1. Probabilistic placement of carried pixel onto canvas (crisp)
+        if (rnd(mx, my) < a) {
+          dst[idx]     = pickupR[mi] | 0;
+          dst[idx + 1] = pickupG[mi] | 0;
+          dst[idx + 2] = pickupB[mi] | 0;
+        }
+        // 2. Probabilistic refresh of pickup buffer with canvas pixel
+        if (rnd(mx + 991, my + 743) > decay) {
+          pickupR[mi] = src[idx];
+          pickupG[mi] = src[idx + 1];
+          pickupB[mi] = src[idx + 2];
         }
       }
     }
@@ -885,27 +946,17 @@ const PaintEngine = (() => {
   function hasStamp() { return hasPickupStamp; }
   function getStampSize() { return pickupStamp ? { w: pickupStamp.w, h: pickupStamp.h } : null; }
 
-  // Bilinear texture sample with wrapping (smoother than nearest)
-  function sampleStampBilinear(sd, sw, sh, fx, fy) {
-    const x = ((fx % sw) + sw) % sw;
-    const y = ((fy % sh) + sh) % sh;
-    const x0 = Math.floor(x), y0 = Math.floor(y);
-    const x1 = (x0 + 1) % sw, y1 = (y0 + 1) % sh;
-    const tx = x - x0, ty = y - y0;
-    const i00 = (y0 * sw + x0) * 4;
-    const i10 = (y0 * sw + x1) * 4;
-    const i01 = (y1 * sw + x0) * 4;
-    const i11 = (y1 * sw + x1) * 4;
-    const w00 = (1 - tx) * (1 - ty);
-    const w10 = tx * (1 - ty);
-    const w01 = (1 - tx) * ty;
-    const w11 = tx * ty;
-    return [
-      sd[i00]   * w00 + sd[i10]   * w10 + sd[i01]   * w01 + sd[i11]   * w11,
-      sd[i00+1] * w00 + sd[i10+1] * w10 + sd[i01+1] * w01 + sd[i11+1] * w11,
-      sd[i00+2] * w00 + sd[i10+2] * w10 + sd[i01+2] * w01 + sd[i11+2] * w11
-    ];
+  // Nearest-neighbor texture sample with wrapping. Crisp — preserves
+  // every dithered pixel from the source stamp exactly. No interpolation,
+  // so the painted output is always one of the source palette values.
+  function sampleStampNearest(sd, sw, sh, fx, fy) {
+    const x = (((Math.floor(fx) % sw) + sw) % sw);
+    const y = (((Math.floor(fy) % sh) + sh) % sh);
+    const i = (y * sw + x) * 4;
+    return [sd[i], sd[i + 1], sd[i + 2]];
   }
+  // Back-compat alias (older code paths)
+  const sampleStampBilinear = sampleStampNearest;
 
   // Build the fiber set for a stroke. Each fiber is an independent painterly
   // streak that runs along the stroke direction. The set is fixed for the
@@ -1050,87 +1101,81 @@ const PaintEngine = (() => {
         const vRaw = relX * perpX + relY * perpY; // perpendicular (px)
         const vNorm = vRaw / radius;             // -1 .. 1
 
-        // Find the dominant fibers near this perpendicular position and
-        // accumulate their contributions. This produces visible distinct
-        // painterly streaks within the brush, each elongated along the
-        // stroke and carrying its own texture sample.
-        let accR = 0, accG = 0, accB = 0, accW = 0;
+        // CRISP / WINNER-TAKES-ALL fiber selection.
+        // Instead of averaging multiple fiber samples (which produces
+        // synthetic blended colors that ruin the dither), we find the
+        // single fiber with the highest weight at this pixel and use ITS
+        // exact sampled texel. The output is always one of the source
+        // dither palette values — pixel-perfect crisp.
+        let bestW = -1, bestR = 0, bestG = 0, bestB = 0;
 
-        // Only consider fibers whose envelope overlaps this pixel —
-        // avoids iterating all fibers per pixel.
         for (let f = 0; f < fcount; f++) {
           const fib = fibers[f];
-          // Wandering perpendicular center as the stroke advances
           const wander = Math.sin((pickupStrokeDist + u) * fib.wanderFreq) * fib.wanderAmp;
           const dperp = vNorm - (fib.perp + wander);
           const ad = Math.abs(dperp);
           if (ad > fib.halfWidth * 1.6) continue;
-          // Smooth perpendicular falloff (fiber thickness profile)
           const tp = Math.max(0, 1 - ad / (fib.halfWidth * 1.6));
-          const fiberPerpW = tp * tp * (3 - 2 * tp); // smoothstep
+          const fiberPerpW = tp * tp * (3 - 2 * tp);
 
-          // Longitudinal envelope — broken / wispy along length so streaks
-          // don't all extend uniformly. Combination of low-freq sine
-          // envelope and per-fiber load.
           const lenT = (pickupStrokeDist + u) * fib.envFreq + fib.envPhase;
           const env = 1 - fib.envAmp + Math.sin(lenT) * fib.envAmp;
           const fiberLongW = Math.max(0, env);
 
-          // Sample texture. The fiber's u flows continuously with stroke
-          // distance, creating an elongated streak. Each fiber samples
-          // its own row of the texture (texV) so different fibers carry
-          // different colors.
+          const wF = fiberPerpW * fiberLongW * fib.load;
+          if (wF <= bestW) continue;
+
+          // Nearest-neighbor sample of the source dither texture
           const sU = fib.texU + (pickupStrokeDist + u) * texPerPixelU * fib.lenStretch;
           const sV = fib.texV + dperp * radius * texPerPixelV * 0.4 +
                      (pickupStrokeDist + u) * fib.driftV;
-          const [sr, sg, sb] = sampleStampBilinear(sd, sw, sh, sU, sV);
-
-          const wF = fiberPerpW * fiberLongW * fib.load;
-          accR += sr * wF;
-          accG += sg * wF;
-          accB += sb * wF;
-          accW += wF;
+          const [sr, sg, sb] = sampleStampNearest(sd, sw, sh, sU, sV);
+          bestW = wF;
+          bestR = sr; bestG = sg; bestB = sb;
         }
 
-        if (accW < 0.001) continue;
+        if (bestW < 0) continue;
 
-        let r = accR / accW;
-        let g = accG / accW;
-        let b = accB / accW;
+        let r = bestR, g = bestG, b = bestB;
 
-        // Optional per-pixel scatter mixes neighboring fiber samples slightly
+        // Optional per-pixel scatter — replace (not blend) with a scattered
+        // sample so the output remains a crisp source pixel.
         if (scat > 0) {
           const n = noise(mx + (pickupStrokeDist | 0), my);
-          const sx = (n - 0.5) * scat;
-          const sy = (noise(my, mx + (pickupStrokeDist | 0)) - 0.5) * scat;
-          const [sr2, sg2, sb2] = sampleStampBilinear(sd, sw, sh,
-            r * 0 + (pickupStrokeSeedX + sx),
-            g * 0 + (pickupStrokeSeedY + sy));
-          // Blend a small amount of the scatter sample
-          const sm = Math.min(0.3, scat / 50);
-          r = r * (1 - sm) + sr2 * sm;
-          g = g * (1 - sm) + sg2 * sm;
-          b = b * (1 - sm) + sb2 * sm;
+          if (n < scat / 100) {
+            const sx = (noise(mx + 17, my + 31) - 0.5) * scat * 4;
+            const sy = (noise(my + 53, mx + 11) - 0.5) * scat * 4;
+            const [sr2, sg2, sb2] = sampleStampNearest(sd, sw, sh,
+              pickupStrokeSeedX + sx,
+              pickupStrokeSeedY + sy);
+            r = sr2; g = sg2; b = sb2;
+          }
         }
 
-        // Coherence boost: at high coherence, fiber accumulation stays
-        // streaky already; at low coherence, add a touch of per-pixel
-        // texture noise so streaks have grain.
+        // Coherence: at low coherence, occasionally swap a pixel for a
+        // randomly-sampled texel — keeps grain crisp instead of blurry.
         if (coh < 1) {
-          const grain = (noise(mx, my + ((pickupStrokeDist * 7) | 0)) - 0.5) * (1 - coh) * 30;
-          r += grain; g += grain; b += grain;
+          const swapP = (1 - coh) * 0.35;
+          if (noise(mx + 7, my + ((pickupStrokeDist * 7) | 0)) < swapP) {
+            const rsx = noise(mx, my + 41) * sw;
+            const rsy = noise(my, mx + 29) * sh;
+            const [sr3, sg3, sb3] = sampleStampNearest(sd, sw, sh, rsx, rsy);
+            r = sr3; g = sg3; b = sb3;
+          }
         }
 
         const di = (py * w + px) * 4;
-        // Strong placement at center, soft edge falloff
-        const wSolid = Math.pow(maskVal, 1.4) * opa * taperEnv;
-        const wBlend = maskVal * opa * taperEnv;
-        const tR = r * wSolid + src[di]     * (1 - wSolid);
-        const tG = g * wSolid + src[di + 1] * (1 - wSolid);
-        const tB = b * wSolid + src[di + 2] * (1 - wSolid);
-        dst[di]     = Math.max(0, Math.min(255, Math.round(src[di]     + (tR - src[di])     * wBlend)));
-        dst[di + 1] = Math.max(0, Math.min(255, Math.round(src[di + 1] + (tG - src[di + 1]) * wBlend)));
-        dst[di + 2] = Math.max(0, Math.min(255, Math.round(src[di + 2] + (tB - src[di + 2]) * wBlend)));
+        // CRISP placement: probabilistic replacement instead of alpha blending.
+        // The mask × opacity becomes a per-pixel probability that this output
+        // pixel is replaced by the (crisp source) value rather than averaged.
+        // No interpolation between source and target → dither pattern stays
+        // pixel-perfect.
+        const replaceP = Math.pow(maskVal, 1.2) * opa * taperEnv;
+        if (noise(mx + 101, my + 211 + ((pickupStrokeDist * 13) | 0)) < replaceP) {
+          dst[di]     = r < 0 ? 0 : r > 255 ? 255 : r;
+          dst[di + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
+          dst[di + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+        }
       }
     }
   }
