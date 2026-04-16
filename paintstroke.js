@@ -65,6 +65,11 @@ const PaintEngine = (() => {
   // Random per-stroke offset so consecutive strokes don't sample the same spot
   let pickupStrokeSeedX = 0, pickupStrokeSeedY = 0;
 
+  // Fiber model: array of independent painterly streaks rendered each stamp.
+  // Each fiber has its own texture sampling row, opacity envelope, drift,
+  // and length envelope. Rebuilt at the start of every stroke.
+  let pickupFibers = null;
+
   // Smudge pickup buffers
   let pickupR = null, pickupG = null, pickupB = null;
   let hasPickup = false;
@@ -652,56 +657,88 @@ const PaintEngine = (() => {
     ];
   }
 
-  // Continuous-ribbon pickup engine.
-  // The brush footprint samples the captured stamp in a stroke-aligned
-  // coordinate system: u = along stroke (continuously advancing with stroke
-  // distance, creating the illusion of a long paint mark being drawn out),
-  // v = perpendicular to stroke. Texture tiles seamlessly. Block-based
-  // jitter (coherence) controls noise vs. solid-streak character.
+  // Build the fiber set for a stroke. Each fiber is an independent painterly
+  // streak that runs along the stroke direction. The set is fixed for the
+  // duration of the stroke so streaks remain coherent as you drag, but
+  // randomized per stroke so each pass looks unique.
+  function buildPickupFibers(brushDiameter) {
+    if (!pickupStamp) return null;
+    const sw = pickupStamp.w, sh = pickupStamp.h;
+    // Density scales with brush size — bigger brush = more fibers.
+    // ~1 fiber per ~3 brush pixels gives nice visible streaks.
+    const count = Math.max(8, Math.min(96, Math.round(brushDiameter / 3)));
+    if (!_pickupRng) _pickupRng = { s: 42 };
+    const rng = () => { _pickupRng.s = (_pickupRng.s * 16807) % 2147483647; return _pickupRng.s / 2147483647; };
+    const fibers = new Array(count);
+    for (let i = 0; i < count; i++) {
+      // Place fibers across perpendicular axis [-1, 1] with a bit of jitter
+      // so they're not perfectly evenly spaced.
+      const slot = (i + 0.5) / count * 2 - 1;          // -1 .. 1
+      const wobble = (rng() - 0.5) * (1.6 / count);
+      fibers[i] = {
+        // Perpendicular position (in normalized brush radius units)
+        perp: slot + wobble,
+        // Half-width of this fiber's perpendicular envelope (some thicker, some thinner)
+        halfWidth: (1.0 / count) * (0.7 + rng() * 1.4),
+        // Independent texture sampling row & column offset
+        texU: rng() * sw,
+        texV: rng() * sh,
+        // Slow drift in texture-V along the fiber's length (subtle organic curve)
+        driftV: (rng() - 0.5) * 0.4,
+        // Per-fiber along-stroke length-stretch (some streaks elongate more)
+        lenStretch: 0.45 + rng() * 0.95,
+        // Opacity / load — natural variation in how much paint each "bristle" carries
+        load: 0.5 + rng() * 0.6,
+        // Phase offset for the longitudinal envelope (broken / wispy edges)
+        envPhase: rng() * Math.PI * 2,
+        envFreq: 0.04 + rng() * 0.08,
+        envAmp: 0.15 + rng() * 0.35,
+        // Slight perpendicular wander as the fiber travels
+        wanderAmp: (rng() - 0.5) * 0.08,
+        wanderFreq: 0.05 + rng() * 0.08
+      };
+    }
+    return fibers;
+  }
+
+  // Fiber-based pickup engine.
+  // Renders multiple distinct painterly streaks within the brush footprint,
+  // each elongated along the stroke direction, each pulling from a different
+  // part of the captured stamp. As you drag, the fibers carry texture along
+  // with them — feels like liquid paint pixels stretching, not stamps.
   function stampPickup(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
     if (!hasPickupStamp || !pickupStamp) return;
+    if (!pickupFibers) pickupFibers = buildPickupFibers(ms);
+    const fibers = pickupFibers;
+    const fcount = fibers.length;
     const sw = pickupStamp.w, sh = pickupStamp.h;
     const sd = pickupStamp.data.data;
     const half = ms / 2;
-    const jit = pickupJitter / 100;
-    const scat = pickupScatter;
+    const radius = Math.max(1, half);
     const coh = pickupCoherence / 100;
+    const scat = pickupScatter;
 
-    if (!_pickupRng) _pickupRng = { s: 42 };
-    const rng = () => { _pickupRng.s = (_pickupRng.s * 16807) % 2147483647; return _pickupRng.s / 2147483647; };
-
-    // Stroke axis (smoothed for stable ribbon orientation)
+    // Stroke axis (smoothed for stable orientation under wiggle)
     let nx = smoothDirX, ny = smoothDirY;
     const dirMag = Math.sqrt(nx * nx + ny * ny);
     const hasDir = dirMag > 0.01;
     if (hasDir) { nx /= dirMag; ny /= dirMag; }
     else { nx = 1; ny = 0; }
-
-    // Perpendicular axis (rotate 90° CCW)
     const perpX = -ny, perpY = nx;
 
-    // Texture scale: how stamp dimensions map to canvas pixels.
-    // Stamp is sized to sit comfortably within the brush — width fills
-    // brush diameter perpendicular to stroke, length stretches along stroke
-    // for a paint-ribbon feel.
-    const texScaleV = sh / Math.max(1, ms);          // perpendicular: fit brush
-    const texScaleU = sw / Math.max(1, ms) * 0.6;    // along stroke: stretched (longer feel)
+    // Texture mapping: how brush-pixel-distance maps to texture pixels.
+    // Larger ratio = sample wider area of texture per pixel = more variety.
+    const texPerPixelU = (sw / Math.max(1, ms)) * 0.5;
+    const texPerPixelV = (sh / Math.max(1, ms)) * 0.7;
 
-    // Block-coherent jitter: pixels in the same block share offsets.
-    // At coh=0, blockSize=1 → noise; at coh=1, blockSize=ms → solid.
-    const blockSize = Math.max(1, Math.round(1 + (ms - 1) * coh * coh));
-    const blocksX = Math.ceil(ms / blockSize);
-    const blocksY = Math.ceil(ms / blockSize);
-    const blockJU = new Float32Array(blocksX * blocksY);
-    const blockJV = new Float32Array(blocksX * blocksY);
-    for (let i = 0; i < blocksX * blocksY; i++) {
-      blockJU[i] = (rng() - 0.5) * sw * jit * (1 - coh * 0.7);  // suppress along-stroke jitter at high coh
-      blockJV[i] = (rng() - 0.5) * sh * jit;
-    }
+    // Helper: deterministic per-pixel hash for non-coherent jitter
+    const noise = (a, b) => {
+      let h = (a * 374761393 + b * 668265263) | 0;
+      h = (h ^ (h >>> 13)) * 1274126177 | 0;
+      h = h ^ (h >>> 16);
+      return ((h >>> 0) / 4294967295);
+    };
 
-    // Strength governs how forcefully the stamp overwrites canvas pixels.
-    // High alpha + center of brush ≈ direct placement (visible push of pixels);
-    // edges fall to soft blend.
     const opa = Math.max(0, Math.min(1, alpha));
 
     for (let my = 0; my < ms; my++) {
@@ -711,52 +748,93 @@ const PaintEngine = (() => {
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
-        // Brush-local coords centered at brush center
         const relX = mx - half, relY = my - half;
+        // Project to stroke coords
+        const u = relX * nx + relY * ny;       // along stroke (px)
+        const vRaw = relX * perpX + relY * perpY; // perpendicular (px)
+        const vNorm = vRaw / radius;             // -1 .. 1
 
-        // Project into stroke coordinate system
-        const u = relX * nx + relY * ny;       // along stroke
-        const v = relX * perpX + relY * perpY; // perpendicular
+        // Find the dominant fibers near this perpendicular position and
+        // accumulate their contributions. This produces visible distinct
+        // painterly streaks within the brush, each elongated along the
+        // stroke and carrying its own texture sample.
+        let accR = 0, accG = 0, accB = 0, accW = 0;
 
-        // Sample position in stamp space — u flows with stroke distance,
-        // creating a continuous paint ribbon rather than discrete stamps.
-        let sampleX = pickupStrokeSeedX + (pickupStrokeDist + u) * texScaleU;
-        let sampleY = pickupStrokeSeedY + sh / 2 + v * texScaleV;
+        // Only consider fibers whose envelope overlaps this pixel —
+        // avoids iterating all fibers per pixel.
+        for (let f = 0; f < fcount; f++) {
+          const fib = fibers[f];
+          // Wandering perpendicular center as the stroke advances
+          const wander = Math.sin((pickupStrokeDist + u) * fib.wanderFreq) * fib.wanderAmp;
+          const dperp = vNorm - (fib.perp + wander);
+          const ad = Math.abs(dperp);
+          if (ad > fib.halfWidth * 1.6) continue;
+          // Smooth perpendicular falloff (fiber thickness profile)
+          const tp = Math.max(0, 1 - ad / (fib.halfWidth * 1.6));
+          const fiberPerpW = tp * tp * (3 - 2 * tp); // smoothstep
 
-        // Block-coherent jitter
-        if (jit > 0) {
-          const bxi = Math.floor(mx / blockSize);
-          const byi = Math.floor(my / blockSize);
-          const bi = byi * blocksX + bxi;
-          // Project block jitter into stroke axes
-          sampleX += blockJU[bi];
-          sampleY += blockJV[bi];
+          // Longitudinal envelope — broken / wispy along length so streaks
+          // don't all extend uniformly. Combination of low-freq sine
+          // envelope and per-fiber load.
+          const lenT = (pickupStrokeDist + u) * fib.envFreq + fib.envPhase;
+          const env = 1 - fib.envAmp + Math.sin(lenT) * fib.envAmp;
+          const fiberLongW = Math.max(0, env);
+
+          // Sample texture. The fiber's u flows continuously with stroke
+          // distance, creating an elongated streak. Each fiber samples
+          // its own row of the texture (texV) so different fibers carry
+          // different colors.
+          const sU = fib.texU + (pickupStrokeDist + u) * texPerPixelU * fib.lenStretch;
+          const sV = fib.texV + dperp * radius * texPerPixelV * 0.4 +
+                     (pickupStrokeDist + u) * fib.driftV;
+          const [sr, sg, sb] = sampleStampBilinear(sd, sw, sh, sU, sV);
+
+          const wF = fiberPerpW * fiberLongW * fib.load;
+          accR += sr * wF;
+          accG += sg * wF;
+          accB += sb * wF;
+          accW += wF;
         }
 
-        // Per-pixel scatter (suppressed at high coherence)
+        if (accW < 0.001) continue;
+
+        let r = accR / accW;
+        let g = accG / accW;
+        let b = accB / accW;
+
+        // Optional per-pixel scatter mixes neighboring fiber samples slightly
         if (scat > 0) {
-          const scatScale = 1 - coh * 0.7;
-          sampleX += (rng() - 0.5) * scat * 2 * scatScale;
-          sampleY += (rng() - 0.5) * scat * 2 * scatScale;
+          const n = noise(mx + (pickupStrokeDist | 0), my);
+          const sx = (n - 0.5) * scat;
+          const sy = (noise(my, mx + (pickupStrokeDist | 0)) - 0.5) * scat;
+          const [sr2, sg2, sb2] = sampleStampBilinear(sd, sw, sh,
+            r * 0 + (pickupStrokeSeedX + sx),
+            g * 0 + (pickupStrokeSeedY + sy));
+          // Blend a small amount of the scatter sample
+          const sm = Math.min(0.3, scat / 50);
+          r = r * (1 - sm) + sr2 * sm;
+          g = g * (1 - sm) + sg2 * sm;
+          b = b * (1 - sm) + sb2 * sm;
         }
 
-        const [stampR, stampG, stampB] = sampleStampBilinear(sd, sw, sh, sampleX, sampleY);
+        // Coherence boost: at high coherence, fiber accumulation stays
+        // streaky already; at low coherence, add a touch of per-pixel
+        // texture noise so streaks have grain.
+        if (coh < 1) {
+          const grain = (noise(mx, my + ((pickupStrokeDist * 7) | 0)) - 0.5) * (1 - coh) * 30;
+          r += grain; g += grain; b += grain;
+        }
+
         const di = (py * w + px) * 4;
-
-        // Center of brush = direct pixel placement (you SEE pixels being placed).
-        // Edges = blended (soft falloff into existing canvas).
-        // mask^1.5 sharpens the falloff curve so center feels solid.
-        const w_solid = Math.pow(maskVal, 1.5) * opa;
-        const w_blend = maskVal * opa;
-
-        const targetR = stampR * w_solid + (src[di]     * (1 - w_solid));
-        const targetG = stampG * w_solid + (src[di + 1] * (1 - w_solid));
-        const targetB = stampB * w_solid + (src[di + 2] * (1 - w_solid));
-
-        // Direct overwrite for solid feel
-        dst[di]     = Math.round(src[di]     + (targetR - src[di])     * w_blend);
-        dst[di + 1] = Math.round(src[di + 1] + (targetG - src[di + 1]) * w_blend);
-        dst[di + 2] = Math.round(src[di + 2] + (targetB - src[di + 2]) * w_blend);
+        // Strong placement at center, soft edge falloff
+        const wSolid = Math.pow(maskVal, 1.4) * opa;
+        const wBlend = maskVal * opa;
+        const tR = r * wSolid + src[di]     * (1 - wSolid);
+        const tG = g * wSolid + src[di + 1] * (1 - wSolid);
+        const tB = b * wSolid + src[di + 2] * (1 - wSolid);
+        dst[di]     = Math.max(0, Math.min(255, Math.round(src[di]     + (tR - src[di])     * wBlend)));
+        dst[di + 1] = Math.max(0, Math.min(255, Math.round(src[di + 1] + (tG - src[di + 1]) * wBlend)));
+        dst[di + 2] = Math.max(0, Math.min(255, Math.round(src[di + 2] + (tB - src[di + 2]) * wBlend)));
       }
     }
   }
@@ -799,6 +877,8 @@ const PaintEngine = (() => {
       // don't all start sampling at (0,0)
       pickupStrokeSeedX = Math.random() * (pickupStamp ? pickupStamp.w : 0);
       pickupStrokeSeedY = Math.random() * (pickupStamp ? pickupStamp.h : 0);
+      // Build a fresh set of fibers for this stroke
+      pickupFibers = buildPickupFibers(activeMaskSize);
     }
     if (tool === 'smudge') initPickup(x, y);
 
@@ -966,7 +1046,12 @@ const PaintEngine = (() => {
 
   // ── Settings ──
   function setTool(t) { tool = t; }
-  function setSize(s) { size = Math.max(1, Math.min(500, s)); updateActiveMask(); }
+  function setSize(s) {
+    size = Math.max(1, Math.min(500, s));
+    updateActiveMask();
+    // Invalidate fiber set so it rebuilds at the right density next stroke
+    pickupFibers = null;
+  }
   function setSpacing(s) { spacing = Math.max(1, Math.min(200, s)); }
   function setStrength(s) { strength = Math.max(0, Math.min(100, s)); }
   function setOpacity(o) { opacity = Math.max(0, Math.min(100, o)); }
