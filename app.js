@@ -2128,49 +2128,113 @@
     if (opts === 'custom' && tool === 'pickup') {
       const hasStamp = PaintEngine.hasStamp();
       const stampSize = PaintEngine.getStampSize();
-      const settings = PaintEngine.getSettings();
+      const s = PaintEngine.getSettings();
+
+      // Helper to render a slider param row
+      const sliderRow = (label, id, min, max, val, hint) => `
+        <div class="param-group">
+          <span class="param-label">${label}${hint ? `<span class="param-hint-inline"> ${hint}</span>` : ''}</span>
+          <div class="slider-row">
+            <input type="range" id="${id}" min="${min}" max="${max}" step="1" value="${val}">
+            <span class="param-value">${val}</span>
+          </div>
+        </div>`;
+
+      // Preset buttons that set a coherent group of params at once
+      const presetBtn = (label, key) => `<button class="pickup-preset-btn" data-preset="${key}">${label}</button>`;
+
       container.innerHTML = `
         <div class="param-group">
           <button id="btn-pickup-select" class="btn-small">${hasStamp ? 'Re-select Pixels' : 'Select Pixels from Canvas'}</button>
           ${hasStamp && stampSize ? `<span class="param-label" style="font-size:10px;opacity:0.6;margin-top:4px">${stampSize.w}×${stampSize.h}px captured — drag to paint</span>` : '<span class="param-label" style="font-size:10px;opacity:0.6;margin-top:4px">Draw a rectangle on the canvas to pick up pixels</span>'}
         </div>
         <div class="param-group">
-          <span class="param-label">Jitter</span>
-          <div class="slider-row">
-            <input type="range" id="tool-opt-pickup-jitter" min="0" max="100" step="1" value="${settings.pickupJitter}">
-            <span class="param-value">${settings.pickupJitter}</span>
+          <span class="param-label">Presets</span>
+          <div class="pickup-preset-grid">
+            ${presetBtn('Bristles', 'bristles')}
+            ${presetBtn('Smear', 'smear')}
+            ${presetBtn('Solid', 'solid')}
+            ${presetBtn('Wisp', 'wisp')}
+            ${presetBtn('Chaos', 'chaos')}
+            ${presetBtn('Liquid', 'liquid')}
           </div>
         </div>
-        <div class="param-group">
-          <span class="param-label">Scatter</span>
-          <div class="slider-row">
-            <input type="range" id="tool-opt-pickup-scatter" min="0" max="50" step="1" value="${settings.pickupScatter}">
-            <span class="param-value">${settings.pickupScatter}</span>
-          </div>
-        </div>
-        <div class="param-group">
-          <span class="param-label">Streak</span>
-          <div class="slider-row">
-            <input type="range" id="tool-opt-pickup-coherence" min="0" max="100" step="1" value="${settings.pickupCoherence}">
-            <span class="param-value">${settings.pickupCoherence}</span>
-          </div>
-        </div>
+        <div class="param-section-divider">FIBERS</div>
+        ${sliderRow('Density', 'tool-opt-pickup-density', 0, 100, s.pickupFiberDensity, 'sparse → packed')}
+        ${sliderRow('Length',  'tool-opt-pickup-length',  0, 100, s.pickupFiberLength,  'short → long')}
+        ${sliderRow('Flow',    'tool-opt-pickup-flow',    0, 100, s.pickupFiberFlow,    'broken → solid')}
+        ${sliderRow('Wander',  'tool-opt-pickup-wander',  0, 100, s.pickupFiberWander,  'straight → curl')}
+        ${sliderRow('Variety', 'tool-opt-pickup-variety', 0, 100, s.pickupColorVariety, 'uniform → mixed')}
+        ${sliderRow('Taper',   'tool-opt-pickup-taper',   0, 100, s.pickupFiberTaper,   'flat → tapered')}
+        <div class="param-section-divider">GRAIN</div>
+        ${sliderRow('Jitter',    'tool-opt-pickup-jitter',    0, 100, s.pickupJitter)}
+        ${sliderRow('Scatter',   'tool-opt-pickup-scatter',   0, 50,  s.pickupScatter)}
+        ${sliderRow('Coherence', 'tool-opt-pickup-coherence', 0, 100, s.pickupCoherence)}
       `;
       $('btn-pickup-select').addEventListener('click', () => enterPickupMarquee());
-      const jitterEl = $('tool-opt-pickup-jitter');
-      const scatterEl = $('tool-opt-pickup-scatter');
-      const coherenceEl = $('tool-opt-pickup-coherence');
-      if (jitterEl) jitterEl.addEventListener('input', () => {
-        PaintEngine.setPickupJitter(parseInt(jitterEl.value));
-        jitterEl.parentElement.querySelector('.param-value').textContent = jitterEl.value;
-      });
-      if (scatterEl) scatterEl.addEventListener('input', () => {
-        PaintEngine.setPickupScatter(parseInt(scatterEl.value));
-        scatterEl.parentElement.querySelector('.param-value').textContent = scatterEl.value;
-      });
-      if (coherenceEl) coherenceEl.addEventListener('input', () => {
-        PaintEngine.setPickupCoherence(parseInt(coherenceEl.value));
-        coherenceEl.parentElement.querySelector('.param-value').textContent = coherenceEl.value;
+
+      // Slider wiring
+      const wire = (id, setter) => {
+        const el = $(id);
+        if (!el) return;
+        el.addEventListener('input', () => {
+          const v = parseInt(el.value);
+          setter(v);
+          const disp = el.parentElement.querySelector('.param-value');
+          if (disp) disp.textContent = v;
+        });
+      };
+      wire('tool-opt-pickup-density', v => PaintEngine.setPickupFiberDensity(v));
+      wire('tool-opt-pickup-length',  v => PaintEngine.setPickupFiberLength(v));
+      wire('tool-opt-pickup-flow',    v => PaintEngine.setPickupFiberFlow(v));
+      wire('tool-opt-pickup-wander',  v => PaintEngine.setPickupFiberWander(v));
+      wire('tool-opt-pickup-variety', v => PaintEngine.setPickupColorVariety(v));
+      wire('tool-opt-pickup-taper',   v => PaintEngine.setPickupFiberTaper(v));
+      wire('tool-opt-pickup-jitter',  v => PaintEngine.setPickupJitter(v));
+      wire('tool-opt-pickup-scatter', v => PaintEngine.setPickupScatter(v));
+      wire('tool-opt-pickup-coherence', v => PaintEngine.setPickupCoherence(v));
+
+      // Preset application
+      const presets = {
+        bristles: { density: 25, length: 60, flow: 30, wander: 35, variety: 70, taper: 40, jitter: 40, scatter: 5, coherence: 30 },
+        smear:    { density: 80, length: 75, flow: 70, wander: 15, variety: 30, taper: 20, jitter: 20, scatter: 0, coherence: 80 },
+        solid:    { density: 95, length: 90, flow: 100, wander: 5, variety: 0, taper: 60, jitter: 0, scatter: 0, coherence: 100 },
+        wisp:     { density: 15, length: 85, flow: 15, wander: 25, variety: 80, taper: 80, jitter: 50, scatter: 8, coherence: 40 },
+        chaos:    { density: 50, length: 50, flow: 35, wander: 90, variety: 100, taper: 10, jitter: 80, scatter: 30, coherence: 10 },
+        liquid:   { density: 70, length: 70, flow: 55, wander: 50, variety: 60, taper: 35, jitter: 30, scatter: 12, coherence: 60 }
+      };
+      const applyPreset = (key) => {
+        const p = presets[key];
+        if (!p) return;
+        PaintEngine.setPickupFiberDensity(p.density);
+        PaintEngine.setPickupFiberLength(p.length);
+        PaintEngine.setPickupFiberFlow(p.flow);
+        PaintEngine.setPickupFiberWander(p.wander);
+        PaintEngine.setPickupColorVariety(p.variety);
+        PaintEngine.setPickupFiberTaper(p.taper);
+        PaintEngine.setPickupJitter(p.jitter);
+        PaintEngine.setPickupScatter(p.scatter);
+        PaintEngine.setPickupCoherence(p.coherence);
+        // Sync slider visuals
+        const setSlider = (id, val) => {
+          const el = $(id);
+          if (!el) return;
+          el.value = val;
+          const disp = el.parentElement.querySelector('.param-value');
+          if (disp) disp.textContent = val;
+        };
+        setSlider('tool-opt-pickup-density', p.density);
+        setSlider('tool-opt-pickup-length',  p.length);
+        setSlider('tool-opt-pickup-flow',    p.flow);
+        setSlider('tool-opt-pickup-wander',  p.wander);
+        setSlider('tool-opt-pickup-variety', p.variety);
+        setSlider('tool-opt-pickup-taper',   p.taper);
+        setSlider('tool-opt-pickup-jitter',  p.jitter);
+        setSlider('tool-opt-pickup-scatter', p.scatter);
+        setSlider('tool-opt-pickup-coherence', p.coherence);
+      };
+      container.querySelectorAll('.pickup-preset-btn').forEach(btn => {
+        btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
       });
       return;
     }
@@ -2338,6 +2402,8 @@
       // Reset controls
       $('brush-maker-threshold').value = 128;
       $('brush-maker-softness').value = 20;
+      const featherEl = $('brush-maker-feather');
+      if (featherEl) featherEl.value = 0;
       $('brush-maker-invert').checked = false;
 
       // Show modal after a tick so the browser's click event (which fires
@@ -2349,24 +2415,33 @@
     }
   });
 
-  function renderBrushMakerPreview() {
-    if (!_brushMakerSourceData) return;
+  function getBrushMakerParams() {
     const th = parseInt($('brush-maker-threshold').value);
     const sf = parseInt($('brush-maker-softness').value);
     const inv = $('brush-maker-invert').checked;
+    const featherEl = $('brush-maker-feather');
+    const fe = featherEl ? parseInt(featherEl.value) : 0;
+    return { th, sf, inv, fe };
+  }
+
+  function renderBrushMakerPreview() {
+    if (!_brushMakerSourceData) return;
+    const { th, sf, inv, fe } = getBrushMakerParams();
     $('brush-maker-threshold-val').textContent = th;
     $('brush-maker-softness-val').textContent = sf;
+    const featherValEl = $('brush-maker-feather-val');
+    if (featherValEl) featherValEl.textContent = fe;
 
-    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, th, sf, inv);
-    const sz = 128;
+    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, th, sf, inv, fe);
+    const sz = brushMakerCanvas.width;  // now 220
     const srcSz = result.size;
     const srcW = _brushMakerSourceData.width;
     const srcH = _brushMakerSourceData.height;
     const srcD = _brushMakerSourceData.data;
     const scale = srcSz / sz;
 
-    // Draw checkerboard first (transparency indicator)
-    const chk = 8;
+    // Draw checkerboard
+    const chk = 10;
     brushMakerCtx.clearRect(0, 0, sz, sz);
     for (let cy2 = 0; cy2 < sz; cy2 += chk) {
       for (let cx2 = 0; cx2 < sz; cx2 += chk) {
@@ -2376,14 +2451,12 @@
       }
     }
 
-    // Overlay source image with computed alpha from mask
     const img = brushMakerCtx.createImageData(sz, sz);
     for (let y = 0; y < sz; y++) {
       for (let x = 0; x < sz; x++) {
         const sx = Math.min(Math.round(x * scale), srcSz - 1);
         const sy = Math.min(Math.round(y * scale), srcSz - 1);
         const alpha = result.mask[sy * srcSz + sx];
-        // Sample source pixel color
         const sxClamped = Math.min(sx, srcW - 1);
         const syClamped = Math.min(sy, srcH - 1);
         const si = (syClamped * srcW + sxClamped) * 4;
@@ -2394,18 +2467,98 @@
         img.data[idx + 3] = Math.round(alpha * 255);
       }
     }
-    // Composite over checkerboard
     const tmpCvs = document.createElement('canvas');
     tmpCvs.width = sz; tmpCvs.height = sz;
     const tmpCtx = tmpCvs.getContext('2d');
     tmpCtx.putImageData(img, 0, 0);
     brushMakerCtx.drawImage(tmpCvs, 0, 0);
+
+    // Render side test pads (simulates strokes using the brush as alpha mask)
+    renderBrushTestPads(result.mask, result.size);
+  }
+
+  // Render two test canvases: one with white "ink" on dark, one with dark on light.
+  // Strokes are drawn using the mask as a soft alpha stamp at varying sizes/spacings.
+  function renderBrushTestPads(mask, maskSize) {
+    renderBrushTest('brush-test-dark',  mask, maskSize, '#0a0a0d', '#f4f4f6');
+    renderBrushTest('brush-test-light', mask, maskSize, '#f4f4f6', '#0a0a0d');
+  }
+  function renderBrushTest(canvasId, mask, maskSize, bg, ink) {
+    const c = document.getElementById(canvasId);
+    if (!c) return;
+    const tctx = c.getContext('2d');
+    const w = c.width, h = c.height;
+    // Background fill
+    tctx.fillStyle = bg;
+    tctx.fillRect(0, 0, w, h);
+    // Build a small RGBA stamp from the mask once (small render size for speed)
+    const stampSizes = [22, 30, 40];
+    const stamps = stampSizes.map(sz => makeMaskStamp(mask, maskSize, sz, ink));
+
+    // Three test strokes: straight, wavy, dab cluster
+    drawStrokeWithStamp(tctx, stamps[1], 12, 30, w - 12, 30, 0.45);
+    // Wavy
+    let prev = null;
+    for (let x = 12; x < w - 12; x += 4) {
+      const y = 70 + Math.sin(x * 0.08) * 12;
+      if (prev) drawStrokeWithStamp(tctx, stamps[0], prev.x, prev.y, x, y, 0.5);
+      prev = { x, y };
+    }
+    // Dabs of varying size at the bottom
+    for (let i = 0; i < 5; i++) {
+      const stamp = stamps[i % stamps.length];
+      const x = 24 + i * (w - 48) / 4;
+      stampAt(tctx, stamp, x, 100, 1);
+    }
+  }
+  function makeMaskStamp(mask, maskSize, outSize, inkCss) {
+    const c = document.createElement('canvas');
+    c.width = outSize; c.height = outSize;
+    const ictx = c.getContext('2d');
+    const img = ictx.createImageData(outSize, outSize);
+    const scale = maskSize / outSize;
+    // Parse ink color
+    const tmp = document.createElement('canvas').getContext('2d');
+    tmp.fillStyle = inkCss; tmp.fillRect(0,0,1,1);
+    const px = tmp.getImageData(0,0,1,1).data;
+    const r = px[0], g = px[1], b = px[2];
+    for (let y = 0; y < outSize; y++) {
+      for (let x = 0; x < outSize; x++) {
+        const sx = Math.min(maskSize - 1, Math.floor(x * scale));
+        const sy = Math.min(maskSize - 1, Math.floor(y * scale));
+        const a = mask[sy * maskSize + sx];
+        const i = (y * outSize + x) * 4;
+        img.data[i] = r; img.data[i+1] = g; img.data[i+2] = b;
+        img.data[i+3] = Math.round(a * 255);
+      }
+    }
+    ictx.putImageData(img, 0, 0);
+    return c;
+  }
+  function stampAt(tctx, stamp, x, y, alpha) {
+    tctx.globalAlpha = alpha;
+    tctx.drawImage(stamp, x - stamp.width / 2, y - stamp.height / 2);
+    tctx.globalAlpha = 1;
+  }
+  function drawStrokeWithStamp(tctx, stamp, x0, y0, x1, y1, alpha) {
+    const dx = x1 - x0, dy = y1 - y0;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    const step = Math.max(1, stamp.width * 0.18);
+    const steps = Math.max(1, Math.ceil(dist / step));
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      stampAt(tctx, stamp, x0 + dx*t, y0 + dy*t, alpha);
+    }
   }
 
   // Live preview on slider change
   $('brush-maker-threshold').addEventListener('input', renderBrushMakerPreview);
   $('brush-maker-softness').addEventListener('input', renderBrushMakerPreview);
+  const _featherSlider = $('brush-maker-feather');
+  if (_featherSlider) _featherSlider.addEventListener('input', renderBrushMakerPreview);
   $('brush-maker-invert').addEventListener('change', renderBrushMakerPreview);
+  const _redrawBtn = document.getElementById('brush-test-redraw');
+  if (_redrawBtn) _redrawBtn.addEventListener('click', renderBrushMakerPreview);
 
   // Cancel
   $('brush-maker-cancel').addEventListener('click', () => {
@@ -2416,10 +2569,8 @@
   // Confirm — add the brush
   $('brush-maker-confirm').addEventListener('click', () => {
     if (!_brushMakerSourceData) return;
-    const th = parseInt($('brush-maker-threshold').value);
-    const sf = parseInt($('brush-maker-softness').value);
-    const inv = $('brush-maker-invert').checked;
-    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, th, sf, inv);
+    const { th, sf, inv, fe } = getBrushMakerParams();
+    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, th, sf, inv, fe);
     PaintEngine.addBrush(_brushMakerName, result.mask, result.size);
     PaintEngine.selectBrush(PaintEngine.getBrushes().length - 1);
     PaintEngine.invalidateCursorCache();

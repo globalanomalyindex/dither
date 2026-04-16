@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=15">
+  <link rel="stylesheet" href="style.css?v=16">
 </head>
 <body>
   <div id="app">
@@ -427,23 +427,45 @@
 
   <!-- Brush Maker Modal -->
   <div id="brush-maker-modal" class="modal-overlay" style="display:none">
-    <div class="modal-panel">
+    <div class="modal-panel modal-panel-wide">
       <h3>Make Brush from Canvas</h3>
-      <div class="brush-import-preview">
-        <canvas id="brush-maker-canvas" width="128" height="128"></canvas>
-      </div>
-      <div class="brush-import-controls">
-        <label>Threshold
-          <input type="range" id="brush-maker-threshold" min="0" max="255" value="128">
-          <span id="brush-maker-threshold-val">128</span>
-        </label>
-        <label>Softness
-          <input type="range" id="brush-maker-softness" min="0" max="100" value="20">
-          <span id="brush-maker-softness-val">20</span>
-        </label>
-        <label class="brush-import-check">
-          <input type="checkbox" id="brush-maker-invert"> Invert (white on black)
-        </label>
+      <div class="brush-maker-layout">
+        <div class="brush-maker-left">
+          <div class="brush-import-preview">
+            <canvas id="brush-maker-canvas" width="220" height="220"></canvas>
+          </div>
+          <div class="brush-import-controls">
+            <label>Threshold
+              <input type="range" id="brush-maker-threshold" min="0" max="255" value="128">
+              <span id="brush-maker-threshold-val">128</span>
+            </label>
+            <label>Softness
+              <input type="range" id="brush-maker-softness" min="0" max="100" value="20">
+              <span id="brush-maker-softness-val">20</span>
+            </label>
+            <label>Feather
+              <input type="range" id="brush-maker-feather" min="0" max="100" value="0">
+              <span id="brush-maker-feather-val">0</span>
+            </label>
+            <label class="brush-import-check">
+              <input type="checkbox" id="brush-maker-invert"> Invert (white on black)
+            </label>
+          </div>
+        </div>
+        <div class="brush-maker-right">
+          <div class="brush-test-header">
+            <span>Test Strokes</span>
+            <button id="brush-test-redraw" class="btn-icon">↻</button>
+          </div>
+          <div class="brush-test-pad brush-test-dark">
+            <canvas id="brush-test-dark" width="240" height="120"></canvas>
+            <span class="brush-test-label">on dark</span>
+          </div>
+          <div class="brush-test-pad brush-test-light">
+            <canvas id="brush-test-light" width="240" height="120"></canvas>
+            <span class="brush-test-label">on light</span>
+          </div>
+        </div>
       </div>
       <div class="brush-import-actions">
         <button id="brush-maker-cancel" class="btn-secondary">Cancel</button>
@@ -543,10 +565,10 @@
     </div>
   </div>
 
-  <script src="dither.js?v=15"></script>
-  <script src="engine.js?v=15"></script>
-  <script src="grain.js?v=15"></script>
-  <script src="paintstroke.js?v=15"></script>
-  <script src="app.js?v=15"></script>
+  <script src="dither.js?v=16"></script>
+  <script src="engine.js?v=16"></script>
+  <script src="grain.js?v=16"></script>
+  <script src="paintstroke.js?v=16"></script>
+  <script src="app.js?v=16"></script>
 </body>
 </html>

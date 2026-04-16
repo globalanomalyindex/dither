@@ -33,9 +33,17 @@ const PaintEngine = (() => {
   let spreadAmount = 50;   // stretch intensity
 
   // Pickup tool params
-  let pickupJitter = 30;      // % — randomize sample position within stamp
-  let pickupScatter = 10;     // px — scatter individual pixels
-  let pickupCoherence = 50;   // 0=noise, 100=solid streaks — controls spatial block size of randomization
+  let pickupJitter = 30;        // % — randomize sample position within stamp
+  let pickupScatter = 10;       // px — scatter individual pixels
+  let pickupCoherence = 50;     // 0=noise, 100=solid streaks — block size of randomization
+
+  // Fiber model params — control bristle character
+  let pickupFiberDensity = 50;  // 0..100 — sparse bristles → packed solid coverage
+  let pickupFiberLength = 50;   // 0..100 — short stamps → long elongated streaks
+  let pickupFiberFlow = 50;     // 0..100 — broken/wispy → solid continuous lines
+  let pickupFiberWander = 30;   // 0..100 — straight parallel → wandering / chaotic
+  let pickupColorVariety = 50;  // 0..100 — uniform color → multi-colored bristles
+  let pickupFiberTaper = 50;    // 0..100 — flat ends → tapered stroke ends
 
   // Tapering
   let taperIn = 20;            // % of stroke length for taper in
@@ -664,38 +672,76 @@ const PaintEngine = (() => {
   function buildPickupFibers(brushDiameter) {
     if (!pickupStamp) return null;
     const sw = pickupStamp.w, sh = pickupStamp.h;
-    // Density scales with brush size — bigger brush = more fibers.
-    // ~1 fiber per ~3 brush pixels gives nice visible streaks.
-    const count = Math.max(8, Math.min(96, Math.round(brushDiameter / 3)));
+
+    // Density: low = sparse visible bristles, high = packed solid coverage.
+    // Density also slightly thickens each fiber's perpendicular envelope.
+    const density = pickupFiberDensity / 100;
+    const baseCount = Math.round(brushDiameter / 6);
+    const count = Math.max(4, Math.min(140,
+      Math.round(baseCount * (0.4 + density * 3))
+    ));
+
+    // Color variety: how much each fiber jumps to a different texture row.
+    // 0 = all fibers sample the same row (uniform color), 1 = each fiber
+    // pulls from a wildly different part of the texture.
+    const variety = pickupColorVariety / 100;
+    const sharedTexV = Math.random() * sh;          // fallback row when variety=0
+    const sharedTexU = Math.random() * sw;
+
     if (!_pickupRng) _pickupRng = { s: 42 };
     const rng = () => { _pickupRng.s = (_pickupRng.s * 16807) % 2147483647; return _pickupRng.s / 2147483647; };
+
+    // Flow solidity: high flow = small envelope amplitude (solid lines),
+    // low flow = high amplitude (broken/wispy paint dropouts).
+    const flow = pickupFiberFlow / 100;
+    const envAmpBase = (1 - flow) * 0.6;
+
+    // Wander: how much fibers curve perpendicular to stroke as they travel.
+    const wander = pickupFiberWander / 100;
+
+    // Length-stretch baseline. Length=0 → very short streaks (almost stamp),
+    // length=1 → long elongated streaks well-mapped to texture.
+    const lengthN = pickupFiberLength / 100;
+
+    // Fiber thickness: at high density we can keep them thinner so they
+    // remain distinct. At low density, widen them so coverage doesn't
+    // get gappy from sparse fibers alone.
+    const thicknessBase = (1.0 / count) * (1.0 + (1 - density) * 1.5);
+
     const fibers = new Array(count);
     for (let i = 0; i < count; i++) {
-      // Place fibers across perpendicular axis [-1, 1] with a bit of jitter
-      // so they're not perfectly evenly spaced.
-      const slot = (i + 0.5) / count * 2 - 1;          // -1 .. 1
+      // Perpendicular slot with light jitter
+      const slot = (i + 0.5) / count * 2 - 1;
       const wobble = (rng() - 0.5) * (1.6 / count);
+      // Per-fiber thickness variation
+      const halfWidth = thicknessBase * (0.55 + rng() * 1.0);
+
+      // Texture sampling — variety controls how far each fiber strays from
+      // the shared row/column.
+      const texU = sharedTexU + (rng() - 0.5) * sw * variety;
+      const texV = sharedTexV + (rng() - 0.5) * sh * variety;
+
       fibers[i] = {
-        // Perpendicular position (in normalized brush radius units)
         perp: slot + wobble,
-        // Half-width of this fiber's perpendicular envelope (some thicker, some thinner)
-        halfWidth: (1.0 / count) * (0.7 + rng() * 1.4),
-        // Independent texture sampling row & column offset
-        texU: rng() * sw,
-        texV: rng() * sh,
-        // Slow drift in texture-V along the fiber's length (subtle organic curve)
-        driftV: (rng() - 0.5) * 0.4,
-        // Per-fiber along-stroke length-stretch (some streaks elongate more)
-        lenStretch: 0.45 + rng() * 0.95,
-        // Opacity / load — natural variation in how much paint each "bristle" carries
-        load: 0.5 + rng() * 0.6,
-        // Phase offset for the longitudinal envelope (broken / wispy edges)
+        halfWidth,
+        texU,
+        texV,
+        // Slow texture-V drift: subtle organic curve along fiber length.
+        // Suppressed when wander is low.
+        driftV: (rng() - 0.5) * 0.5 * wander,
+        // Length stretch. lengthN=0 → very compressed (~stamp-like).
+        // lengthN=1 → strong elongation along stroke.
+        lenStretch: 0.2 + rng() * 0.4 + lengthN * (0.6 + rng() * 1.4),
+        // Per-fiber paint load
+        load: 0.55 + rng() * 0.55,
+        // Longitudinal break-up envelope. Amplitude shrinks toward 0 as
+        // flow → 1, eliminating dropouts → solid lines.
         envPhase: rng() * Math.PI * 2,
-        envFreq: 0.04 + rng() * 0.08,
-        envAmp: 0.15 + rng() * 0.35,
-        // Slight perpendicular wander as the fiber travels
-        wanderAmp: (rng() - 0.5) * 0.08,
-        wanderFreq: 0.05 + rng() * 0.08
+        envFreq: 0.025 + rng() * 0.07,
+        envAmp: envAmpBase * (0.5 + rng() * 0.8),
+        // Perpendicular wander while traveling along stroke
+        wanderAmp: (rng() - 0.5) * 0.18 * wander,
+        wanderFreq: 0.04 + rng() * 0.08
       };
     }
     return fibers;
@@ -740,6 +786,14 @@ const PaintEngine = (() => {
     };
 
     const opa = Math.max(0, Math.min(1, alpha));
+
+    // Per-stamp taper envelope (softens stamp at start of stroke; end-taper
+    // is handled by the per-fiber longitudinal envelope falling off when
+    // the user lifts).
+    const taperN = pickupFiberTaper / 100;
+    const taperEnv = taperN > 0
+      ? Math.min(1, Math.pow(Math.min(1, pickupStrokeDist / (radius * 4 * taperN + 1)), 1.2))
+      : 1;
 
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
@@ -827,8 +881,8 @@ const PaintEngine = (() => {
 
         const di = (py * w + px) * 4;
         // Strong placement at center, soft edge falloff
-        const wSolid = Math.pow(maskVal, 1.4) * opa;
-        const wBlend = maskVal * opa;
+        const wSolid = Math.pow(maskVal, 1.4) * opa * taperEnv;
+        const wBlend = maskVal * opa * taperEnv;
         const tR = r * wSolid + src[di]     * (1 - wSolid);
         const tG = g * wSolid + src[di + 1] * (1 - wSolid);
         const tB = b * wSolid + src[di + 2] * (1 - wSolid);
@@ -1003,36 +1057,75 @@ const PaintEngine = (() => {
 
   function getSelectedBrush() { return selectedBrush; }
 
-  function extractBrushFromImage(imageData, threshold, softness, invert) {
+  function extractBrushFromImage(imageData, threshold, softness, invert, feather) {
     const w = imageData.width, h = imageData.height;
     const d = imageData.data;
     const sz = Math.max(w, h);
     const mask = new Float32Array(sz * sz);
-    const th = threshold / 255;   // 0-1, pixels brighter than this become transparent
-    const sf = softness / 100;    // 0-1, feather width around threshold
+    const th = threshold / 255;
+    const sf = softness / 100;
 
     for (let y = 0; y < h && y < sz; y++) {
       for (let x = 0; x < w && x < sz; x++) {
         const i = (y * w + x) * 4;
         const brightness = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) / 255;
-        // Threshold removes bright pixels (white → transparent)
-        // Darker pixels stay opaque, preserving texture
         const edge = sf > 0 ? sf * 0.5 : 0.005;
         const lo = Math.max(0, th - edge), hi = Math.min(1, th + edge);
         let alpha;
         if (brightness >= hi) {
-          alpha = 0;          // above threshold = fully transparent
+          alpha = 0;
         } else if (brightness <= lo) {
-          alpha = 1;          // well below threshold = fully opaque
+          alpha = 1;
         } else {
-          alpha = 1 - (brightness - lo) / (hi - lo);  // smooth fade
+          alpha = 1 - (brightness - lo) / (hi - lo);
         }
-        // Preserve tonal texture: darks are more opaque, mids partially
-        // Scale by inverse brightness so texture detail is retained
         const texture = 1 - brightness;
         alpha = alpha * (0.3 + 0.7 * texture);
         if (invert) alpha = brightness >= hi ? 1 : brightness <= lo ? 0 : (brightness - lo) / (hi - lo);
         mask[y * sz + x] = Math.max(0, Math.min(1, alpha));
+      }
+    }
+
+    // Feathering: separable box blur (cheap Gaussian approximation).
+    // feather is 0..100 → kernel radius scales with mask size so the same
+    // value gives consistent perceived softness across brush sizes.
+    const fAmt = Math.max(0, Math.min(100, feather || 0));
+    if (fAmt > 0) {
+      const radius = Math.max(1, Math.round(sz * fAmt / 200));
+      const passes = 2; // two box-blur passes ≈ Gaussian
+      const tmp = new Float32Array(sz * sz);
+      for (let p = 0; p < passes; p++) {
+        // Horizontal pass: mask → tmp
+        for (let y = 0; y < sz; y++) {
+          let sum = 0;
+          // Initialize sum with first window
+          for (let x = -radius; x <= radius; x++) {
+            const xc = Math.max(0, Math.min(sz - 1, x));
+            sum += mask[y * sz + xc];
+          }
+          const inv = 1 / (radius * 2 + 1);
+          for (let x = 0; x < sz; x++) {
+            tmp[y * sz + x] = sum * inv;
+            const addX = Math.min(sz - 1, x + radius + 1);
+            const subX = Math.max(0, x - radius);
+            sum += mask[y * sz + addX] - mask[y * sz + subX];
+          }
+        }
+        // Vertical pass: tmp → mask
+        for (let x = 0; x < sz; x++) {
+          let sum = 0;
+          for (let y = -radius; y <= radius; y++) {
+            const yc = Math.max(0, Math.min(sz - 1, y));
+            sum += tmp[yc * sz + x];
+          }
+          const inv = 1 / (radius * 2 + 1);
+          for (let y = 0; y < sz; y++) {
+            mask[y * sz + x] = sum * inv;
+            const addY = Math.min(sz - 1, y + radius + 1);
+            const subY = Math.max(0, y - radius);
+            sum += tmp[addY * sz + x] - tmp[subY * sz + x];
+          }
+        }
       }
     }
 
@@ -1067,13 +1160,19 @@ const PaintEngine = (() => {
   function setPickupJitter(v) { pickupJitter = Math.max(0, Math.min(100, v)); }
   function setPickupScatter(v) { pickupScatter = Math.max(0, Math.min(50, v)); }
   function setPickupCoherence(v) { pickupCoherence = Math.max(0, Math.min(100, v)); }
+  function setPickupFiberDensity(v) { pickupFiberDensity = Math.max(0, Math.min(100, v)); pickupFibers = null; }
+  function setPickupFiberLength(v)  { pickupFiberLength  = Math.max(0, Math.min(100, v)); pickupFibers = null; }
+  function setPickupFiberFlow(v)    { pickupFiberFlow    = Math.max(0, Math.min(100, v)); pickupFibers = null; }
+  function setPickupFiberWander(v)  { pickupFiberWander  = Math.max(0, Math.min(100, v)); pickupFibers = null; }
+  function setPickupColorVariety(v) { pickupColorVariety = Math.max(0, Math.min(100, v)); pickupFibers = null; }
+  function setPickupFiberTaper(v)   { pickupFiberTaper   = Math.max(0, Math.min(100, v)); }
   function setTaperIn(v) { taperIn = Math.max(0, Math.min(100, v)); }
   function setTaperOut(v) { taperOut = Math.max(0, Math.min(100, v)); }
   function setTaperSize(v) { taperSize = !!v; }
   function setTaperOpacity(v) { taperOpacity = !!v; }
 
   function getSettings() {
-    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection, pickupJitter, pickupScatter, pickupCoherence, taperIn, taperOut, taperSize, taperOpacity };
+    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection, pickupJitter, pickupScatter, pickupCoherence, pickupFiberDensity, pickupFiberLength, pickupFiberFlow, pickupFiberWander, pickupColorVariety, pickupFiberTaper, taperIn, taperOut, taperSize, taperOpacity };
   }
 
   // ── Brush Thumbnails ──
@@ -1136,6 +1235,8 @@ const PaintEngine = (() => {
     setLiquifySmooth, setBlendKernel, setSpreadAmount,
     setBrushAngle, setFollowDirection,
     setPickupJitter, setPickupScatter, setPickupCoherence,
+    setPickupFiberDensity, setPickupFiberLength, setPickupFiberFlow,
+    setPickupFiberWander, setPickupColorVariety, setPickupFiberTaper,
     setTaperIn, setTaperOut, setTaperSize, setTaperOpacity,
     selectBrush, getBrushes, getSelectedBrush, getBrushThumbnail,
     addBrush, extractBrushFromImage, capturePickupStamp, hasStamp, getStampSize,
