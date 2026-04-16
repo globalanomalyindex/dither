@@ -615,12 +615,17 @@ const PaintEngine = (() => {
     if (!hasPickupStamp || !pickupStamp) return;
     const sw = pickupStamp.w, sh = pickupStamp.h;
     const sd = pickupStamp.data.data;
-    const half = ms / 2;
     const jit = pickupJitter / 100;
     const scat = pickupScatter;
 
     if (!_pickupRng) _pickupRng = { s: 42 };
     const rng = () => { _pickupRng.s = (_pickupRng.s * 16807) % 2147483647; return _pickupRng.s / 2147483647; };
+
+    // Stroke direction for push-like displacement
+    const dirLen = Math.sqrt(strokeDirX * strokeDirX + strokeDirY * strokeDirY);
+    const ndx = dirLen > 0.001 ? strokeDirX / dirLen : 0;
+    const ndy = dirLen > 0.001 ? strokeDirY / dirLen : 0;
+    const pushDist = pushDistance * (strength / 100);
 
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
@@ -630,9 +635,12 @@ const PaintEngine = (() => {
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
         // Map brush position to stamp position with jitter
-        // Base mapping: proportional position within brush → position within stamp
         let sampleX = (mx / ms) * sw;
         let sampleY = (my / ms) * sh;
+
+        // Offset by stroke direction (push effect on the stamp texture)
+        sampleX += strokeStampCount * ndx * 0.5;
+        sampleY += strokeStampCount * ndy * 0.5;
 
         // Add jitter: randomize sample position within stamp
         if (jit > 0) {
@@ -650,13 +658,30 @@ const PaintEngine = (() => {
         sampleX = ((sampleX % sw) + sw) % sw;
         sampleY = ((sampleY % sh) + sh) % sh;
 
-        // Nearest-neighbor sample from stamp (preserves dither pattern)
+        // Also pull from canvas in push direction for smear effect
+        const srcPx = Math.round(px - ndx * pushDist);
+        const srcPy = Math.round(py - ndy * pushDist);
+
+        // Nearest-neighbor sample from stamp
         const si = (Math.floor(sampleY) * sw + Math.floor(sampleX)) * 4;
         const di = (py * w + px) * 4;
 
-        dst[di]     = Math.round(src[di]     + (sd[si]     - src[di])     * a);
-        dst[di + 1] = Math.round(src[di + 1] + (sd[si + 1] - src[di + 1]) * a);
-        dst[di + 2] = Math.round(src[di + 2] + (sd[si + 2] - src[di + 2]) * a);
+        // Blend: mix stamp texture with push-displaced canvas pixels
+        let sr, sg, sb;
+        if (srcPx >= 0 && srcPx < w && srcPy >= 0 && srcPy < h) {
+          const pi = (srcPy * w + srcPx) * 4;
+          // Mix stamp color with push-source canvas color
+          const mixAmt = 0.6; // 60% stamp, 40% push
+          sr = sd[si]     * mixAmt + src[pi]     * (1 - mixAmt);
+          sg = sd[si + 1] * mixAmt + src[pi + 1] * (1 - mixAmt);
+          sb = sd[si + 2] * mixAmt + src[pi + 2] * (1 - mixAmt);
+        } else {
+          sr = sd[si]; sg = sd[si + 1]; sb = sd[si + 2];
+        }
+
+        dst[di]     = Math.round(src[di]     + (sr - src[di])     * a);
+        dst[di + 1] = Math.round(src[di + 1] + (sg - src[di + 1]) * a);
+        dst[di + 2] = Math.round(src[di + 2] + (sb - src[di + 2]) * a);
       }
     }
   }

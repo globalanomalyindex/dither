@@ -175,9 +175,16 @@
           // Update display value
           const disp = sizeEl.parentElement.querySelector('.param-value');
           if (disp) disp.textContent = newSize;
-          // Invalidate cursor cache so it redraws at new size
           PaintEngine.invalidateCursorCache();
+          // Reset app-level cache to force visual refresh
+          _lastCursorBrush = -1;
+          _lastCursorDisplaySize = 0;
           updateBrushCursorImage();
+          // Force reflow so the browser repaints immediately
+          if (brushCursor) {
+            brushCursor.style.display = 'block';
+            void brushCursor.offsetHeight;
+          }
         }
       }
     }
@@ -2349,7 +2356,7 @@
     for (let cy2 = 0; cy2 < sz; cy2 += chk) {
       for (let cx2 = 0; cx2 < sz; cx2 += chk) {
         const dark = ((cx2 / chk + cy2 / chk) % 2 === 0);
-        brushMakerCtx.fillStyle = dark ? '#333' : '#555';
+        brushMakerCtx.fillStyle = dark ? '#999' : '#ccc';
         brushMakerCtx.fillRect(cx2, cy2, chk, chk);
       }
     }
