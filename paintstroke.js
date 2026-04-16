@@ -621,67 +621,74 @@ const PaintEngine = (() => {
     if (!_pickupRng) _pickupRng = { s: 42 };
     const rng = () => { _pickupRng.s = (_pickupRng.s * 16807) % 2147483647; return _pickupRng.s / 2147483647; };
 
-    // Stroke direction for push-like displacement
-    const dirLen = Math.sqrt(strokeDirX * strokeDirX + strokeDirY * strokeDirY);
-    const ndx = dirLen > 0.001 ? strokeDirX / dirLen : 0;
-    const ndy = dirLen > 0.001 ? strokeDirY / dirLen : 0;
-    const pushDist = pushDistance * (strength / 100);
+    // Stroke direction
+    const nx = strokeDirX, ny = strokeDirY;
+    const hasDir = Math.abs(nx) > 0.01 || Math.abs(ny) > 0.01;
+
+    // Push displacement distance — canvas pixels behind get shoved forward
+    const dist = pushDistance * alpha;
+
+    // Texture scroll: the stamp "feeds" through as you stroke,
+    // like an ink roller picking up new texture with each revolution
+    const scrollX = strokeStampCount * nx * (sw / ms) * 1.5;
+    const scrollY = strokeStampCount * ny * (sh / ms) * 1.5;
 
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
-        const a = activeMask[my * ms + mx] * alpha;
-        if (a < 0.01) continue;
+        const maskVal = activeMask[my * ms + mx];
+        if (maskVal < 0.01) continue;
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
-        // Map brush position to stamp position with jitter
-        let sampleX = (mx / ms) * sw;
-        let sampleY = (my / ms) * sh;
+        const di = (py * w + px) * 4;
 
-        // Offset by stroke direction (push effect on the stamp texture)
-        sampleX += strokeStampCount * ndx * 0.5;
-        sampleY += strokeStampCount * ndy * 0.5;
+        // --- Sample from stamp texture (generative, scrolling) ---
+        let sampleX = (mx / ms) * sw + scrollX;
+        let sampleY = (my / ms) * sh + scrollY;
 
-        // Add jitter: randomize sample position within stamp
+        // Per-pixel jitter: randomize within stamp for organic variation
         if (jit > 0) {
           sampleX += (rng() - 0.5) * sw * jit;
           sampleY += (rng() - 0.5) * sh * jit;
         }
-
-        // Add pixel scatter
+        // Per-pixel scatter: spatial noise
         if (scat > 0) {
-          sampleX += (rng() - 0.5) * scat;
-          sampleY += (rng() - 0.5) * scat;
+          sampleX += (rng() - 0.5) * scat * 2;
+          sampleY += (rng() - 0.5) * scat * 2;
         }
 
-        // Wrap within stamp bounds (tiling the captured texture)
+        // Wrap within stamp (tiling — infinite texture from finite capture)
         sampleX = ((sampleX % sw) + sw) % sw;
         sampleY = ((sampleY % sh) + sh) % sh;
-
-        // Also pull from canvas in push direction for smear effect
-        const srcPx = Math.round(px - ndx * pushDist);
-        const srcPy = Math.round(py - ndy * pushDist);
-
-        // Nearest-neighbor sample from stamp
         const si = (Math.floor(sampleY) * sw + Math.floor(sampleX)) * 4;
-        const di = (py * w + px) * 4;
 
-        // Blend: mix stamp texture with push-displaced canvas pixels
-        let sr, sg, sb;
-        if (srcPx >= 0 && srcPx < w && srcPy >= 0 && srcPy < h) {
-          const pi = (srcPy * w + srcPx) * 4;
-          // Mix stamp color with push-source canvas color
-          const mixAmt = 0.6; // 60% stamp, 40% push
-          sr = sd[si]     * mixAmt + src[pi]     * (1 - mixAmt);
-          sg = sd[si + 1] * mixAmt + src[pi + 1] * (1 - mixAmt);
-          sb = sd[si + 2] * mixAmt + src[pi + 2] * (1 - mixAmt);
+        // Stamp pixel — what the engine is "generating"
+        const stampR = sd[si], stampG = sd[si + 1], stampB = sd[si + 2];
+
+        // --- Push-displaced canvas pixel (what's being shoved) ---
+        let pushR, pushG, pushB;
+        if (hasDir) {
+          const srcX = px - nx * dist * maskVal;
+          const srcY = py - ny * dist * maskVal;
+          [pushR, pushG, pushB] = samplePixel(src, w, h, srcX, srcY);
         } else {
-          sr = sd[si]; sg = sd[si + 1]; sb = sd[si + 2];
+          pushR = src[di]; pushG = src[di + 1]; pushB = src[di + 2];
         }
 
-        dst[di]     = Math.round(src[di]     + (sr - src[di])     * a);
-        dst[di + 1] = Math.round(src[di + 1] + (sg - src[di + 1]) * a);
-        dst[di + 2] = Math.round(src[di + 2] + (sb - src[di + 2]) * a);
+        // --- Blend: stamp feeds the push ---
+        // At brush center (high mask), stamp dominates = fresh generative pixels
+        // At brush edge (low mask), push dominates = displaced canvas pixels
+        // This creates the "engine spitting out pixels" feel
+        const stampWeight = maskVal;  // center = stamp, edge = push
+        const r = stampR * stampWeight + pushR * (1 - stampWeight);
+        const g = stampG * stampWeight + pushG * (1 - stampWeight);
+        const b = stampB * stampWeight + pushB * (1 - stampWeight);
+
+        // Direct pixel replacement — NOT alpha-blended with canvas.
+        // Brush mask controls coverage; within coverage, pixels are PLACED.
+        dst[di]     = Math.round(r);
+        dst[di + 1] = Math.round(g);
+        dst[di + 2] = Math.round(b);
       }
     }
   }
