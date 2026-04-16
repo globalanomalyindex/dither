@@ -32,6 +32,18 @@ const PaintEngine = (() => {
   let blendKernel = 3;     // blur kernel radius
   let spreadAmount = 50;   // stretch intensity
 
+  // Pickup tool params
+  let pickupJitter = 30;      // % — randomize sample position within stamp
+  let pickupScatter = 10;     // px — scatter individual pixels
+
+  // Tapering
+  let taperIn = 20;            // % of stroke length for taper in
+  let taperOut = 20;           // % of stroke length for taper out
+  let taperSize = true;        // taper affects size
+  let taperOpacity = true;     // taper affects opacity
+  let strokeTotalDist = 0;     // accumulated distance this stroke
+  let strokeStampCount = 0;    // stamps applied this stroke
+
   // Brush angle
   let brushAngle = 0;          // manual rotation in degrees
   let followDirection = false;  // rotate brush to follow stroke direction
@@ -47,6 +59,10 @@ const PaintEngine = (() => {
   // Smudge pickup buffers
   let pickupR = null, pickupG = null, pickupB = null;
   let hasPickup = false;
+
+  // Pickup tool: marquee-selected pixel stamp
+  let pickupStamp = null;      // { data: ImageData, w, h }
+  let hasPickupStamp = false;
 
   // Brush library
   const brushLibrary = [];
@@ -306,14 +322,19 @@ const PaintEngine = (() => {
     }
 
     // Compute canvas-space bounding box for the brush
-    const margin = tool === 'push' || tool === 'liquify' ? pushDistance :
-                   tool === 'scatter' ? scatterRadius :
-                   tool === 'spread' ? spreadAmount :
-                   tool === 'blend' ? blendKernel : 0;
-    const rx0 = Math.max(0, Math.floor(cx - half - margin));
-    const ry0 = Math.max(0, Math.floor(cy - half - margin));
-    const rx1 = Math.min(canvas.width, Math.ceil(cx + half + margin));
-    const ry1 = Math.min(canvas.height, Math.ceil(cy + half + margin));
+    let margin = tool === 'push' || tool === 'liquify' ? pushDistance :
+                 tool === 'scatter' ? scatterRadius :
+                 tool === 'spread' ? spreadAmount :
+                 tool === 'blend' ? blendKernel : 0;
+    let brushHalfW = half, brushHalfH = half;
+    if (tool === 'pickup' && pickupStamp) {
+      brushHalfW = Math.max(half, pickupStamp.w / 2);
+      brushHalfH = Math.max(half, pickupStamp.h / 2);
+    }
+    const rx0 = Math.max(0, Math.floor(cx - brushHalfW - margin));
+    const ry0 = Math.max(0, Math.floor(cy - brushHalfH - margin));
+    const rx1 = Math.min(canvas.width, Math.ceil(cx + brushHalfW + margin));
+    const ry1 = Math.min(canvas.height, Math.ceil(cy + brushHalfH + margin));
     const rw = rx1 - rx0, rh = ry1 - ry0;
     if (rw <= 0 || rh <= 0) { activeMask = savedMask; return; }
 
@@ -331,8 +352,10 @@ const PaintEngine = (() => {
     const by0 = Math.floor(cy - half) - ry0;
     const bcx = cx - rx0, bcy = cy - ry0;
 
+    strokeStampCount++;
+    const taperMul = getTaperMultiplier();
     const str = strength / 100;
-    const opa = opacity / 100;
+    const opa = (opacity / 100) * (taperOpacity ? taperMul : 1);
 
     switch (tool) {
       case 'smudge':  stampSmudge(src, dst, rw, rh, bcx, bcy, bx0, by0, ms, str * opa); break;
@@ -565,26 +588,97 @@ const PaintEngine = (() => {
     }
   }
 
-  // ── Tool: Pickup (paint with sampled pixels) ──
+  // ── Tool: Pickup (live dynamic pixel brush) ──
+  // The captured stamp is a source texture — when painting, each pixel in the
+  // brush footprint samples from the stamp at a randomized offset, creating
+  // organic strokes that carry the image's dithered texture.
+  let _pickupRng = null;
+
+  function capturePickupStamp(x, y, w, h) {
+    if (!canvas || !ctx) return;
+    const cx = Math.max(0, Math.round(x));
+    const cy = Math.max(0, Math.round(y));
+    const cw = Math.min(Math.round(w), canvas.width - cx);
+    const ch = Math.min(Math.round(h), canvas.height - cy);
+    if (cw <= 0 || ch <= 0) return;
+    pickupStamp = {
+      data: ctx.getImageData(cx, cy, cw, ch),
+      w: cw, h: ch
+    };
+    hasPickupStamp = true;
+  }
+
+  function hasStamp() { return hasPickupStamp; }
+  function getStampSize() { return pickupStamp ? { w: pickupStamp.w, h: pickupStamp.h } : null; }
+
   function stampPickup(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
-    if (!hasPickup) return;
+    if (!hasPickupStamp || !pickupStamp) return;
+    const sw = pickupStamp.w, sh = pickupStamp.h;
+    const sd = pickupStamp.data.data;
+    const half = ms / 2;
+    const jit = pickupJitter / 100;
+    const scat = pickupScatter;
+
+    if (!_pickupRng) _pickupRng = { s: 42 };
+    const rng = () => { _pickupRng.s = (_pickupRng.s * 16807) % 2147483647; return _pickupRng.s / 2147483647; };
+
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
         const a = activeMask[my * ms + mx] * alpha;
         if (a < 0.01) continue;
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
-        const idx = (py * w + px) * 4;
-        const mi = my * ms + mx;
-        // Paint the picked-up color buffer onto canvas
-        dst[idx]     = Math.round(src[idx]     + (pickupR[mi] - src[idx])     * a);
-        dst[idx + 1] = Math.round(src[idx + 1] + (pickupG[mi] - src[idx + 1]) * a);
-        dst[idx + 2] = Math.round(src[idx + 2] + (pickupB[mi] - src[idx + 2]) * a);
+
+        // Map brush position to stamp position with jitter
+        // Base mapping: proportional position within brush → position within stamp
+        let sampleX = (mx / ms) * sw;
+        let sampleY = (my / ms) * sh;
+
+        // Add jitter: randomize sample position within stamp
+        if (jit > 0) {
+          sampleX += (rng() - 0.5) * sw * jit;
+          sampleY += (rng() - 0.5) * sh * jit;
+        }
+
+        // Add pixel scatter
+        if (scat > 0) {
+          sampleX += (rng() - 0.5) * scat;
+          sampleY += (rng() - 0.5) * scat;
+        }
+
+        // Wrap within stamp bounds (tiling the captured texture)
+        sampleX = ((sampleX % sw) + sw) % sw;
+        sampleY = ((sampleY % sh) + sh) % sh;
+
+        // Nearest-neighbor sample from stamp (preserves dither pattern)
+        const si = (Math.floor(sampleY) * sw + Math.floor(sampleX)) * 4;
+        const di = (py * w + px) * 4;
+
+        dst[di]     = Math.round(src[di]     + (sd[si]     - src[di])     * a);
+        dst[di + 1] = Math.round(src[di + 1] + (sd[si + 1] - src[di + 1]) * a);
+        dst[di + 2] = Math.round(src[di + 2] + (sd[si + 2] - src[di + 2]) * a);
       }
     }
   }
 
   // ── Stroke Handling ──
+  // Compute taper multiplier (0-1) based on stroke progress
+  function getTaperMultiplier() {
+    // Use stamp count as proxy for stroke length
+    const count = strokeStampCount;
+    // Taper in: ramp up over first N stamps
+    const inStamps = Math.max(1, Math.round(taperIn / 5));
+    const outStamps = Math.max(1, Math.round(taperOut / 5));
+    let taper = 1;
+    if (taperIn > 0 && count < inStamps) {
+      taper = Math.min(taper, count / inStamps);
+    }
+    // Taper out is harder without knowing total length, so we apply
+    // it retroactively — use velocity-based fade (slower = more taper)
+    // For now we apply taper-in at start; taper-out on endStroke is cosmetic
+    return Math.max(0.05, taper);
+  }
+
   function beginStroke(x, y) {
     if (!canvas) return;
     pushPaintUndo();
@@ -592,9 +686,13 @@ const PaintEngine = (() => {
     lastX = x; lastY = y;
     prevStampX = x; prevStampY = y;
     strokeDirX = 0; strokeDirY = 0;
+    strokeTotalDist = 0;
+    strokeStampCount = 0;
     updateActiveMask();
 
-    if (tool === 'smudge' || tool === 'pickup') initPickup(x, y);
+    // Reset pickup RNG each stroke for varied but reproducible results
+    if (tool === 'pickup') _pickupRng = { s: Math.floor(Math.random() * 2147483646) + 1 };
+    if (tool === 'smudge') initPickup(x, y);
 
     applyStamp(x, y);
   }
@@ -606,6 +704,7 @@ const PaintEngine = (() => {
     const spacingPx = Math.max(1, activeMaskSize * spacing / 100);
 
     if (dist < spacingPx * 0.5) return;
+    strokeTotalDist += dist;
 
     const steps = Math.max(1, Math.ceil(dist / spacingPx));
     for (let i = 1; i <= steps; i++) {
@@ -767,9 +866,15 @@ const PaintEngine = (() => {
   function setSpreadAmount(a) { spreadAmount = Math.max(1, Math.min(100, a)); }
   function setBrushAngle(a) { brushAngle = a % 360; }
   function setFollowDirection(v) { followDirection = !!v; }
+  function setPickupJitter(v) { pickupJitter = Math.max(0, Math.min(100, v)); }
+  function setPickupScatter(v) { pickupScatter = Math.max(0, Math.min(50, v)); }
+  function setTaperIn(v) { taperIn = Math.max(0, Math.min(100, v)); }
+  function setTaperOut(v) { taperOut = Math.max(0, Math.min(100, v)); }
+  function setTaperSize(v) { taperSize = !!v; }
+  function setTaperOpacity(v) { taperOpacity = !!v; }
 
   function getSettings() {
-    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection };
+    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection, pickupJitter, pickupScatter, taperIn, taperOut, taperSize, taperOpacity };
   }
 
   // ── Brush Thumbnails ──
@@ -831,8 +936,10 @@ const PaintEngine = (() => {
     setSmudgeDecay, setPushDistance, setScatterRadius, setSwirlAngle,
     setLiquifySmooth, setBlendKernel, setSpreadAmount,
     setBrushAngle, setFollowDirection,
+    setPickupJitter, setPickupScatter,
+    setTaperIn, setTaperOut, setTaperSize, setTaperOpacity,
     selectBrush, getBrushes, getSelectedBrush, getBrushThumbnail,
-    addBrush, extractBrushFromImage,
+    addBrush, extractBrushFromImage, capturePickupStamp, hasStamp, getStampSize,
     getSettings, updateActiveMask,
     getBrushCursorURL, invalidateCursorCache
   };

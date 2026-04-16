@@ -171,7 +171,13 @@
           const step = e.shiftKey ? 10 : (current > 50 ? 5 : (current > 20 ? 3 : 1));
           const newSize = e.key === ']' ? Math.min(200, current + step) : Math.max(1, current - step);
           sizeEl.value = newSize;
-          sizeEl.dispatchEvent(new Event('input'));
+          PaintEngine.setSize(newSize);
+          // Update display value
+          const disp = sizeEl.parentElement.querySelector('.param-value');
+          if (disp) disp.textContent = newSize;
+          // Invalidate cursor cache so it redraws at new size
+          PaintEngine.invalidateCursorCache();
+          updateBrushCursorImage();
         }
       }
     }
@@ -293,6 +299,7 @@
   let isPainting = false;
   let spaceHeld = false;
   let brushSelectionMode = false;
+  let pickupSelectionMode = false;
   let panStartX = 0, panStartY = 0;
   let panStartPanX = 0, panStartPanY = 0;
 
@@ -306,8 +313,8 @@
 
   canvasWrapper.addEventListener('mousedown', e => {
     if (e.button !== 0) return;
-    // Brush selection mode intercepts in capture phase — skip here
-    if (brushSelectionMode) return;
+    // Brush/pickup selection mode intercepts in capture phase — skip here
+    if (brushSelectionMode || pickupSelectionMode) return;
     e.preventDefault();
 
     // Paint mode: paintstroke tab active, Space not held, image loaded
@@ -2046,12 +2053,23 @@
   }
 
   // Tool selection
+  function enterPickupMarquee() {
+    if (!DitherEngine.getSourceSize()) return;
+    pickupSelectionMode = true;
+    canvasWrapper.style.cursor = 'crosshair';
+    if (brushCursor) brushCursor.style.display = 'none';
+  }
+
   document.querySelectorAll('.paint-tool-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.paint-tool-btn').forEach(b => b.classList.remove('selected'));
       btn.classList.add('selected');
       PaintEngine.setTool(btn.dataset.tool);
       buildToolOptions(btn.dataset.tool);
+      // Auto-enter marquee mode when selecting pickup without a stamp
+      if (btn.dataset.tool === 'pickup' && !PaintEngine.hasStamp()) {
+        enterPickupMarquee();
+      }
     });
   });
 
@@ -2067,10 +2085,17 @@
     });
   }
 
-  paintSlider('paint-size', v => PaintEngine.setSize(v));
+  paintSlider('paint-size', v => { PaintEngine.setSize(v); PaintEngine.invalidateCursorCache(); updateBrushCursorImage(); });
   paintSlider('paint-spacing', v => PaintEngine.setSpacing(v));
   paintSlider('paint-strength', v => PaintEngine.setStrength(v));
   paintSlider('paint-opacity', v => PaintEngine.setOpacity(v));
+  paintSlider('paint-taper-in', v => PaintEngine.setTaperIn(v));
+  paintSlider('paint-taper-out', v => PaintEngine.setTaperOut(v));
+
+  const taperOpacityCheck = $('paint-taper-opacity');
+  if (taperOpacityCheck) {
+    taperOpacityCheck.addEventListener('change', () => PaintEngine.setTaperOpacity(taperOpacityCheck.checked));
+  }
 
   // Tool-specific options panel
   function buildToolOptions(tool) {
@@ -2087,10 +2112,51 @@
       ],
       blend: [{ label: 'Kernel', id: 'blend-kern', min: 1, max: 20, value: PaintEngine.getSettings().blendKernel, setter: v => PaintEngine.setBlendKernel(v) }],
       spread: [{ label: 'Amount', id: 'spread-amt', min: 1, max: 100, value: PaintEngine.getSettings().spreadAmount, setter: v => PaintEngine.setSpreadAmount(v) }],
-      pickup: []
+      pickup: 'custom'
     };
 
     const opts = toolOpts[tool] || [];
+
+    // Pickup tool: custom UI
+    if (opts === 'custom' && tool === 'pickup') {
+      const hasStamp = PaintEngine.hasStamp();
+      const stampSize = PaintEngine.getStampSize();
+      const settings = PaintEngine.getSettings();
+      container.innerHTML = `
+        <div class="param-group">
+          <button id="btn-pickup-select" class="btn-small">${hasStamp ? 'Re-select Pixels' : 'Select Pixels from Canvas'}</button>
+          ${hasStamp && stampSize ? `<span class="param-label" style="font-size:10px;opacity:0.6;margin-top:4px">${stampSize.w}×${stampSize.h}px captured — drag to paint</span>` : '<span class="param-label" style="font-size:10px;opacity:0.6;margin-top:4px">Draw a rectangle on the canvas to pick up pixels</span>'}
+        </div>
+        <div class="param-group">
+          <span class="param-label">Jitter</span>
+          <div class="slider-row">
+            <input type="range" id="tool-opt-pickup-jitter" min="0" max="100" step="1" value="${settings.pickupJitter}">
+            <span class="param-value">${settings.pickupJitter}</span>
+          </div>
+        </div>
+        <div class="param-group">
+          <span class="param-label">Scatter</span>
+          <div class="slider-row">
+            <input type="range" id="tool-opt-pickup-scatter" min="0" max="50" step="1" value="${settings.pickupScatter}">
+            <span class="param-value">${settings.pickupScatter}</span>
+          </div>
+        </div>
+      `;
+      $('btn-pickup-select').addEventListener('click', () => enterPickupMarquee());
+      const jitterEl = $('tool-opt-pickup-jitter');
+      const scatterEl = $('tool-opt-pickup-scatter');
+      if (jitterEl) jitterEl.addEventListener('input', () => {
+        PaintEngine.setPickupJitter(parseInt(jitterEl.value));
+        jitterEl.parentElement.querySelector('.param-value').textContent = jitterEl.value;
+      });
+      if (scatterEl) scatterEl.addEventListener('input', () => {
+        PaintEngine.setPickupScatter(parseInt(scatterEl.value));
+        scatterEl.parentElement.querySelector('.param-value').textContent = scatterEl.value;
+      });
+      return;
+    }
+
+    if (typeof opts === 'string') return;
     for (const opt of opts) {
       const step = opt.step || 1;
       const dispVal = step < 1 ? parseFloat(opt.value).toFixed(1) : opt.value;
@@ -2180,9 +2246,9 @@
     if (brushCursor) brushCursor.style.display = 'none';
   });
 
-  // Override mousedown to intercept marquee selection
+  // Override mousedown to intercept marquee selection (brush maker OR pickup)
   canvasWrapper.addEventListener('mousedown', e => {
-    if (brushSelectionMode && e.button === 0) {
+    if ((brushSelectionMode || pickupSelectionMode) && e.button === 0) {
       e.preventDefault();
       e.stopPropagation();
       marqueeActive = true;
@@ -2213,7 +2279,9 @@
     if (marqueeActive) {
       marqueeActive = false;
       brushMarquee.style.display = 'none';
+      const wasPickup = pickupSelectionMode;
       brushSelectionMode = false;
+      pickupSelectionMode = false;
       canvasWrapper.style.cursor = activeTab === 'paintstroke' ? 'none' : '';
       if (activeTab === 'paintstroke' && brushCursor) brushCursor.style.display = 'block';
 
@@ -2236,7 +2304,15 @@
 
       if (cw < 2 || ch < 2) return;
 
-      // Capture the canvas pixels in that rect
+      // Pickup tool: capture raw pixels as stamp
+      if (wasPickup) {
+        PaintEngine.capturePickupStamp(cx, cy, cw, ch);
+        // Update tool options to show stamp info
+        buildToolOptions('pickup');
+        return;
+      }
+
+      // Brush maker: capture for threshold processing
       _brushMakerSourceData = ctx.getImageData(cx, cy, cw, ch);
       _brushMakerName = 'Canvas Brush ' + (PaintEngine.getBrushes().length + 1);
 
@@ -2259,27 +2335,49 @@
     $('brush-maker-threshold-val').textContent = th;
     $('brush-maker-softness-val').textContent = sf;
 
-    // extractBrushFromImage expects threshold 0-100 scale
-    const thNorm = th / 255 * 100;
-    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, thNorm, sf, inv);
+    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, th, sf, inv);
     const sz = 128;
-    const scaled = new Float32Array(sz * sz);
     const srcSz = result.size;
+    const srcW = _brushMakerSourceData.width;
+    const srcH = _brushMakerSourceData.height;
+    const srcD = _brushMakerSourceData.data;
     const scale = srcSz / sz;
+
+    // Draw checkerboard first (transparency indicator)
+    const chk = 8;
+    brushMakerCtx.clearRect(0, 0, sz, sz);
+    for (let cy2 = 0; cy2 < sz; cy2 += chk) {
+      for (let cx2 = 0; cx2 < sz; cx2 += chk) {
+        const dark = ((cx2 / chk + cy2 / chk) % 2 === 0);
+        brushMakerCtx.fillStyle = dark ? '#333' : '#555';
+        brushMakerCtx.fillRect(cx2, cy2, chk, chk);
+      }
+    }
+
+    // Overlay source image with computed alpha from mask
+    const img = brushMakerCtx.createImageData(sz, sz);
     for (let y = 0; y < sz; y++) {
       for (let x = 0; x < sz; x++) {
         const sx = Math.min(Math.round(x * scale), srcSz - 1);
         const sy = Math.min(Math.round(y * scale), srcSz - 1);
-        scaled[y * sz + x] = result.mask[sy * srcSz + sx];
+        const alpha = result.mask[sy * srcSz + sx];
+        // Sample source pixel color
+        const sxClamped = Math.min(sx, srcW - 1);
+        const syClamped = Math.min(sy, srcH - 1);
+        const si = (syClamped * srcW + sxClamped) * 4;
+        const idx = (y * sz + x) * 4;
+        img.data[idx]     = srcD[si];
+        img.data[idx + 1] = srcD[si + 1];
+        img.data[idx + 2] = srcD[si + 2];
+        img.data[idx + 3] = Math.round(alpha * 255);
       }
     }
-    const img = brushMakerCtx.createImageData(sz, sz);
-    for (let i = 0; i < sz * sz; i++) {
-      const v = Math.round(scaled[i] * 255);
-      const idx = i * 4;
-      img.data[idx] = v; img.data[idx + 1] = v; img.data[idx + 2] = v; img.data[idx + 3] = 255;
-    }
-    brushMakerCtx.putImageData(img, 0, 0);
+    // Composite over checkerboard
+    const tmpCvs = document.createElement('canvas');
+    tmpCvs.width = sz; tmpCvs.height = sz;
+    const tmpCtx = tmpCvs.getContext('2d');
+    tmpCtx.putImageData(img, 0, 0);
+    brushMakerCtx.drawImage(tmpCvs, 0, 0);
   }
 
   // Live preview on slider change
@@ -2299,8 +2397,7 @@
     const th = parseInt($('brush-maker-threshold').value);
     const sf = parseInt($('brush-maker-softness').value);
     const inv = $('brush-maker-invert').checked;
-    const thNorm = th / 255 * 100;
-    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, thNorm, sf, inv);
+    const result = PaintEngine.extractBrushFromImage(_brushMakerSourceData, th, sf, inv);
     PaintEngine.addBrush(_brushMakerName, result.mask, result.size);
     PaintEngine.selectBrush(PaintEngine.getBrushes().length - 1);
     PaintEngine.invalidateCursorCache();
