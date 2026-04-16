@@ -2328,9 +2328,12 @@
       $('brush-maker-softness').value = 20;
       $('brush-maker-invert').checked = false;
 
-      // Show modal and render preview
-      brushMakerModal.style.display = '';
-      renderBrushMakerPreview();
+      // Show modal after a tick so the browser's click event (which fires
+      // after mouseup) doesn't land on the modal's buttons and close it
+      requestAnimationFrame(() => {
+        brushMakerModal.style.display = '';
+        renderBrushMakerPreview();
+      });
     }
   });
 
