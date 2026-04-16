@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=19">
+  <link rel="stylesheet" href="style.css?v=20">
 </head>
 <body>
   <div id="app">
@@ -345,6 +345,62 @@
               <label class="param-check">
                 <input type="checkbox" id="brush-follow-dir"> Follow stroke direction
               </label>
+              <div class="param-group">
+                <span class="param-label">Shape Influence</span>
+                <div class="slider-row">
+                  <input type="range" id="brush-shape-influence" min="0" max="300" value="150" step="5">
+                  <span class="param-value" data-for="brush-shape-influence">150</span>
+                </div>
+                <div class="param-help">How strongly the brush mask shape modulates per-pixel stroke intensity. Higher = bristles, holes, splatter dots show through the paint.</div>
+              </div>
+            </div>
+
+            <!-- WET PAINT (live evolving stroke) -->
+            <div class="sidebar-section">
+              <div class="section-header"><h2>Wet Paint</h2></div>
+              <div class="param-help" style="margin-bottom:8px;">Previously-painted pixels keep evolving as the stroke continues — paint drips, bleeds, smears, and separates like real wet paint on a digital canvas.</div>
+              <div class="param-group">
+                <span class="param-label">Drip (gravity)</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-wet-drip" min="0" max="100" value="0" step="1">
+                  <span class="param-value" data-for="paint-wet-drip">0</span>
+                </div>
+              </div>
+              <div class="param-group">
+                <span class="param-label">Bleed (capillary)</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-wet-bleed" min="0" max="100" value="0" step="1">
+                  <span class="param-value" data-for="paint-wet-bleed">0</span>
+                </div>
+              </div>
+              <div class="param-group">
+                <span class="param-label">Smear (drag)</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-wet-smear" min="0" max="100" value="0" step="1">
+                  <span class="param-value" data-for="paint-wet-smear">0</span>
+                </div>
+              </div>
+              <div class="param-group">
+                <span class="param-label">Separate (split)</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-wet-separate" min="0" max="100" value="0" step="1">
+                  <span class="param-value" data-for="paint-wet-separate">0</span>
+                </div>
+              </div>
+              <div class="param-group">
+                <span class="param-label">Wetness Lifetime</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-wet-lifetime" min="0" max="100" value="50" step="1">
+                  <span class="param-value" data-for="paint-wet-lifetime">50</span>
+                </div>
+              </div>
+              <div class="param-group">
+                <span class="param-label">Evolve Rate</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-wet-evolve" min="1" max="4" value="1" step="1">
+                  <span class="param-value" data-for="paint-wet-evolve">1</span>
+                </div>
+              </div>
             </div>
 
             <!-- STROKE SETTINGS -->
@@ -585,10 +641,10 @@
     </div>
   </div>
 
-  <script src="dither.js?v=19"></script>
-  <script src="engine.js?v=19"></script>
-  <script src="grain.js?v=19"></script>
-  <script src="paintstroke.js?v=19"></script>
-  <script src="app.js?v=19"></script>
+  <script src="dither.js?v=20"></script>
+  <script src="engine.js?v=20"></script>
+  <script src="grain.js?v=20"></script>
+  <script src="paintstroke.js?v=20"></script>
+  <script src="app.js?v=20"></script>
 </body>
 </html>

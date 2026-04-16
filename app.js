@@ -351,6 +351,7 @@
 
   const brushCursorImg = $('brush-cursor-img');
   let _lastCursorBrush = -1, _lastCursorDisplaySize = 0;
+  let _cursorOverCanvas = false;
 
   function updateBrushCursorImage() {
     if (!brushCursor || !brushCursorImg) return;
@@ -367,9 +368,28 @@
     brushCursor.style.height = displaySize + 'px';
   }
 
+  // Show/hide brush cursor strictly based on whether the mouse is over the
+  // canvas-wrapper (not over sidebars or menus).
+  function updateCursorVisibility() {
+    if (!brushCursor) return;
+    const visible = activeTab === 'paintstroke' && _cursorOverCanvas;
+    brushCursor.style.display = visible ? 'block' : 'none';
+  }
+  if (canvasWrapper) {
+    canvasWrapper.addEventListener('mouseenter', () => {
+      _cursorOverCanvas = true;
+      updateCursorVisibility();
+    });
+    canvasWrapper.addEventListener('mouseleave', () => {
+      _cursorOverCanvas = false;
+      // Don't hide while painting — user could drag off-canvas momentarily
+      if (!isPainting) updateCursorVisibility();
+    });
+  }
+
   document.addEventListener('mousemove', e => {
-    // Update brush cursor position
-    if (activeTab === 'paintstroke' && brushCursor) {
+    // Update brush cursor position only when shown
+    if (activeTab === 'paintstroke' && brushCursor && _cursorOverCanvas) {
       brushCursor.style.left = e.clientX + 'px';
       brushCursor.style.top = e.clientY + 'px';
       updateBrushCursorImage();
@@ -1512,8 +1532,8 @@
       $('tab-dither').style.display = tab === 'dither' ? '' : 'none';
       $('tab-grain').style.display = tab === 'grain' ? '' : 'none';
       $('tab-paintstroke').style.display = tab === 'paintstroke' ? '' : 'none';
-      // Show/hide brush cursor
-      if (brushCursor) brushCursor.style.display = tab === 'paintstroke' ? 'block' : 'none';
+      // Show/hide brush cursor based on tab + canvas hover
+      updateCursorVisibility();
       // Set canvas cursor
       canvasWrapper.style.cursor = tab === 'paintstroke' ? 'none' : '';
     });
@@ -2122,6 +2142,15 @@
   paintSlider('paint-opacity', v => PaintEngine.setOpacity(v));
   paintSlider('paint-taper-in', v => PaintEngine.setTaperIn(v));
   paintSlider('paint-taper-out', v => PaintEngine.setTaperOut(v));
+
+  // Brush shape influence + wet-paint sliders
+  paintSlider('brush-shape-influence', v => PaintEngine.setShapeInfluence(v));
+  paintSlider('paint-wet-drip', v => PaintEngine.setWetDrip(v));
+  paintSlider('paint-wet-bleed', v => PaintEngine.setWetBleed(v));
+  paintSlider('paint-wet-smear', v => PaintEngine.setWetSmear(v));
+  paintSlider('paint-wet-separate', v => PaintEngine.setWetSeparate(v));
+  paintSlider('paint-wet-lifetime', v => PaintEngine.setWetLifetime(v));
+  paintSlider('paint-wet-evolve', v => PaintEngine.setWetEvolveRate(v));
 
   const taperOpacityCheck = $('paint-taper-opacity');
   if (taperOpacityCheck) {

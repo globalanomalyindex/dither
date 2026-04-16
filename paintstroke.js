@@ -90,6 +90,27 @@ const PaintEngine = (() => {
   const brushLibrary = [];
   let selectedBrush = 0;
 
+  // ── Live wet layer ──
+  // Tracks which pixels are still "wet" so they keep evolving (drip, bleed,
+  // smear, spread) as the stroke continues. Each stamp adds wetness within
+  // the brush footprint; an evolution step then applies physical-paint-like
+  // transformations to all wet pixels and decays their wetness.
+  let wetMap = null;        // Float32Array (canvas.w * canvas.h), value 0..1
+  let wetBounds = null;     // {x0,y0,x1,y1} dirty region
+  let wetCanvasW = 0, wetCanvasH = 0;
+
+  // Wet layer params (0..100 scale unless noted)
+  let wetDrip      = 0;     // gravity: wet pixels pull color from above
+  let wetBleed     = 0;     // capillary: averaging with neighbors
+  let wetSmear     = 0;     // continued smear along stroke direction
+  let wetSeparate  = 0;     // separation: pull contrast outward (paint splitting)
+  let wetLifetime  = 50;    // how long wetness persists (50 = balanced)
+  let wetEvolveRate = 1;    // evolution iterations per stamp (subdivides for smoothness)
+
+  // Brush-shape influence (how much the mask shape dominates per-pixel
+  // displacement amplitude; 100 = current, >100 = sharper bristly behavior).
+  let shapeInfluence = 150; // 0..300 percentage
+
   // ── Init ──
   function init(canvasEl) {
     canvas = canvasEl;
@@ -321,6 +342,203 @@ const PaintEngine = (() => {
     return out;
   }
 
+  // ── Wet Layer ──
+  function ensureWetMap() {
+    if (!canvas) return;
+    if (!wetMap || wetCanvasW !== canvas.width || wetCanvasH !== canvas.height) {
+      wetCanvasW = canvas.width; wetCanvasH = canvas.height;
+      wetMap = new Float32Array(wetCanvasW * wetCanvasH);
+      wetBounds = null;
+    }
+  }
+
+  function clearWetMap() {
+    if (wetMap) wetMap.fill(0);
+    wetBounds = null;
+  }
+
+  function wetEnabled() {
+    return wetDrip > 0 || wetBleed > 0 || wetSmear > 0 || wetSeparate > 0;
+  }
+
+  // Mark pixels under the brush footprint as wet. Wetness adds (clamped to 1)
+  // so repeated strokes over the same area remain very wet.
+  function markWet(cx, cy, ms) {
+    if (!wetMap || !wetEnabled()) return;
+    const half = ms / 2;
+    const cw = wetCanvasW, ch = wetCanvasH;
+    const ax0 = Math.floor(cx - half), ay0 = Math.floor(cy - half);
+    let bx0 = Math.max(0, ax0), by0 = Math.max(0, ay0);
+    let bx1 = Math.min(cw, ax0 + ms), by1 = Math.min(ch, ay0 + ms);
+    if (bx0 >= bx1 || by0 >= by1) return;
+    for (let py = by0; py < by1; py++) {
+      const my = py - ay0;
+      for (let px = bx0; px < bx1; px++) {
+        const mx = px - ax0;
+        const a = activeMask[my * ms + mx];
+        if (a < 0.02) continue;
+        const idx = py * cw + px;
+        const v = wetMap[idx] + a * 0.9;
+        wetMap[idx] = v > 1 ? 1 : v;
+      }
+    }
+    if (!wetBounds) wetBounds = { x0: bx0, y0: by0, x1: bx1, y1: by1 };
+    else {
+      if (bx0 < wetBounds.x0) wetBounds.x0 = bx0;
+      if (by0 < wetBounds.y0) wetBounds.y0 = by0;
+      if (bx1 > wetBounds.x1) wetBounds.x1 = bx1;
+      if (by1 > wetBounds.y1) wetBounds.y1 = by1;
+    }
+  }
+
+  // Run one physical-paint evolution pass over the wet bounds. Reads the
+  // current canvas region, computes drip / bleed / smear / separate
+  // displacements weighted by per-pixel wetness, writes back, then decays
+  // wetness and shrinks the dirty rect.
+  function evolveWetLayer() {
+    if (!wetMap || !wetBounds || !wetEnabled() || !ctx) return;
+    const cw = wetCanvasW, ch = wetCanvasH;
+    // Pad bounds by 2 so we can sample neighbors without clamping artifacts
+    const x0 = Math.max(0, wetBounds.x0 - 2);
+    const y0 = Math.max(0, wetBounds.y0 - 2);
+    const x1 = Math.min(cw, wetBounds.x1 + 2);
+    const y1 = Math.min(ch, wetBounds.y1 + 2);
+    const w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0) { wetBounds = null; return; }
+
+    const reg = ctx.getImageData(x0, y0, w, h);
+    const sd = reg.data;
+    // Working copy for read-source while we write back
+    const out = new Uint8ClampedArray(sd);
+
+    const drip      = wetDrip / 100;
+    const bleed     = wetBleed / 100;
+    const smear     = wetSmear / 100;
+    const separate  = wetSeparate / 100;
+    const dirX = smoothDirX, dirY = smoothDirY;
+    const hasDir = (dirX * dirX + dirY * dirY) > 0.001;
+    // Lifetime → decay. lifetime=100 → very slow decay (paint stays wet),
+    // lifetime=0 → fast dry (one frame).
+    const lifeN = wetLifetime / 100;
+    const decay = Math.pow(0.45 + lifeN * 0.5, 1 / Math.max(1, wetEvolveRate));
+    const drySub = (1 - lifeN) * 0.012 + 0.003;
+
+    let nx0 = cw, ny0 = ch, nx1 = 0, ny1 = 0;
+    let anyAlive = false;
+
+    for (let y = 0; y < h; y++) {
+      const gy = y + y0;
+      for (let x = 0; x < w; x++) {
+        const gx = x + x0;
+        const wi = gy * cw + gx;
+        const wet = wetMap[wi];
+        if (wet < 0.015) continue;
+        const di = (y * w + x) * 4;
+        let r = sd[di], g = sd[di+1], b = sd[di+2];
+
+        // DRIP — pull from the pixel above (paint sags downward)
+        if (drip > 0) {
+          const ay = y - 1;
+          if (ay >= 0) {
+            const ai = (ay * w + x) * 4;
+            const m = drip * wet * 0.55;
+            r = r + (sd[ai]   - r) * m;
+            g = g + (sd[ai+1] - g) * m;
+            b = b + (sd[ai+2] - b) * m;
+          }
+        }
+
+        // BLEED — capillary: average with 4-neighbors weighted by wetness
+        if (bleed > 0) {
+          let sr = 0, sg = 0, sb = 0, c = 0;
+          if (x > 0)     { const i = (y*w + x-1)*4;   sr += sd[i]; sg += sd[i+1]; sb += sd[i+2]; c++; }
+          if (x < w - 1) { const i = (y*w + x+1)*4;   sr += sd[i]; sg += sd[i+1]; sb += sd[i+2]; c++; }
+          if (y > 0)     { const i = ((y-1)*w + x)*4; sr += sd[i]; sg += sd[i+1]; sb += sd[i+2]; c++; }
+          if (y < h - 1) { const i = ((y+1)*w + x)*4; sr += sd[i]; sg += sd[i+1]; sb += sd[i+2]; c++; }
+          if (c > 0) {
+            sr /= c; sg /= c; sb /= c;
+            const m = bleed * wet * 0.45;
+            r = r + (sr - r) * m;
+            g = g + (sg - g) * m;
+            b = b + (sb - b) * m;
+          }
+        }
+
+        // SMEAR — continue dragging pixels along the stroke direction
+        if (smear > 0 && hasDir) {
+          const sx = x - dirX * smear * 1.5;
+          const sy = y - dirY * smear * 1.5;
+          const ix = sx < 0 ? 0 : sx > w - 1 ? w - 1 : Math.round(sx);
+          const iy = sy < 0 ? 0 : sy > h - 1 ? h - 1 : Math.round(sy);
+          const si = (iy * w + ix) * 4;
+          const m = smear * wet * 0.5;
+          r = r + (sd[si]   - r) * m;
+          g = g + (sd[si+1] - g) * m;
+          b = b + (sd[si+2] - b) * m;
+        }
+
+        // SEPARATE — paint splitting: amplify local contrast (push toward
+        // brighter or darker neighbor depending on which is closer)
+        if (separate > 0) {
+          // Sample two opposite neighbors along stroke perpendicular
+          let pX, pY;
+          if (hasDir) { pX = -dirY; pY = dirX; }
+          else { pX = 1; pY = 0; }
+          const a1x = x + Math.round(pX * 1), a1y = y + Math.round(pY * 1);
+          const a2x = x - Math.round(pX * 1), a2y = y - Math.round(pY * 1);
+          if (a1x >= 0 && a1x < w && a1y >= 0 && a1y < h &&
+              a2x >= 0 && a2x < w && a2y >= 0 && a2y < h) {
+            const i1 = (a1y * w + a1x) * 4;
+            const i2 = (a2y * w + a2x) * 4;
+            // Push self away from the average toward the more extreme side
+            const avgR = (sd[i1]   + sd[i2])   * 0.5;
+            const avgG = (sd[i1+1] + sd[i2+1]) * 0.5;
+            const avgB = (sd[i1+2] + sd[i2+2]) * 0.5;
+            const m = separate * wet * 0.35;
+            r = r + (r - avgR) * m;
+            g = g + (g - avgG) * m;
+            b = b + (b - avgB) * m;
+          }
+        }
+
+        out[di]     = r < 0 ? 0 : r > 255 ? 255 : r;
+        out[di + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
+        out[di + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+
+        const newWet = wet * decay - drySub;
+        if (newWet > 0.015) {
+          wetMap[wi] = newWet;
+          anyAlive = true;
+          if (gx     < nx0) nx0 = gx;
+          if (gy     < ny0) ny0 = gy;
+          if (gx + 1 > nx1) nx1 = gx + 1;
+          if (gy + 1 > ny1) ny1 = gy + 1;
+        } else {
+          wetMap[wi] = 0;
+        }
+      }
+    }
+
+    reg.data.set(out);
+    ctx.putImageData(reg, x0, y0);
+    wetBounds = anyAlive ? { x0: nx0, y0: ny0, x1: nx1, y1: ny1 } : null;
+  }
+
+  // Run the wet evolution multiple sub-iterations per stamp to keep motion
+  // smooth even at low spacing / fast strokes.
+  function stepWetLayer() {
+    if (!wetEnabled()) return;
+    const iters = Math.max(1, Math.min(4, wetEvolveRate | 0));
+    for (let i = 0; i < iters; i++) evolveWetLayer();
+  }
+
+  // Mask power-shape: amplifies brush-mask contrast so the brush *shape*
+  // dominates per-pixel displacement amplitude. Returns a value in 0..1.
+  function shapedMask(a) {
+    const p = 1 + (shapeInfluence / 100); // 1..4
+    return Math.pow(a, p);
+  }
+
   // ── Stamp Application ──
   function applyStamp(cx, cy) {
     if (!activeMask || !canvas) return;
@@ -402,6 +620,15 @@ const PaintEngine = (() => {
 
     ctx.putImageData(dstData, rx0, ry0);
     activeMask = savedMask;
+
+    // Live wet-layer: mark the just-stamped footprint as wet, then evolve
+    // the entire wet region (so previously-painted pixels keep changing —
+    // dripping, bleeding, smearing — as the stroke continues).
+    if (wetEnabled()) {
+      ensureWetMap();
+      markWet(cx, cy, ms);
+      stepWetLayer();
+    }
   }
 
   // ── Tool: Smudge ──
@@ -409,8 +636,12 @@ const PaintEngine = (() => {
     const decay = smudgeDecay / 100;
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
-        const a = activeMask[my * ms + mx] * alpha;
-        if (a < 0.01) continue;
+        const m0 = activeMask[my * ms + mx];
+        if (m0 < 0.01) continue;
+        // Brush-shape influence: shape per-pixel transfer with the mask
+        // contrast so the brush's actual texture (bristles, stipple, holes)
+        // shows up clearly in the smear.
+        const a = shapedMask(m0) * alpha;
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
         const idx = (py * w + px) * 4;
@@ -463,8 +694,12 @@ const PaintEngine = (() => {
 
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
-        const a = activeMask[my * ms + mx];
-        if (a < 0.01) continue;
+        const m0 = activeMask[my * ms + mx];
+        if (m0 < 0.01) continue;
+        // Per-pixel push amount obeys the brush mask shape — a splatter
+        // brush makes scattered displacement, a flat brush makes a clean
+        // wedge. Power-shaping makes the contrast much stronger.
+        const a = shapedMask(m0);
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
@@ -484,8 +719,11 @@ const PaintEngine = (() => {
     const rad = scatterRadius * alpha;
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
-        const a = activeMask[my * ms + mx];
-        if (a < 0.01) continue;
+        const m0 = activeMask[my * ms + mx];
+        if (m0 < 0.01) continue;
+        // Brush mask amplifies/suppresses scatter intensity per pixel —
+        // sparse-mask brushes (stipple, splatter) produce sparser scatter.
+        const a = shapedMask(m0);
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
@@ -508,8 +746,9 @@ const PaintEngine = (() => {
     const half = ms / 2;
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
-        const a = activeMask[my * ms + mx];
-        if (a < 0.01) continue;
+        const m0 = activeMask[my * ms + mx];
+        if (m0 < 0.01) continue;
+        const a = shapedMask(m0);
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
@@ -538,8 +777,9 @@ const PaintEngine = (() => {
 
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
-        const a = activeMask[my * ms + mx];
-        if (a < 0.01) continue;
+        const m0 = activeMask[my * ms + mx];
+        if (m0 < 0.01) continue;
+        const a = shapedMask(m0);
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
@@ -564,8 +804,9 @@ const PaintEngine = (() => {
     const kr = blendKernel;
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
-        const a = activeMask[my * ms + mx] * alpha;
-        if (a < 0.01) continue;
+        const m0 = activeMask[my * ms + mx];
+        if (m0 < 0.01) continue;
+        const a = shapedMask(m0) * alpha;
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
@@ -601,8 +842,9 @@ const PaintEngine = (() => {
 
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
-        const a = activeMask[my * ms + mx];
-        if (a < 0.01) continue;
+        const m0 = activeMask[my * ms + mx];
+        if (m0 < 0.01) continue;
+        const a = shapedMask(m0);
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
@@ -968,6 +1210,14 @@ const PaintEngine = (() => {
     painting = false;
     strokeCount++;
     hasPickup = false;
+    // Run a few extra wet-evolution iterations after lift so wet pixels
+    // settle / drip a bit before drying — the physical "trail" effect.
+    if (wetEnabled()) {
+      const tail = Math.max(2, Math.min(40, Math.round(wetLifetime / 4)));
+      for (let i = 0; i < tail; i++) evolveWetLayer();
+    }
+    // Force-clear remaining wetness so the next stroke starts dry.
+    clearWetMap();
   }
 
   // ── Undo ──
@@ -985,6 +1235,7 @@ const PaintEngine = (() => {
     const prev = undoStack.pop();
     ctx.putImageData(prev, 0, 0);
     strokeCount = Math.max(0, strokeCount - 1);
+    clearWetMap();
     return true;
   }
 
@@ -993,6 +1244,7 @@ const PaintEngine = (() => {
     strokeCount = 0;
     hasPickup = false;
     baseSnapshot = null;
+    clearWetMap();
   }
 
   // Re-apply paint modifications over a new base image.
@@ -1185,8 +1437,19 @@ const PaintEngine = (() => {
   function setTaperSize(v) { taperSize = !!v; }
   function setTaperOpacity(v) { taperOpacity = !!v; }
 
+  // Wet layer setters
+  function setWetDrip(v)      { wetDrip      = Math.max(0, Math.min(100, v)); }
+  function setWetBleed(v)     { wetBleed     = Math.max(0, Math.min(100, v)); }
+  function setWetSmear(v)     { wetSmear     = Math.max(0, Math.min(100, v)); }
+  function setWetSeparate(v)  { wetSeparate  = Math.max(0, Math.min(100, v)); }
+  function setWetLifetime(v)  { wetLifetime  = Math.max(0, Math.min(100, v)); }
+  function setWetEvolveRate(v){ wetEvolveRate = Math.max(1, Math.min(4, v|0)); }
+
+  // Brush-shape influence setter
+  function setShapeInfluence(v) { shapeInfluence = Math.max(0, Math.min(300, v)); }
+
   function getSettings() {
-    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection, pickupJitter, pickupScatter, pickupCoherence, pickupFiberDensity, pickupFiberLength, pickupFiberFlow, pickupFiberWander, pickupColorVariety, pickupFiberTaper, taperIn, taperOut, taperSize, taperOpacity };
+    return { tool, size, spacing, strength, opacity, smudgeDecay, pushDistance, scatterRadius, swirlAngle, liquifySmooth, blendKernel, spreadAmount, selectedBrush, brushAngle, followDirection, pickupJitter, pickupScatter, pickupCoherence, pickupFiberDensity, pickupFiberLength, pickupFiberFlow, pickupFiberWander, pickupColorVariety, pickupFiberTaper, taperIn, taperOut, taperSize, taperOpacity, wetDrip, wetBleed, wetSmear, wetSeparate, wetLifetime, wetEvolveRate, shapeInfluence };
   }
 
   // ── Brush Thumbnails ──
@@ -1252,6 +1515,8 @@ const PaintEngine = (() => {
     setPickupFiberDensity, setPickupFiberLength, setPickupFiberFlow,
     setPickupFiberWander, setPickupColorVariety, setPickupFiberTaper,
     setTaperIn, setTaperOut, setTaperSize, setTaperOpacity,
+    setWetDrip, setWetBleed, setWetSmear, setWetSeparate,
+    setWetLifetime, setWetEvolveRate, setShapeInfluence,
     selectBrush, getBrushes, getSelectedBrush, getBrushThumbnail,
     addBrush, extractBrushFromImage, capturePickupStamp, hasStamp, getStampSize,
     getSettings, updateActiveMask,
