@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=16">
+  <link rel="stylesheet" href="style.css?v=17">
 </head>
 <body>
   <div id="app">
@@ -230,6 +230,10 @@
               <div class="algo-category-header">Halftone & Screen</div>
               <div class="algorithm-list" data-category="halftone"></div>
             </div>
+            <div class="algo-category" data-cat="image-aware">
+              <div class="algo-category-header">Image-Aware</div>
+              <div class="algorithm-list" data-category="image-aware"></div>
+            </div>
             <div class="algo-category" data-cat="lines">
               <div class="algo-category-header">Lines & Hatching</div>
               <div class="algorithm-list" data-category="lines"></div>
@@ -349,7 +353,7 @@
               <div class="param-group">
                 <span class="param-label">Size</span>
                 <div class="slider-row">
-                  <input type="range" id="paint-size" min="1" max="200" value="30" step="1">
+                  <input type="range" id="paint-size" min="1" max="2000" value="30" step="1">
                   <span class="param-value" data-for="paint-size">30</span>
                 </div>
               </div>
@@ -402,6 +406,22 @@
             <div class="sidebar-section" id="paint-tool-options">
               <div class="section-header"><h2>Tool Options</h2></div>
               <div id="paint-tool-params"></div>
+            </div>
+
+            <!-- LAYER COMPOSITE -->
+            <div class="sidebar-section">
+              <div class="section-header"><h2>Layer</h2></div>
+              <div class="param-group">
+                <span class="param-label">Composite Mode</span>
+                <select id="paint-composite-mode"></select>
+              </div>
+              <div class="param-group">
+                <span class="param-label">Layer Opacity</span>
+                <div class="slider-row">
+                  <input type="range" id="paint-composite-opacity" min="0" max="100" value="100" step="1">
+                  <span class="param-value" data-for="paint-composite-opacity">100</span>
+                </div>
+              </div>
             </div>
 
             <!-- ACTIONS -->
@@ -565,10 +585,10 @@
     </div>
   </div>
 
-  <script src="dither.js?v=16"></script>
-  <script src="engine.js?v=16"></script>
-  <script src="grain.js?v=16"></script>
-  <script src="paintstroke.js?v=16"></script>
-  <script src="app.js?v=16"></script>
+  <script src="dither.js?v=17"></script>
+  <script src="engine.js?v=17"></script>
+  <script src="grain.js?v=17"></script>
+  <script src="paintstroke.js?v=17"></script>
+  <script src="app.js?v=17"></script>
 </body>
 </html>

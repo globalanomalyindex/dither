@@ -168,8 +168,15 @@
         const sizeEl = $('paint-size');
         if (sizeEl) {
           const current = parseInt(sizeEl.value);
-          const step = e.shiftKey ? 10 : (current > 50 ? 5 : (current > 20 ? 3 : 1));
-          const newSize = e.key === ']' ? Math.min(200, current + step) : Math.max(1, current - step);
+          // Tiered step: shift = 10% jumps, otherwise smooth log-ish progression
+          let step;
+          if (e.shiftKey) step = Math.max(10, Math.round(current * 0.15));
+          else if (current > 500) step = 25;
+          else if (current > 200) step = 15;
+          else if (current > 50) step = 5;
+          else if (current > 20) step = 3;
+          else step = 1;
+          const newSize = e.key === ']' ? Math.min(2000, current + step) : Math.max(1, current - step);
           sizeEl.value = newSize;
           PaintEngine.setSize(newSize);
           // Update display value
@@ -256,9 +263,10 @@
         canvas.height = result.height;
         ctx.putImageData(result, 0, 0);
         updateCanvasTransform();
-        // Re-apply paint strokes over the new base
+        // Re-apply paint strokes over the new base, using the configured
+        // composite mode + opacity so paint blends with dither/grain.
         if (hasPaint && paintedState && paintBase) {
-          PaintEngine.applyPaintDelta(paintedState, paintBase);
+          PaintEngine.applyPaintDelta(paintedState, paintBase, paintComposite.mode, paintComposite.opacity);
         }
       }
       state.processing = false;
@@ -611,7 +619,7 @@
 
   // ── Algorithm List ──
   function buildAlgorithmList() {
-    const categories = ['classic', 'ordered', 'halftone', 'lines', 'artistic', 'reconstructive', 'sketch', 'exotic', 'digital', 'effects', 'ascii'];
+    const categories = ['classic', 'ordered', 'halftone', 'image-aware', 'lines', 'artistic', 'reconstructive', 'sketch', 'exotic', 'digital', 'effects', 'ascii'];
     for (const cat of categories) {
       const container = document.querySelector(`.algorithm-list[data-category="${cat}"]`);
       if (!container) continue;
@@ -775,17 +783,7 @@
         <div class="param-group">
           <span class="param-label">Blend Mode</span>
           <select data-algo="${sel.id}" data-param="_blendMode">
-            <option value="normal" ${(sel.params._blendMode||'normal')==='normal'?'selected':''}>Normal</option>
-            <option value="multiply" ${sel.params._blendMode==='multiply'?'selected':''}>Multiply</option>
-            <option value="screen" ${sel.params._blendMode==='screen'?'selected':''}>Screen</option>
-            <option value="overlay" ${sel.params._blendMode==='overlay'?'selected':''}>Overlay</option>
-            <option value="softLight" ${sel.params._blendMode==='softLight'?'selected':''}>Soft Light</option>
-            <option value="hardLight" ${sel.params._blendMode==='hardLight'?'selected':''}>Hard Light</option>
-            <option value="difference" ${sel.params._blendMode==='difference'?'selected':''}>Difference</option>
-            <option value="exclusion" ${sel.params._blendMode==='exclusion'?'selected':''}>Exclusion</option>
-            <option value="darken" ${sel.params._blendMode==='darken'?'selected':''}>Darken</option>
-            <option value="lighten" ${sel.params._blendMode==='lighten'?'selected':''}>Lighten</option>
-            <option value="add" ${sel.params._blendMode==='add'?'selected':''}>Add</option>
+            ${ditherBlendModeOptionsHTML(sel.params._blendMode || 'normal')}
           </select>
         </div>
         <div class="param-group">
@@ -1562,6 +1560,9 @@
 
   const grainLayers = [];
 
+  // ── Paint layer composite (how paint overlay blends onto dither+grain) ──
+  const paintComposite = { mode: 'normal', opacity: 100 };
+
   function defaultGrainParams() {
     return {
       amount: 30, size: 1, roughness: 50, variance: 50, softness: 0,
@@ -1664,6 +1665,29 @@
       item.classList.toggle('selected', si !== -1);
       item.querySelector('.algo-order').textContent = si !== -1 ? `#${si + 1}` : '';
     });
+  }
+
+  // ── Shared Blend Mode option set (used by grain layers, dither pipeline,
+  // and paint layer composite). All modes are routed through the unified
+  // DitherEngine.blendPixel which accepts both hyphen-case and legacy
+  // camelCase names so older saved state keeps working. ──
+  // (forward declared below; defined once and reused everywhere)
+  function normalizeBlendMode(m) {
+    if (!m) return 'normal';
+    const map = { softLight: 'soft-light', hardLight: 'hard-light',
+                  vividLight: 'vivid-light', linearLight: 'linear-light',
+                  pinLight: 'pin-light', hardMix: 'hard-mix',
+                  colorBurn: 'color-burn', linearBurn: 'linear-burn',
+                  colorDodge: 'color-dodge', linearDodge: 'linear-dodge',
+                  add: 'linear-dodge' };
+    return map[m] || m;
+  }
+  function ditherBlendModeOptionsHTML(currentMode) {
+    const cur = normalizeBlendMode(currentMode);
+    return BLEND_MODE_OPTS.map(g =>
+      `<optgroup label="${g.group}">${g.modes.map(([v,l]) =>
+        `<option value="${v}"${cur===v?' selected':''}>${l}</option>`).join('')}</optgroup>`
+    ).join('');
   }
 
   // ── Grain Param Panels ──
@@ -2102,6 +2126,28 @@
   const taperOpacityCheck = $('paint-taper-opacity');
   if (taperOpacityCheck) {
     taperOpacityCheck.addEventListener('change', () => PaintEngine.setTaperOpacity(taperOpacityCheck.checked));
+  }
+
+  // ── Paint layer composite mode + opacity ──
+  const paintCompModeEl = $('paint-composite-mode');
+  if (paintCompModeEl) {
+    paintCompModeEl.innerHTML = BLEND_MODE_OPTS.map(g =>
+      `<optgroup label="${g.group}">${g.modes.map(([v,l]) =>
+        `<option value="${v}"${paintComposite.mode===v?' selected':''}>${l}</option>`).join('')}</optgroup>`
+    ).join('');
+    paintCompModeEl.addEventListener('change', () => {
+      paintComposite.mode = paintCompModeEl.value;
+      runProcess();
+    });
+  }
+  const paintCompOpEl = $('paint-composite-opacity');
+  if (paintCompOpEl) {
+    paintCompOpEl.addEventListener('input', () => {
+      paintComposite.opacity = parseFloat(paintCompOpEl.value);
+      const disp = paintCompOpEl.parentElement.querySelector('.param-value');
+      if (disp) disp.textContent = paintComposite.opacity;
+      runProcess();
+    });
   }
 
   // Tool-specific options panel

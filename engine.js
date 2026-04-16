@@ -231,24 +231,47 @@ const DitherEngine = (() => {
     return Math.max(0, 1 - lockAmount);
   }
 
-  // ── Blend Modes ──
+  // ── Blend Modes (full 22-mode set, shared with grain) ──
+  // a = base (0-255), b = top (0-255). Accepts both camelCase (legacy) and hyphen-case names.
+  function clamp01b(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
   function blendPixel(a, b, mode) {
     const an = a / 255, bn = b / 255;
     let r;
     switch (mode) {
+      case 'normal': r = bn; break;
+      case 'dissolve': r = bn; break; // handled at layer level if needed
       case 'multiply': r = an * bn; break;
+      case 'darken': r = Math.min(an, bn); break;
+      case 'color-burn': case 'colorBurn': r = bn <= 0 ? 0 : 1 - clamp01b((1 - an) / bn); break;
+      case 'linear-burn': case 'linearBurn': r = an + bn - 1; break;
       case 'screen': r = 1 - (1 - an) * (1 - bn); break;
+      case 'lighten': r = Math.max(an, bn); break;
+      case 'color-dodge': case 'colorDodge': r = bn >= 1 ? 1 : clamp01b(an / (1 - bn)); break;
+      case 'linear-dodge': case 'linearDodge': case 'add': r = an + bn; break;
       case 'overlay': r = an < 0.5 ? 2 * an * bn : 1 - 2 * (1 - an) * (1 - bn); break;
-      case 'softLight': r = bn < 0.5 ? an - (1 - 2 * bn) * an * (1 - an) : an + (2 * bn - 1) * (an < 0.25 ? ((16 * an - 12) * an + 4) * an : Math.sqrt(an) - an); break;
-      case 'hardLight': r = bn < 0.5 ? 2 * an * bn : 1 - 2 * (1 - an) * (1 - bn); break;
+      case 'soft-light': case 'softLight':
+        r = bn < 0.5 ? an - (1 - 2 * bn) * an * (1 - an)
+                     : an + (2 * bn - 1) * (an < 0.25 ? ((16 * an - 12) * an + 4) * an : Math.sqrt(an) - an); break;
+      case 'hard-light': case 'hardLight':
+        r = bn < 0.5 ? 2 * an * bn : 1 - 2 * (1 - an) * (1 - bn); break;
+      case 'vivid-light': case 'vividLight':
+        r = bn <= 0.5 ? (bn <= 0 ? 0 : 1 - clamp01b((1 - an) / (2 * bn)))
+                      : (bn >= 1 ? 1 : clamp01b(an / (2 * (1 - bn)))); break;
+      case 'linear-light': case 'linearLight': r = an + 2 * bn - 1; break;
+      case 'pin-light': case 'pinLight':
+        r = bn < 0.5 ? Math.min(an, 2 * bn) : Math.max(an, 2 * bn - 1); break;
+      case 'hard-mix': case 'hardMix': r = (an + bn >= 1) ? 1 : 0; break;
       case 'difference': r = Math.abs(an - bn); break;
       case 'exclusion': r = an + bn - 2 * an * bn; break;
-      case 'darken': r = Math.min(an, bn); break;
-      case 'lighten': r = Math.max(an, bn); break;
-      case 'add': r = Math.min(1, an + bn); break;
+      case 'subtract': r = an - bn; break;
+      case 'divide': r = bn <= 0 ? 1 : clamp01b(an / bn); break;
+      case 'luminosity': r = bn; break; // simplified
+      case 'negation': r = 1 - Math.abs(1 - an - bn); break;
+      case 'reflect': r = bn >= 1 ? 1 : clamp01b(an * an / (1 - bn)); break;
+      case 'glow': r = an >= 1 ? 1 : clamp01b(bn * bn / (1 - an)); break;
       default: r = bn; break;
     }
-    return r * 255;
+    return clamp01b(r) * 255;
   }
 
   // ── Main Process ──
@@ -657,7 +680,7 @@ const DitherEngine = (() => {
 
   return {
     loadImage, getSourceSize, bake, bakeImageData, process, exportFullSize, exportWithOptions, exportImageData,
-    hexToRgb, rgbToHex, clampByte,
+    hexToRgb, rgbToHex, clampByte, blendPixel,
     getPalettePresets, getPalette, extractPalette, medianCut, nearestColor
   };
 })();

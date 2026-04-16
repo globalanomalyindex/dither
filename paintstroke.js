@@ -1008,8 +1008,11 @@ const PaintEngine = (() => {
     return false; // caller handles this via reapplyPaintDelta
   }
 
-  // Apply a pre-computed paint delta onto the current canvas
-  function applyPaintDelta(paintedData, baseData) {
+  // Apply a pre-computed paint delta onto the current canvas, optionally
+  // using a blend mode + opacity so the paint layer composites with the
+  // newly-rendered dither/grain base. blendMode/opacity default to "normal"
+  // / 100 which preserves the original behavior (paint replaces base).
+  function applyPaintDelta(paintedData, baseData, blendMode, opacity) {
     if (!canvas || !paintedData || !baseData) return;
     const newBase = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const nb = newBase.data;
@@ -1018,13 +1021,24 @@ const PaintEngine = (() => {
     const len = nb.length;
     // If canvas size changed, can't re-apply
     if (pd.length !== len || bd.length !== len) return;
+    const mode = blendMode || 'normal';
+    const op = (opacity == null ? 100 : opacity) / 100;
+    const blendFn = (typeof DitherEngine !== 'undefined' && DitherEngine.blendPixel) ? DitherEngine.blendPixel : null;
+    const useBlend = mode !== 'normal' && blendFn;
     for (let i = 0; i < len; i += 4) {
-      // Check if this pixel was modified by paint
-      if (pd[i] !== bd[i] || pd[i+1] !== bd[i+1] || pd[i+2] !== bd[i+2]) {
-        nb[i]   = pd[i];
-        nb[i+1] = pd[i+1];
-        nb[i+2] = pd[i+2];
+      // Was this pixel actually modified by paint?
+      if (pd[i] === bd[i] && pd[i+1] === bd[i+1] && pd[i+2] === bd[i+2]) continue;
+      let r, g, b;
+      if (useBlend) {
+        r = blendFn(nb[i],   pd[i],   mode);
+        g = blendFn(nb[i+1], pd[i+1], mode);
+        b = blendFn(nb[i+2], pd[i+2], mode);
+      } else {
+        r = pd[i]; g = pd[i+1]; b = pd[i+2];
       }
+      nb[i]   = nb[i]   + (r - nb[i])   * op;
+      nb[i+1] = nb[i+1] + (g - nb[i+1]) * op;
+      nb[i+2] = nb[i+2] + (b - nb[i+2]) * op;
     }
     ctx.putImageData(newBase, 0, 0);
     // Update base snapshot to current new base (so future diffs work)
@@ -1140,7 +1154,7 @@ const PaintEngine = (() => {
   // ── Settings ──
   function setTool(t) { tool = t; }
   function setSize(s) {
-    size = Math.max(1, Math.min(500, s));
+    size = Math.max(1, Math.min(2000, s));
     updateActiveMask();
     // Invalidate fiber set so it rebuilds at the right density next stroke
     pickupFibers = null;

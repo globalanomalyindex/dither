@@ -3006,5 +3006,384 @@ const DitherAlgorithms = (() => {
     return o;
   }});
 
+  // ═══════════════════════════════════════════
+  // CLASSIC EXTENSIONS (2 — Riemersma, Ostromoukhov)
+  // ═══════════════════════════════════════════
+
+  // Hilbert curve walk — produces (x,y) sequence for any rect (clamps to fit
+  // a power-of-2 covering). Used by Riemersma dither.
+  function* hilbertWalk(w, h) {
+    const order = Math.ceil(Math.log2(Math.max(w, h)));
+    const N = 1 << order;
+    function rot(n, x, y, rx, ry) {
+      if (ry === 0) {
+        if (rx === 1) { x = n - 1 - x; y = n - 1 - y; }
+        return [y, x];
+      }
+      return [x, y];
+    }
+    for (let d = 0; d < N * N; d++) {
+      let x = 0, y = 0, t = d;
+      for (let s = 1; s < N; s *= 2) {
+        const rx = 1 & (t / 2);
+        const ry = 1 & (t ^ rx);
+        [x, y] = rot(s, x, y, rx, ry);
+        x += s * rx; y += s * ry;
+        t = Math.floor(t / 4);
+      }
+      if (x < w && y < h) yield [x, y];
+    }
+  }
+
+  A.push({ id:'riemersma', name:'Riemersma (Hilbert)', category:'classic', params:[
+    {id:'historySize',label:'History',min:4,max:32,step:1,default:16},
+    {id:'decay',label:'Decay',min:.05,max:.4,step:.01,default:.16},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    const buf = new Float32Array(px);
+    const N = p.historySize;
+    const history = new Float32Array(N);
+    const weights = new Float32Array(N);
+    // exponential weights: latest sample has the largest weight, sums to 1
+    let wsum = 0;
+    for (let i = 0; i < N; i++) {
+      weights[i] = Math.exp(-p.decay * (N - 1 - i));
+      wsum += weights[i];
+    }
+    for (let i = 0; i < N; i++) weights[i] /= wsum;
+    let head = 0;
+    for (const [x, y] of hilbertWalk(w, h)) {
+      const i = y * w + x;
+      let v = buf[i];
+      if (p.gamma !== 1) v = Math.pow(Math.max(0, v) / 255, p.gamma) * 255;
+      // accumulated diffused error from history
+      let acc = 0;
+      for (let k = 0; k < N; k++) acc += history[k] * weights[k];
+      v += acc;
+      const nv = v > p.threshold ? 255 : 0;
+      const err = v - nv;
+      // push error into history (newest at head)
+      history[head] = err;
+      head = (head + 1) % N;
+      o[i] = p.invert ? 255 - nv : nv;
+    }
+    return o;
+  }});
+
+  // Ostromoukhov variable-coefficient Floyd-Steinberg.
+  // Coefficients vary per intensity level (3 weights per row, /sum)
+  const OSTRO = (() => {
+    // Compact 16-entry table interpolated to 256.
+    // Source pattern: Ostromoukhov 2001 "A Simple and Efficient Error-Diffusion Algorithm"
+    const seed = [
+      [13,0,5],[1,0,0],[7,3,5],[5,3,2],[4,2,3],[10,6,7],[7,3,4],[8,4,5],
+      [11,5,6],[5,2,3],[7,3,4],[6,3,3],[5,2,3],[7,3,4],[1,0,1],[7,3,5]
+    ];
+    const T = new Array(256);
+    for (let i = 0; i < 256; i++) {
+      const f = i / 16, lo = Math.min(15, Math.floor(f)), hi = Math.min(15, lo + 1), t = f - lo;
+      const a = seed[lo], b = seed[hi];
+      const r = a[0]*(1-t) + b[0]*t;
+      const dl = a[1]*(1-t) + b[1]*t;
+      const d = a[2]*(1-t) + b[2]*t;
+      const s = r + dl + d || 1;
+      T[i] = [r/s, dl/s, d/s];
+    }
+    return T;
+  })();
+
+  A.push({ id:'ostromoukhov', name:'Ostromoukhov', category:'classic', params:[
+    {id:'strength',label:'Diffusion',min:0,max:1,step:.01,default:1},
+    {id:'serpentine',label:'Serpentine',type:'checkbox',default:true},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'noise',label:'Noise',min:0,max:60,step:1,default:0},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h), buf = new Float32Array(px);
+    const r = p.noise > 0 ? mkRand(p.seed) : null;
+    for (let y = 0; y < h; y++) {
+      const ltr = !p.serpentine || (y % 2 === 0);
+      const sx = ltr ? 0 : w-1, ex = ltr ? w : -1, dx = ltr ? 1 : -1;
+      for (let x = sx; x !== ex; x += dx) {
+        const i = y*w+x;
+        let v = clamp(buf[i]);
+        if (p.gamma !== 1) v = Math.pow(v/255, p.gamma) * 255;
+        if (r) v = clamp(v + (r() - 0.5) * p.noise * 2);
+        const idx = Math.max(0, Math.min(255, Math.round(v)));
+        const nv = v > p.threshold ? 255 : 0;
+        o[i] = nv;
+        const err = (v - nv) * p.strength;
+        const [wr, wdl, wd] = OSTRO[idx];
+        const xr = x + (ltr ? 1 : -1);
+        const xl = x + (ltr ? -1 : 1);
+        if (xr >= 0 && xr < w)            buf[y*w + xr]     += err * wr;
+        if (y + 1 < h && xl >= 0 && xl < w) buf[(y+1)*w + xl] += err * wdl;
+        if (y + 1 < h)                    buf[(y+1)*w + x]   += err * wd;
+      }
+    }
+    return o;
+  }});
+
+  // ═══════════════════════════════════════════
+  // IMAGE-AWARE (5) — algorithms that read edges/gradients/luminance
+  // and let those features steer the dithering / hatching.
+  // ═══════════════════════════════════════════
+
+  // Helper: build sobel magnitude + gradient angle fields once.
+  function gradientFields(px, w, h) {
+    const mag = new Float32Array(w * h);
+    const ang = new Float32Array(w * h);
+    let maxMag = 0;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = y*w + x;
+        const tl = px[i-w-1], t = px[i-w], tr = px[i-w+1];
+        const l  = px[i-1],            r  = px[i+1];
+        const bl = px[i+w-1], b = px[i+w], br = px[i+w+1];
+        const gx = (tr + 2*r + br) - (tl + 2*l + bl);
+        const gy = (bl + 2*b + br) - (tl + 2*t + tr);
+        const m = Math.sqrt(gx*gx + gy*gy);
+        mag[i] = m; ang[i] = Math.atan2(gy, gx);
+        if (m > maxMag) maxMag = m;
+      }
+    }
+    if (maxMag > 0) for (let k = 0; k < mag.length; k++) mag[k] /= maxMag;
+    return { mag, ang, maxMag };
+  }
+
+  // 1) Edge-Aware Floyd-Steinberg — diffusion strength scales with edges so
+  // sharp boundaries stay crisp while flat areas get full diffusion.
+  A.push({ id:'edge-aware-fs', name:'Edge-Aware Floyd-Steinberg', category:'image-aware', params:[
+    {id:'baseStrength',label:'Base Diffusion',min:0,max:1,step:.01,default:1},
+    {id:'edgeStrength',label:'Edge Bias',min:-1,max:1,step:.05,default:-.7,
+     hint:'negative = preserve edges, positive = enhance diffusion at edges'},
+    {id:'edgeRadius',label:'Edge Smoothing',min:0,max:5,step:1,default:1},
+    {id:'serpentine',label:'Serpentine',type:'checkbox',default:true},
+    {id:'threshold',label:'Threshold',min:0,max:255,step:1,default:128},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h), buf = new Float32Array(px);
+    const { mag } = gradientFields(px, w, h);
+    // Optional smoothing of edge field with a small box blur
+    let edgeField = mag;
+    if (p.edgeRadius > 0) {
+      const er = p.edgeRadius, tmp = new Float32Array(w*h), out2 = new Float32Array(w*h);
+      const k = er * 2 + 1;
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let s = 0; for (let dx = -er; dx <= er; dx++) {
+          const xx = Math.min(w-1, Math.max(0, x+dx)); s += mag[y*w+xx];
+        } tmp[y*w+x] = s/k;
+      }
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let s = 0; for (let dy = -er; dy <= er; dy++) {
+          const yy = Math.min(h-1, Math.max(0, y+dy)); s += tmp[yy*w+x];
+        } out2[y*w+x] = s/k;
+      }
+      edgeField = out2;
+    }
+    const matrix = [[1,0,7/16],[-1,1,3/16],[0,1,5/16],[1,1,1/16]];
+    for (let y = 0; y < h; y++) {
+      const ltr = !p.serpentine || (y % 2 === 0);
+      const sx = ltr ? 0 : w-1, ex = ltr ? w : -1, dx = ltr ? 1 : -1;
+      for (let x = sx; x !== ex; x += dx) {
+        const i = y*w+x;
+        let v = clamp(buf[i]);
+        if (p.gamma !== 1) v = Math.pow(v/255, p.gamma) * 255;
+        const nv = v > p.threshold ? 255 : 0;
+        o[i] = nv;
+        const e = edgeField[i]; // 0-1
+        const localStr = Math.max(0, Math.min(2, p.baseStrength * (1 + p.edgeStrength * e)));
+        const err = (v - nv) * localStr;
+        for (const [mdx, mdy, mw] of matrix) {
+          const nx = x + (ltr ? mdx : -mdx), ny = y + mdy;
+          if (nx >= 0 && nx < w && ny >= 0 && ny < h) buf[ny*w+nx] += err * mw;
+        }
+      }
+    }
+    return o;
+  }});
+
+  // 2) Structure-Tensor Hatching — strokes oriented along the dominant
+  // local gradient direction (perpendicular = isophote tangent).
+  A.push({ id:'structure-hatch', name:'Structure-Tensor Hatch', category:'image-aware', params:[
+    {id:'spacing',label:'Stroke Spacing',min:2,max:20,step:1,default:5},
+    {id:'length',label:'Stroke Length',min:3,max:40,step:1,default:12},
+    {id:'thickness',label:'Thickness',min:1,max:4,step:1,default:1},
+    {id:'follow',label:'Follow Edges',min:0,max:1,step:.05,default:1,
+     hint:'1 = strokes follow gradient, 0 = horizontal hatching'},
+    {id:'darkBias',label:'Dark Bias',min:0,max:2,step:.05,default:1,
+     hint:'how strongly tone affects stroke density'},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    o.fill(p.invert ? 0 : 255);
+    const { mag, ang } = gradientFields(px, w, h);
+    const sp = p.spacing, len = p.length, th = p.thickness;
+    for (let y = 0; y < h; y += sp) for (let x = 0; x < w; x += sp) {
+      const i = y*w+x;
+      let v = clamp(px[i])/255;
+      if (p.gamma !== 1) v = Math.pow(v, p.gamma);
+      // Probability of placing a stroke here based on darkness * darkBias
+      const density = Math.pow(1 - v, p.darkBias);
+      if (density < 0.05) continue;
+      // Stroke direction = isophote tangent = perpendicular to gradient
+      const a = ang[i] || 0;
+      const baseAng = a + Math.PI / 2;
+      const dirAng = baseAng * p.follow; // 0 = horizontal, 1 = full follow
+      const dxs = Math.cos(dirAng), dys = Math.sin(dirAng);
+      const half = (len * density) / 2;
+      const ink = p.invert ? 255 : 0;
+      for (let t = -half; t <= half; t += 0.5) {
+        const sx = Math.round(x + t * dxs), sy = Math.round(y + t * dys);
+        if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+        for (let dty = -Math.floor(th/2); dty <= Math.floor(th/2); dty++)
+          for (let dtx = -Math.floor(th/2); dtx <= Math.floor(th/2); dtx++) {
+            const fx = sx + dtx, fy = sy + dty;
+            if (fx >= 0 && fx < w && fy >= 0 && fy < h) o[fy*w+fx] = ink;
+          }
+      }
+    }
+    return o;
+  }});
+
+  // 3) Adaptive Halftone — dot size modulated by local variance so detailed
+  // areas get smaller dots (more resolution) and flat areas get larger dots.
+  A.push({ id:'adaptive-halftone', name:'Adaptive Halftone', category:'image-aware', params:[
+    {id:'baseSize',label:'Base Dot Size',min:3,max:24,step:1,default:8},
+    {id:'sizeVariance',label:'Size Adaptation',min:0,max:1,step:.05,default:.6,
+     hint:'how much local detail shrinks dots'},
+    {id:'angle',label:'Angle',min:0,max:90,step:1,default:45},
+    {id:'shape',label:'Shape',type:'select',options:[
+      {value:'circle',label:'Circle'},{value:'diamond',label:'Diamond'},{value:'square',label:'Square'}
+    ],default:'circle'},
+    {id:'softness',label:'Softness',min:0,max:1,step:.05,default:.1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    const { mag } = gradientFields(px, w, h);
+    // Dilate edge field with a local-window mean for variance proxy
+    const winR = 4, winK = (winR*2+1)*(winR*2+1);
+    const variance = new Float32Array(w*h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let s = 0;
+      for (let dy = -winR; dy <= winR; dy++) for (let dx = -winR; dx <= winR; dx++) {
+        const xx = Math.max(0, Math.min(w-1, x+dx));
+        const yy = Math.max(0, Math.min(h-1, y+dy));
+        s += mag[yy*w+xx];
+      }
+      variance[y*w+x] = s / winK;
+    }
+    const ang = p.angle * Math.PI / 180, ca = Math.cos(ang), sa = Math.sin(ang);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      // Local cell size: shrink in detailed regions
+      const localSize = Math.max(2, p.baseSize * (1 - variance[y*w+x] * p.sizeVariance));
+      const rx = x*ca + y*sa, ry = -x*sa + y*ca;
+      const cx = ((rx % localSize) + localSize) % localSize;
+      const cy = ((ry % localSize) + localSize) % localSize;
+      const nx = (cx/localSize - .5)*2, ny2 = (cy/localSize - .5)*2;
+      let d;
+      if (p.shape === 'diamond') d = Math.abs(nx) + Math.abs(ny2);
+      else if (p.shape === 'square') d = Math.max(Math.abs(nx), Math.abs(ny2));
+      else d = Math.sqrt(nx*nx + ny2*ny2);
+      let val = clamp(px[y*w+x]) / 255;
+      if (p.gamma !== 1) val = Math.pow(val, p.gamma);
+      const t = (1 - val) * 1.42;
+      let result;
+      if (p.softness > 0) { const s2 = d - t; result = clamp(128 - s2/p.softness*128); }
+      else result = d < t ? 0 : 255;
+      o[y*w+x] = p.invert ? 255 - result : result;
+    }
+    return o;
+  }});
+
+  // 4) Flow-Field Stipple — stipples placed along streamlines that follow
+  // the image gradient field. Areas with strong direction get coherent
+  // stipple flows; flat areas get isotropic dots.
+  A.push({ id:'flow-stipple', name:'Flow-Field Stipple', category:'image-aware', params:[
+    {id:'density',label:'Density',min:50,max:1500,step:50,default:500,
+     hint:'number of seed points per 100k pixels'},
+    {id:'streamLen',label:'Stream Length',min:2,max:30,step:1,default:10},
+    {id:'streamStep',label:'Step Size',min:.5,max:3,step:.25,default:1},
+    {id:'dotSize',label:'Dot Size',min:1,max:4,step:1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    o.fill(p.invert ? 0 : 255);
+    const { ang } = gradientFields(px, w, h);
+    const ink = p.invert ? 255 : 0;
+    const r = mkRand(p.seed);
+    const nSeeds = Math.round(p.density * (w * h) / 100000);
+    for (let s = 0; s < nSeeds; s++) {
+      let x = r() * w, y = r() * h;
+      // Reject seeds in highlights based on luminance (probabilistic)
+      const sv = clamp(px[Math.floor(y)*w + Math.floor(x)]) / 255;
+      const darkness = 1 - (p.gamma !== 1 ? Math.pow(sv, p.gamma) : sv);
+      if (r() > darkness) continue;
+      // Walk along (and against) the gradient tangent for streamLen steps
+      for (let dir = -1; dir <= 1; dir += 2) {
+        let cx = x, cy = y;
+        for (let k = 0; k < p.streamLen; k++) {
+          const ix = Math.floor(cx), iy = Math.floor(cy);
+          if (ix < 0 || ix >= w || iy < 0 || iy >= h) break;
+          // Stamp dot
+          for (let dy = 0; dy < p.dotSize; dy++) for (let dx = 0; dx < p.dotSize; dx++) {
+            const fx = ix + dx, fy = iy + dy;
+            if (fx >= 0 && fx < w && fy >= 0 && fy < h) o[fy*w+fx] = ink;
+          }
+          // Step along isophote tangent (perpendicular to gradient)
+          const a = (ang[iy*w+ix] || 0) + Math.PI / 2;
+          cx += Math.cos(a) * p.streamStep * dir;
+          cy += Math.sin(a) * p.streamStep * dir;
+        }
+      }
+    }
+    return o;
+  }});
+
+  // 5) Contour Stipple — stipples concentrated on iso-luminance contours
+  // (sharp edges in tone). Like a topographic map of the image.
+  A.push({ id:'contour-stipple', name:'Contour Stipple', category:'image-aware', params:[
+    {id:'levels',label:'Tone Levels',min:3,max:24,step:1,default:8,
+     hint:'number of contour bands'},
+    {id:'density',label:'Stipple Density',min:.1,max:1,step:.05,default:.5},
+    {id:'dotSize',label:'Dot Size',min:1,max:4,step:1,default:1},
+    {id:'gamma',label:'Gamma',min:.2,max:3,step:.05,default:1},
+    {id:'invert',label:'Invert',type:'checkbox',default:false},
+    {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
+  ], apply(px,w,h,p) {
+    const o = new Uint8ClampedArray(w*h);
+    o.fill(p.invert ? 0 : 255);
+    const r = mkRand(p.seed);
+    const ink = p.invert ? 255 : 0;
+    const step = 255 / p.levels;
+    for (let y = 1; y < h-1; y++) for (let x = 1; x < w-1; x++) {
+      const i = y*w+x;
+      let v = clamp(px[i]);
+      if (p.gamma !== 1) v = Math.pow(v/255, p.gamma) * 255;
+      const band = Math.floor(v / step);
+      // Check if any 4-neighbor is in a different band → on contour
+      const bandT = Math.floor(clamp(px[i-w]) / step);
+      const bandB = Math.floor(clamp(px[i+w]) / step);
+      const bandL = Math.floor(clamp(px[i-1]) / step);
+      const bandR = Math.floor(clamp(px[i+1]) / step);
+      const onContour = (band !== bandT) || (band !== bandB) || (band !== bandL) || (band !== bandR);
+      if (onContour && r() < p.density) {
+        for (let dy = 0; dy < p.dotSize; dy++) for (let dx = 0; dx < p.dotSize; dx++) {
+          const fx = x + dx, fy = y + dy;
+          if (fx >= 0 && fx < w && fy >= 0 && fy < h) o[fy*w+fx] = ink;
+        }
+      }
+    }
+    return o;
+  }});
+
   return A;
 })();
