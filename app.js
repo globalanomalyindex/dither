@@ -1524,44 +1524,44 @@
   });
 
   // ── Bake ──
+  // TRUE WYSIWYG: the current canvas pixels become the new source, byte-for-byte.
+  // We never re-run the pipeline at a different resolution, never re-downsample,
+  // never re-render after bake. What you see on screen is exactly what gets baked.
   $('btn-bake').addEventListener('click', () => {
+    if (!canvas.width || !canvas.height) return;
     pushUndo();
-    let result;
-    if (PaintEngine.hasStrokes()) {
-      // Bake canvas pixels directly (includes paint strokes at preview resolution)
-      result = DitherEngine.bakeImageData(ctx.getImageData(0, 0, canvas.width, canvas.height));
-    } else {
-      result = DitherEngine.bake(buildPipeline(), buildGlobals(), grainLayers.length > 0 ? buildAllGrainOpts() : null);
-    }
-    if (result) {
-      $('image-info').textContent = `${result.width} \u00d7 ${result.height} \u2014 baked`;
-      // Reset dither state since edits are now baked in
-      state.selectedAlgorithms = [];
-      state.globals.brightness = 0;
-      state.globals.contrast = 0;
-      state.globals.gamma = 1.0;
-      // WYSIWYG bake: the baked imageData already contains the final RGB pixels
-      // (paint, grain, color tints, all composited). Force colorMode='color'
-      // and reset any dark/light tint so the empty-pipeline render passes
-      // those RGB pixels through verbatim instead of collapsing to grayscale
-      // and re-tinting.
-      state.globals.colorMode = 'color';
-      state.globals.colorDark = '#000000';
-      state.globals.colorLight = '#ffffff';
-      // Reset tone lock (which would also mask the baked pixels)
-      state.globals.toneLock = { shadows: false, midtones: false, highlights: false, shadowMid: 64, midHighlight: 192 };
-      // Reset grain
-      grainLayers.length = 0;
-      updateGrainUI();
-      buildGrainParamPanels();
-      // Reset paint
-      PaintEngine.clearStrokes();
-      updateStrokeCount();
-      syncUIFromState();
-      updateAlgorithmUI();
-      buildParamPanels();
-      runProcess();
-    }
+    // 1. Capture current canvas pixels — this IS the baked image.
+    const snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    // 2. Install those pixels as the new source.
+    const result = DitherEngine.bakeImageData(snapshot);
+    if (!result) return;
+    $('image-info').textContent = `${result.width} \u00d7 ${result.height} \u2014 baked`;
+    // 3. Reset all pipeline state — the baked pixels are the starting point now.
+    state.selectedAlgorithms = [];
+    state.globals.brightness = 0;
+    state.globals.contrast = 0;
+    state.globals.gamma = 1.0;
+    // Force colorMode='color' + neutral dk/lt so when the next slider triggers
+    // a re-render, empty-pipeline+color mode passes the RGB pixels through verbatim.
+    state.globals.colorMode = 'color';
+    state.globals.colorDark = '#000000';
+    state.globals.colorLight = '#ffffff';
+    state.globals.toneLock = { shadows: false, midtones: false, highlights: false, shadowMid: 64, midHighlight: 192 };
+    // Reset grain + paint — they're already composited into the snapshot.
+    grainLayers.length = 0;
+    updateGrainUI();
+    buildGrainParamPanels();
+    PaintEngine.clearStrokes();
+    updateStrokeCount();
+    syncUIFromState();
+    updateAlgorithmUI();
+    buildParamPanels();
+    // 4. Critically: DO NOT call runProcess. The canvas already shows the
+    //    baked pixels and re-rendering risks drift. The next user interaction
+    //    (adding an algo, tweaking a slider) will kick runProcess on the new source.
+    // 5. Belt-and-suspenders: paint the snapshot back over the canvas in case
+    //    syncUIFromState/buildParamPanels triggered anything that redrew.
+    ctx.putImageData(snapshot, 0, 0);
   });
 
   // ── Reset ──
