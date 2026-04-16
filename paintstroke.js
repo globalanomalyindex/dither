@@ -57,6 +57,14 @@ const PaintEngine = (() => {
   let prevStampX = 0, prevStampY = 0;
   let strokeDirX = 0, strokeDirY = 0;
 
+  // Smoothed stroke direction (for stable ribbon orientation)
+  let smoothDirX = 0, smoothDirY = 0;
+
+  // Accumulated stroke distance (texture u-coordinate for ribbon)
+  let pickupStrokeDist = 0;
+  // Random per-stroke offset so consecutive strokes don't sample the same spot
+  let pickupStrokeSeedX = 0, pickupStrokeSeedY = 0;
+
   // Smudge pickup buffers
   let pickupR = null, pickupG = null, pickupB = null;
   let hasPickup = false;
@@ -309,7 +317,17 @@ const PaintEngine = (() => {
     // Compute stroke direction from previous stamp
     const ddx = cx - prevStampX, ddy = cy - prevStampY;
     const ddLen = Math.sqrt(ddx * ddx + ddy * ddy);
-    if (ddLen > 0.1) { strokeDirX = ddx / ddLen; strokeDirY = ddy / ddLen; }
+    if (ddLen > 0.1) {
+      strokeDirX = ddx / ddLen;
+      strokeDirY = ddy / ddLen;
+      // Smoothed direction (exponential moving average) — ribbons stay
+      // stable when the user wiggles
+      const sm = 0.35;
+      smoothDirX = smoothDirX * (1 - sm) + strokeDirX * sm;
+      smoothDirY = smoothDirY * (1 - sm) + strokeDirY * sm;
+      // Advance ribbon u-coordinate by canvas distance traveled
+      pickupStrokeDist += ddLen;
+    }
     prevStampX = cx; prevStampY = cy;
 
     // Apply brush rotation (manual angle + follow direction)
@@ -612,48 +630,79 @@ const PaintEngine = (() => {
   function hasStamp() { return hasPickupStamp; }
   function getStampSize() { return pickupStamp ? { w: pickupStamp.w, h: pickupStamp.h } : null; }
 
+  // Bilinear texture sample with wrapping (smoother than nearest)
+  function sampleStampBilinear(sd, sw, sh, fx, fy) {
+    const x = ((fx % sw) + sw) % sw;
+    const y = ((fy % sh) + sh) % sh;
+    const x0 = Math.floor(x), y0 = Math.floor(y);
+    const x1 = (x0 + 1) % sw, y1 = (y0 + 1) % sh;
+    const tx = x - x0, ty = y - y0;
+    const i00 = (y0 * sw + x0) * 4;
+    const i10 = (y0 * sw + x1) * 4;
+    const i01 = (y1 * sw + x0) * 4;
+    const i11 = (y1 * sw + x1) * 4;
+    const w00 = (1 - tx) * (1 - ty);
+    const w10 = tx * (1 - ty);
+    const w01 = (1 - tx) * ty;
+    const w11 = tx * ty;
+    return [
+      sd[i00]   * w00 + sd[i10]   * w10 + sd[i01]   * w01 + sd[i11]   * w11,
+      sd[i00+1] * w00 + sd[i10+1] * w10 + sd[i01+1] * w01 + sd[i11+1] * w11,
+      sd[i00+2] * w00 + sd[i10+2] * w10 + sd[i01+2] * w01 + sd[i11+2] * w11
+    ];
+  }
+
+  // Continuous-ribbon pickup engine.
+  // The brush footprint samples the captured stamp in a stroke-aligned
+  // coordinate system: u = along stroke (continuously advancing with stroke
+  // distance, creating the illusion of a long paint mark being drawn out),
+  // v = perpendicular to stroke. Texture tiles seamlessly. Block-based
+  // jitter (coherence) controls noise vs. solid-streak character.
   function stampPickup(src, dst, w, h, cx, cy, bx0, by0, ms, alpha) {
     if (!hasPickupStamp || !pickupStamp) return;
     const sw = pickupStamp.w, sh = pickupStamp.h;
     const sd = pickupStamp.data.data;
+    const half = ms / 2;
     const jit = pickupJitter / 100;
     const scat = pickupScatter;
+    const coh = pickupCoherence / 100;
 
     if (!_pickupRng) _pickupRng = { s: 42 };
     const rng = () => { _pickupRng.s = (_pickupRng.s * 16807) % 2147483647; return _pickupRng.s / 2147483647; };
 
-    // Stroke direction
-    const nx = strokeDirX, ny = strokeDirY;
-    const hasDir = Math.abs(nx) > 0.01 || Math.abs(ny) > 0.01;
+    // Stroke axis (smoothed for stable ribbon orientation)
+    let nx = smoothDirX, ny = smoothDirY;
+    const dirMag = Math.sqrt(nx * nx + ny * ny);
+    const hasDir = dirMag > 0.01;
+    if (hasDir) { nx /= dirMag; ny /= dirMag; }
+    else { nx = 1; ny = 0; }
 
-    // Push displacement distance
-    const dist = pushDistance * alpha;
+    // Perpendicular axis (rotate 90° CCW)
+    const perpX = -ny, perpY = nx;
 
-    // Texture scroll: stamp feeds through as you stroke
-    const scrollX = strokeStampCount * nx * (sw / ms) * 1.5;
-    const scrollY = strokeStampCount * ny * (sh / ms) * 1.5;
+    // Texture scale: how stamp dimensions map to canvas pixels.
+    // Stamp is sized to sit comfortably within the brush — width fills
+    // brush diameter perpendicular to stroke, length stretches along stroke
+    // for a paint-ribbon feel.
+    const texScaleV = sh / Math.max(1, ms);          // perpendicular: fit brush
+    const texScaleU = sw / Math.max(1, ms) * 0.6;    // along stroke: stretched (longer feel)
 
-    // Coherence controls the block size for jitter randomization.
-    // At 0: block=1px (every pixel gets its own random offset = noise)
-    // At 100: block=brush size (entire brush shares one offset = solid streak)
-    // In between: groups of pixels share offsets, creating color streaks
-    const coh = pickupCoherence / 100;
+    // Block-coherent jitter: pixels in the same block share offsets.
+    // At coh=0, blockSize=1 → noise; at coh=1, blockSize=ms → solid.
     const blockSize = Math.max(1, Math.round(1 + (ms - 1) * coh * coh));
-
-    // Pre-compute one jitter offset per block (grid of offsets)
     const blocksX = Math.ceil(ms / blockSize);
     const blocksY = Math.ceil(ms / blockSize);
-    const blockOffsetsX = new Float32Array(blocksX * blocksY);
-    const blockOffsetsY = new Float32Array(blocksX * blocksY);
+    const blockJU = new Float32Array(blocksX * blocksY);
+    const blockJV = new Float32Array(blocksX * blocksY);
     for (let i = 0; i < blocksX * blocksY; i++) {
-      blockOffsetsX[i] = (rng() - 0.5) * sw * jit;
-      blockOffsetsY[i] = (rng() - 0.5) * sh * jit;
+      blockJU[i] = (rng() - 0.5) * sw * jit * (1 - coh * 0.7);  // suppress along-stroke jitter at high coh
+      blockJV[i] = (rng() - 0.5) * sh * jit;
     }
 
-    // Perpendicular to stroke for streak elongation at high coherence
-    // Streaks run ALONG stroke direction, noise is suppressed along that axis
-    const perpX = hasDir ? -ny : 0;
-    const perpY = hasDir ? nx : 0;
+    // Strength governs how forcefully the stamp overwrites canvas pixels.
+    // High alpha + center of brush ≈ direct placement (visible push of pixels);
+    // edges fall to soft blend.
+    const opa = Math.max(0, Math.min(1, alpha));
 
     for (let my = 0; my < ms; my++) {
       for (let mx = 0; mx < ms; mx++) {
@@ -662,71 +711,52 @@ const PaintEngine = (() => {
         const px = bx0 + mx, py = by0 + my;
         if (px < 0 || px >= w || py < 0 || py >= h) continue;
 
-        const di = (py * w + px) * 4;
+        // Brush-local coords centered at brush center
+        const relX = mx - half, relY = my - half;
 
-        // --- Sample from stamp texture (generative, scrolling) ---
-        let sampleX = (mx / ms) * sw + scrollX;
-        let sampleY = (my / ms) * sh + scrollY;
+        // Project into stroke coordinate system
+        const u = relX * nx + relY * ny;       // along stroke
+        const v = relX * perpX + relY * perpY; // perpendicular
 
-        // Block-based jitter: pixels in the same block share the same offset
+        // Sample position in stamp space — u flows with stroke distance,
+        // creating a continuous paint ribbon rather than discrete stamps.
+        let sampleX = pickupStrokeSeedX + (pickupStrokeDist + u) * texScaleU;
+        let sampleY = pickupStrokeSeedY + sh / 2 + v * texScaleV;
+
+        // Block-coherent jitter
         if (jit > 0) {
-          const bx = Math.floor(mx / blockSize);
-          const by = Math.floor(my / blockSize);
-          const bi = by * blocksX + bx;
-          // At high coherence, elongate jitter along stroke direction (streaks)
-          // and suppress jitter perpendicular to stroke
-          if (coh > 0.3 && hasDir) {
-            // Project block offset onto stroke-parallel axis (keep) vs perpendicular (suppress)
-            const offX = blockOffsetsX[bi];
-            const offY = blockOffsetsY[bi];
-            // Parallel component (along stroke) — keep full
-            const parDot = offX * nx + offY * ny;
-            // Perpendicular component — suppress based on coherence
-            const perpDot = offX * perpX + offY * perpY;
-            const perpSuppress = 1 - coh * 0.8; // high coherence = kill perp noise
-            sampleX += parDot * nx + perpDot * perpX * perpSuppress;
-            sampleY += parDot * ny + perpDot * perpY * perpSuppress;
-          } else {
-            sampleX += blockOffsetsX[bi];
-            sampleY += blockOffsetsY[bi];
-          }
+          const bxi = Math.floor(mx / blockSize);
+          const byi = Math.floor(my / blockSize);
+          const bi = byi * blocksX + bxi;
+          // Project block jitter into stroke axes
+          sampleX += blockJU[bi];
+          sampleY += blockJV[bi];
         }
 
-        // Per-pixel scatter (reduced by coherence — streaks stay clean)
+        // Per-pixel scatter (suppressed at high coherence)
         if (scat > 0) {
           const scatScale = 1 - coh * 0.7;
           sampleX += (rng() - 0.5) * scat * 2 * scatScale;
           sampleY += (rng() - 0.5) * scat * 2 * scatScale;
         }
 
-        // Wrap within stamp (tiling — infinite texture from finite capture)
-        sampleX = ((sampleX % sw) + sw) % sw;
-        sampleY = ((sampleY % sh) + sh) % sh;
-        const si = (Math.floor(sampleY) * sw + Math.floor(sampleX)) * 4;
+        const [stampR, stampG, stampB] = sampleStampBilinear(sd, sw, sh, sampleX, sampleY);
+        const di = (py * w + px) * 4;
 
-        // Stamp pixel — what the engine is "generating"
-        const stampR = sd[si], stampG = sd[si + 1], stampB = sd[si + 2];
+        // Center of brush = direct pixel placement (you SEE pixels being placed).
+        // Edges = blended (soft falloff into existing canvas).
+        // mask^1.5 sharpens the falloff curve so center feels solid.
+        const w_solid = Math.pow(maskVal, 1.5) * opa;
+        const w_blend = maskVal * opa;
 
-        // --- Push-displaced canvas pixel (what's being shoved) ---
-        let pushR, pushG, pushB;
-        if (hasDir) {
-          const srcX = px - nx * dist * maskVal;
-          const srcY = py - ny * dist * maskVal;
-          [pushR, pushG, pushB] = samplePixel(src, w, h, srcX, srcY);
-        } else {
-          pushR = src[di]; pushG = src[di + 1]; pushB = src[di + 2];
-        }
+        const targetR = stampR * w_solid + (src[di]     * (1 - w_solid));
+        const targetG = stampG * w_solid + (src[di + 1] * (1 - w_solid));
+        const targetB = stampB * w_solid + (src[di + 2] * (1 - w_solid));
 
-        // --- Blend: stamp feeds the push ---
-        const stampWeight = maskVal;
-        const r = stampR * stampWeight + pushR * (1 - stampWeight);
-        const g = stampG * stampWeight + pushG * (1 - stampWeight);
-        const b = stampB * stampWeight + pushB * (1 - stampWeight);
-
-        // Direct pixel placement
-        dst[di]     = Math.round(r);
-        dst[di + 1] = Math.round(g);
-        dst[di + 2] = Math.round(b);
+        // Direct overwrite for solid feel
+        dst[di]     = Math.round(src[di]     + (targetR - src[di])     * w_blend);
+        dst[di + 1] = Math.round(src[di + 1] + (targetG - src[di + 1]) * w_blend);
+        dst[di + 2] = Math.round(src[di + 2] + (targetB - src[di + 2]) * w_blend);
       }
     }
   }
@@ -756,12 +786,20 @@ const PaintEngine = (() => {
     lastX = x; lastY = y;
     prevStampX = x; prevStampY = y;
     strokeDirX = 0; strokeDirY = 0;
+    smoothDirX = 0; smoothDirY = 0;
     strokeTotalDist = 0;
     strokeStampCount = 0;
+    pickupStrokeDist = 0;
     updateActiveMask();
 
     // Reset pickup RNG each stroke for varied but reproducible results
-    if (tool === 'pickup') _pickupRng = { s: Math.floor(Math.random() * 2147483646) + 1 };
+    if (tool === 'pickup') {
+      _pickupRng = { s: Math.floor(Math.random() * 2147483646) + 1 };
+      // Per-stroke seed offset into the texture, so consecutive strokes
+      // don't all start sampling at (0,0)
+      pickupStrokeSeedX = Math.random() * (pickupStamp ? pickupStamp.w : 0);
+      pickupStrokeSeedY = Math.random() * (pickupStamp ? pickupStamp.h : 0);
+    }
     if (tool === 'smudge') initPickup(x, y);
 
     applyStamp(x, y);
@@ -771,7 +809,12 @@ const PaintEngine = (() => {
     if (!painting || !canvas) return;
     const dx = x - lastX, dy = y - lastY;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    const spacingPx = Math.max(1, activeMaskSize * spacing / 100);
+
+    // Pickup uses ultra-tight spacing for a true continuous-ribbon feel.
+    // Other tools use the user-defined spacing.
+    const isPickup = tool === 'pickup';
+    const spacingPct = isPickup ? Math.min(spacing, 8) : spacing;
+    const spacingPx = Math.max(1, activeMaskSize * spacingPct / 100);
 
     if (dist < spacingPx * 0.5) return;
     strokeTotalDist += dist;
