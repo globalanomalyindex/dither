@@ -242,8 +242,14 @@
   // Note: pushUndo is invoked *after* runProcess finishes (see runProcess
   // below) so each snapshot's state and pixels are captured from the same
   // moment — guaranteeing Undo is WYSIWYG.
+  //
+  // Debounce: 120ms is enough to collapse a slider-drag stream without
+  // making tinkering feel laggy. A bigger chunk of the "freeze" users see
+  // comes from synchronous render cost, which is why runProcess below also
+  // yields control via await — dragging a slider now cancels any in-flight
+  // render and kicks off a fresh one with the latest params.
   let processTimer = null;
-  function scheduleProcess(delay = 16) {
+  function scheduleProcess(delay = 120) {
     clearTimeout(processTimer);
     processTimer = setTimeout(() => { runProcess(); }, delay);
   }
@@ -273,10 +279,22 @@
 
   const PREVIEW_MAX = 1200;
 
+  // Cancellation token for the currently-running process. We mutate an
+  // existing token's `.cancelled` flag so in-flight async work sees it
+  // promptly without us having to thread a new arg through every callback.
+  let currentToken = null;
+
   function runProcess() {
-    if (state.processing) return;
     const size = DitherEngine.getSourceSize();
     if (!size) return;
+
+    // If a render is already in flight, cancel it. The async loop inside
+    // DitherEngine.processAsync yields between pipeline steps / color
+    // channels / stroke chunks, so the previous run sees the flag quickly
+    // and bails out — no more "drop the call and ignore the user".
+    if (currentToken) currentToken.cancelled = true;
+    const token = { cancelled: false };
+    currentToken = token;
 
     state.processing = true;
     showProcessing(true);
@@ -291,10 +309,35 @@
     // inside the same rAF that just inserted the overlay into the DOM — the
     // browser never gets a paint tick, so the "Processing…" dialog never
     // shows up until AFTER the work already finished and got removed again.
-    requestAnimationFrame(() => { requestAnimationFrame(() => {
-      let result = DitherEngine.process(buildPipeline(), buildGlobals(), PREVIEW_MAX);
+    requestAnimationFrame(() => { requestAnimationFrame(async () => {
+      // Progressive preview: if the current algorithm supports chunked
+      // rendering, we get intermediate ImageDatas and paint them so the
+      // user sees block-by-block transformation instead of a long freeze.
+      const onProgress = (partial) => {
+        if (token.cancelled) return;
+        if (!partial) return;
+        if (canvas.width !== partial.width || canvas.height !== partial.height) {
+          canvas.width = partial.width;
+          canvas.height = partial.height;
+        }
+        ctx.putImageData(partial, 0, 0);
+      };
+
+      let result;
+      try {
+        const processFn = DitherEngine.processAsync || DitherEngine.process;
+        const ret = processFn(buildPipeline(), buildGlobals(), PREVIEW_MAX, {
+          signal: token, onProgress
+        });
+        result = (ret && typeof ret.then === 'function') ? await ret : ret;
+      } catch (_) { result = null; }
+
+      if (token.cancelled) {
+        // Another runProcess has taken over; leave UI state to them.
+        return;
+      }
+
       if (result) {
-        // Apply grain layers
         if (grainLayers.length > 0) {
           result = GrainEngine.applyGrainLayers(result, buildAllGrainOpts());
         }
@@ -302,16 +345,13 @@
         canvas.height = result.height;
         ctx.putImageData(result, 0, 0);
         updateCanvasTransform();
-        // Re-apply paint strokes over the new base, using the configured
-        // composite mode + opacity so paint blends with dither/grain.
         if (hasPaint && paintedState && paintBase) {
           PaintEngine.applyPaintDelta(paintedState, paintBase, paintComposite.mode, paintComposite.opacity);
         }
       }
       state.processing = false;
+      currentToken = null;
       showProcessing(false);
-      // Capture the final frame for Undo — state + pixels from the same
-      // moment so restoration is pixel-exact.
       pushUndo();
     });});
   }
@@ -1342,10 +1382,44 @@
   function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
   function randomHex() { return '#' + Math.floor(Math.random() * 16777216).toString(16).padStart(6, '0'); }
 
+  // Per-algorithm Dice caps. Some algos have expensive params whose worst-case
+  // combos (e.g. dabCount=40000 + layers=5 + wetStreak=1 + colorVariety=1) can
+  // freeze the page for tens of seconds. Dice picks from full range normally,
+  // but these caps keep rolls inside an "interactive" budget so Dice stays fun
+  // instead of punishing. Also blacklist 'select' options known to be slow.
+  const SAFE_DICE_CAPS = {
+    'palette-knife': {
+      size:         { max: 22 },
+      smear:        { max: 55 },
+      layers:       { max: 2 },
+      wetBleed:     { max: 0.5 },
+      wetSmudge:    { max: 0.55 },
+      wetStreak:    { max: 0.55 },
+      sizeByDetail: { max: 1.1 },
+      colorVariety: { max: 0.6 },
+      intensity:    { max: 2.0 },
+      pressure:     { max: 1.1 }
+    },
+    'impressionism': {
+      dabCount:     { max: 9000 },
+      dabLen:       { max: 30 },
+      dabWidth:     { max: 10 },
+      layers:       { max: 2 },
+      wetBleed:     { max: 0.5 },
+      wetSmudge:    { max: 0.55 },
+      wetStreak:    { max: 0.55 },
+      sizeByDetail: { max: 1.1 },
+      colorVariety: { max: 0.6 },
+      intensity:    { max: 1.8 },
+      scatter:      { max: 12 }
+    }
+  };
+
   function randomizeAlgoParams(algoId) {
     const sel = state.selectedAlgorithms.find(a => a.id === algoId);
     if (!sel) return;
     const algo = DitherAlgorithms.find(a => a.id === algoId);
+    const caps = SAFE_DICE_CAPS[algoId] || {};
     for (const p of algo.params) {
       if (p.type === 'checkbox') {
         sel.params[p.id] = Math.random() > 0.5;
@@ -1353,8 +1427,11 @@
         const opts = p.options;
         sel.params[p.id] = opts[randomInt(0, opts.length - 1)].value;
       } else {
-        const steps = (p.max - p.min) / p.step;
-        sel.params[p.id] = p.min + Math.round(Math.random() * steps) * p.step;
+        const cap = caps[p.id];
+        const min = p.min;
+        const max = cap ? Math.min(p.max, cap.max) : p.max;
+        const steps = Math.max(1, Math.round((max - min) / p.step));
+        sel.params[p.id] = min + Math.round(Math.random() * steps) * p.step;
         sel.params[p.id] = Math.round(sel.params[p.id] * 1000) / 1000;
       }
     }

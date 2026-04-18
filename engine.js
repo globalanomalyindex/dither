@@ -287,6 +287,36 @@ const DitherEngine = (() => {
     return processGrayscaleDither(pipeline, globals, w, h, data);
   }
 
+  // Async variant: same output as `process`, but yields control between
+  // pipeline steps + between R/G/B channels (and also asks the algorithm
+  // itself to yield via applyAsync if supported). Keeps the page responsive
+  // during long renders and supports cancellation + progressive preview.
+  // opts: { signal: { cancelled }, onProgress: (ImageData)=>void }
+  async function processAsync(pipeline, globals, previewMaxDim, opts) {
+    if (!sourceData) return null;
+    const data = previewMaxDim ? getDownsampled(previewMaxDim) : sourceData;
+    if (!data) return null;
+    const w = data.width, h = data.height;
+    const colorMode = globals.colorMode;
+    const signal = (opts && opts.signal) || { cancelled: false };
+    const onProgress = (opts && opts.onProgress) || null;
+
+    if (colorMode === 'color') return processColorDitherAsync(pipeline, globals, w, h, data, signal, onProgress);
+    if (colorMode === 'palette') return processPaletteDitherAsync(pipeline, globals, w, h, data, signal, onProgress);
+    return processGrayscaleDitherAsync(pipeline, globals, w, h, data, signal, onProgress);
+  }
+
+  // Yield helper: lets the browser paint + pump input events between chunks.
+  function yieldTick() { return new Promise(r => setTimeout(r, 0)); }
+
+  // Run a step's apply() — use applyAsync if the algorithm provides one.
+  async function runApply(step, channel, w, h, onStepProgress, signal) {
+    if (step.algorithm.applyAsync) {
+      return await step.algorithm.applyAsync(channel, w, h, step.params, { signal, onProgress: onStepProgress });
+    }
+    return step.algorithm.apply(channel, w, h, step.params);
+  }
+
   function processGrayscaleDither(pipeline, globals, w, h, data) {
     let gray = toGrayscale(data, w, h, globals.grayscaleMode || 'luminance');
     gray = applyPreProcess(gray, globals.brightness, globals.contrast, globals.gamma);
@@ -528,6 +558,300 @@ const DitherEngine = (() => {
     return result;
   }
 
+  // ── Async variants ────────────────────────────────────────────────
+  // These mirror processGrayscaleDither / processColorDither / processPaletteDither
+  // but yield between pipeline steps and between color channels, and call
+  // onProgress with an ImageData render of the current accumulated state so
+  // the user sees block-by-block transformation during long renders.
+
+  async function processGrayscaleDitherAsync(pipeline, globals, w, h, data, signal, onProgress) {
+    let gray = toGrayscale(data, w, h, globals.grayscaleMode || 'luminance');
+    gray = applyPreProcess(gray, globals.brightness, globals.contrast, globals.gamma);
+    const origGray = gray;
+    const toneLock = globals.toneLock;
+    const n = w * h;
+    const dk = globals.colorDark, lt = globals.colorLight;
+
+    const renderGrayToImageData = (buf) => {
+      const out = new ImageData(w, h);
+      const rd = out.data;
+      for (let i = 0; i < n; i++) {
+        const t = clampByte(buf[i]) / 255;
+        const o = i * 4;
+        rd[o]   = dk[0] + (lt[0]-dk[0]) * t;
+        rd[o+1] = dk[1] + (lt[1]-dk[1]) * t;
+        rd[o+2] = dk[2] + (lt[2]-dk[2]) * t;
+        rd[o+3] = 255;
+      }
+      return out;
+    };
+
+    if (pipeline.length === 0) {
+      const result = new ImageData(w, h);
+      for (let i = 0; i < n; i++) {
+        const v = clampByte(gray[i]);
+        result.data[i*4] = result.data[i*4+1] = result.data[i*4+2] = v;
+        result.data[i*4+3] = 255;
+      }
+      return result;
+    }
+
+    let current = new Float32Array(gray);
+
+    for (let pi = 0; pi < pipeline.length; pi++) {
+      if (signal.cancelled) return null;
+      const step = pipeline[pi];
+      const useOrig = step.params._useOriginal || false;
+      const inputData = useOrig ? new Float32Array(origGray) : new Float32Array(current);
+
+      // Intermediate progress preview: feed algorithm's partial outputs
+      // back through the final tone map so the canvas shows real pixels.
+      let lastProgressTs = 0;
+      const onStepProgress = onProgress ? (partialBuf) => {
+        const now = performance.now();
+        if (now - lastProgressTs < 40) return;  // throttle to ~25fps
+        lastProgressTs = now;
+        onProgress(renderGrayToImageData(partialBuf));
+      } : null;
+
+      const dithResult = await runApply(step, inputData, w, h, onStepProgress, signal);
+      if (signal.cancelled) return null;
+
+      const mix = step.params._mix || 0;
+      const inv = step.params._invert || false;
+      const bp = step.params._blackPoint || 0;
+      const wp = step.params._whitePoint === undefined ? 255 : step.params._whitePoint;
+      const hasBWClip = bp > 0 || wp < 255;
+      const feather = step.params._feather === undefined ? 10 : step.params._feather;
+      const edgeMode = step.params._edgeMode || 'soft';
+      const toneResponse = step.params._toneResponse || 0;
+      const blendMode = step.params._blendMode || 'normal';
+
+      const blended = new Float32Array(n);
+      for (let j = 0; j < n; j++) {
+        let v = dithResult[j];
+        if (mix > 0) v = v * (1 - mix) + origGray[j] * mix;
+        if (blendMode !== 'normal') {
+          const base = pi > 0 ? current[j] : origGray[j];
+          v = blendPixel(base, v, blendMode);
+        }
+        let effectAlpha = 1;
+        if (hasBWClip) effectAlpha = calcEdgeAlpha(origGray[j], bp, wp, feather, edgeMode, j);
+        if (toneResponse !== 0) effectAlpha *= calcToneAlpha(origGray[j], toneResponse);
+        if (inv) effectAlpha = 1 - effectAlpha;
+        effectAlpha *= calcToneLockAlpha(origGray[j], toneLock);
+        if (effectAlpha < 1) v = v * effectAlpha + current[j] * (1 - effectAlpha);
+        blended[j] = v;
+      }
+      current = blended;
+
+      if (onProgress) onProgress(renderGrayToImageData(current));
+      await yieldTick();
+    }
+
+    return renderGrayToImageData(current);
+  }
+
+  async function processColorDitherAsync(pipeline, globals, w, h, data, signal, onProgress) {
+    const ch = toChannels(data, w, h);
+    let rCh = applyPreProcess(ch.r, globals.brightness, globals.contrast, globals.gamma);
+    let gCh = applyPreProcess(ch.g, globals.brightness, globals.contrast, globals.gamma);
+    let bCh = applyPreProcess(ch.b, globals.brightness, globals.contrast, globals.gamma);
+
+    const origR = new Float32Array(rCh), origG = new Float32Array(gCh), origB = new Float32Array(bCh);
+    const n = w * h;
+    const grayRef = new Float32Array(n);
+    for (let i = 0; i < n; i++) grayRef[i] = 0.2126 * origR[i] + 0.7152 * origG[i] + 0.0722 * origB[i];
+    const toneLock = globals.toneLock;
+
+    const renderRGBToImageData = (rBuf, gBuf, bBuf) => {
+      const out = new ImageData(w, h);
+      const rd = out.data;
+      for (let i = 0; i < n; i++) {
+        const o = i * 4;
+        rd[o] = clampByte(rBuf[i]); rd[o+1] = clampByte(gBuf[i]); rd[o+2] = clampByte(bBuf[i]); rd[o+3] = 255;
+      }
+      return out;
+    };
+
+    for (let pi = 0; pi < pipeline.length; pi++) {
+      if (signal.cancelled) return null;
+      const step = pipeline[pi];
+      const mix = step.params._mix || 0;
+      const inv = step.params._invert || false;
+      const bp = step.params._blackPoint || 0;
+      const wp = step.params._whitePoint === undefined ? 255 : step.params._whitePoint;
+      const hasBWClip = bp > 0 || wp < 255;
+      const feather = step.params._feather === undefined ? 10 : step.params._feather;
+      const edgeMode = step.params._edgeMode || 'soft';
+      const toneResponse = step.params._toneResponse || 0;
+      const blendMode = step.params._blendMode || 'normal';
+      const useOrig = step.params._useOriginal || false;
+
+      const inR = useOrig ? new Float32Array(origR) : new Float32Array(rCh);
+      const inG = useOrig ? new Float32Array(origG) : new Float32Array(gCh);
+      const inB = useOrig ? new Float32Array(origB) : new Float32Array(bCh);
+
+      // Per-channel progress: during intermediate channel renders we only
+      // have valid data for one axis. Showing (partial_R, origG, origB)
+      // produces confusing color tints, so instead we render the partial
+      // buffer as a grayscale preview — it reads as "painting in progress"
+      // without implying a final color that isn't there yet.
+      let lastProgressTs = 0;
+      const onPartialChannelProgress = onProgress ? (partial) => {
+        const now = performance.now();
+        if (now - lastProgressTs < 60) return;
+        lastProgressTs = now;
+        onProgress(renderRGBToImageData(partial, partial, partial));
+      } : null;
+
+      const drR = await runApply(step, inR, w, h, onPartialChannelProgress, signal);
+      if (signal.cancelled) return null;
+      // Between channels, show R as full grayscale snapshot so user sees a
+      // visible milestone even if the next channel starts slow.
+      if (onProgress) onProgress(renderRGBToImageData(drR, drR, drR));
+      await yieldTick();
+      const drG = await runApply(step, inG, w, h, onPartialChannelProgress, signal);
+      if (signal.cancelled) return null;
+      if (onProgress) onProgress(renderRGBToImageData(drR, drG, drG));
+      await yieldTick();
+      const drB = await runApply(step, inB, w, h, onPartialChannelProgress, signal);
+      if (signal.cancelled) return null;
+
+      const prevR = new Float32Array(rCh), prevG = new Float32Array(gCh), prevB = new Float32Array(bCh);
+      for (let j = 0; j < n; j++) {
+        let vr = drR[j], vg = drG[j], vb = drB[j];
+        if (mix > 0) { vr = vr*(1-mix) + origR[j]*mix; vg = vg*(1-mix) + origG[j]*mix; vb = vb*(1-mix) + origB[j]*mix; }
+        if (blendMode !== 'normal') {
+          const br = pi > 0 ? prevR[j] : origR[j];
+          const bg = pi > 0 ? prevG[j] : origG[j];
+          const bb = pi > 0 ? prevB[j] : origB[j];
+          vr = blendPixel(br, vr, blendMode);
+          vg = blendPixel(bg, vg, blendMode);
+          vb = blendPixel(bb, vb, blendMode);
+        }
+        let effectAlpha = 1;
+        if (hasBWClip) effectAlpha = calcEdgeAlpha(grayRef[j], bp, wp, feather, edgeMode, j);
+        if (toneResponse !== 0) effectAlpha *= calcToneAlpha(grayRef[j], toneResponse);
+        if (inv) effectAlpha = 1 - effectAlpha;
+        effectAlpha *= calcToneLockAlpha(grayRef[j], toneLock);
+        if (effectAlpha < 1) {
+          vr = vr * effectAlpha + prevR[j] * (1 - effectAlpha);
+          vg = vg * effectAlpha + prevG[j] * (1 - effectAlpha);
+          vb = vb * effectAlpha + prevB[j] * (1 - effectAlpha);
+        }
+        rCh[j] = vr; gCh[j] = vg; bCh[j] = vb;
+      }
+
+      if (onProgress) onProgress(renderRGBToImageData(rCh, gCh, bCh));
+      await yieldTick();
+    }
+
+    return renderRGBToImageData(rCh, gCh, bCh);
+  }
+
+  async function processPaletteDitherAsync(pipeline, globals, w, h, data, signal, onProgress) {
+    // For palette mode, the final FS-dither serial loop is fast enough that
+    // we only bother yielding between pipeline steps / channels.
+    let palette = globals.palette;
+    if (!palette || palette.length === 0) palette = [[0,0,0],[255,255,255]];
+    if (globals.maxColors > 0 && globals.maxColors < palette.length) palette = palette.slice(0, globals.maxColors);
+
+    const ch = toChannels(data, w, h);
+    let rCh = applyPreProcess(ch.r, globals.brightness, globals.contrast, globals.gamma);
+    let gCh = applyPreProcess(ch.g, globals.brightness, globals.contrast, globals.gamma);
+    let bCh = applyPreProcess(ch.b, globals.brightness, globals.contrast, globals.gamma);
+
+    const n = w * h;
+    const toneLock = globals.toneLock;
+
+    if (pipeline.length > 0) {
+      const origR = new Float32Array(rCh), origG = new Float32Array(gCh), origB = new Float32Array(bCh);
+      const grayRef = new Float32Array(n);
+      for (let i = 0; i < n; i++) grayRef[i] = 0.2126 * origR[i] + 0.7152 * origG[i] + 0.0722 * origB[i];
+
+      for (let pi = 0; pi < pipeline.length; pi++) {
+        if (signal.cancelled) return null;
+        const step = pipeline[pi];
+        const mix = step.params._mix || 0;
+        const inv = step.params._invert || false;
+        const bp = step.params._blackPoint || 0;
+        const wp = step.params._whitePoint === undefined ? 255 : step.params._whitePoint;
+        const hasBWClip = bp > 0 || wp < 255;
+        const feather = step.params._feather === undefined ? 10 : step.params._feather;
+        const edgeMode = step.params._edgeMode || 'soft';
+        const toneResponse = step.params._toneResponse || 0;
+        const blendMode = step.params._blendMode || 'normal';
+        const useOrig = step.params._useOriginal || false;
+
+        const inR = useOrig ? new Float32Array(origR) : new Float32Array(rCh);
+        const inG = useOrig ? new Float32Array(origG) : new Float32Array(gCh);
+        const inB = useOrig ? new Float32Array(origB) : new Float32Array(bCh);
+
+        const drR = await runApply(step, inR, w, h, null, signal);
+        if (signal.cancelled) return null;
+        await yieldTick();
+        const drG = await runApply(step, inG, w, h, null, signal);
+        if (signal.cancelled) return null;
+        await yieldTick();
+        const drB = await runApply(step, inB, w, h, null, signal);
+        if (signal.cancelled) return null;
+
+        const prevR = new Float32Array(rCh), prevG = new Float32Array(gCh), prevB = new Float32Array(bCh);
+        for (let j = 0; j < n; j++) {
+          let vr = drR[j], vg = drG[j], vb = drB[j];
+          if (mix > 0) { vr = vr*(1-mix) + origR[j]*mix; vg = vg*(1-mix) + origG[j]*mix; vb = vb*(1-mix) + origB[j]*mix; }
+          if (blendMode !== 'normal') {
+            const br = pi > 0 ? prevR[j] : origR[j];
+            const bg = pi > 0 ? prevG[j] : origG[j];
+            const bb = pi > 0 ? prevB[j] : origB[j];
+            vr = blendPixel(br, vr, blendMode);
+            vg = blendPixel(bg, vg, blendMode);
+            vb = blendPixel(bb, vb, blendMode);
+          }
+          let effectAlpha = 1;
+          if (hasBWClip) effectAlpha = calcEdgeAlpha(grayRef[j], bp, wp, feather, edgeMode, j);
+          if (toneResponse !== 0) effectAlpha *= calcToneAlpha(grayRef[j], toneResponse);
+          if (inv) effectAlpha = 1 - effectAlpha;
+          effectAlpha *= calcToneLockAlpha(grayRef[j], toneLock);
+          if (effectAlpha < 1) {
+            vr = vr * effectAlpha + prevR[j] * (1 - effectAlpha);
+            vg = vg * effectAlpha + prevG[j] * (1 - effectAlpha);
+            vb = vb * effectAlpha + prevB[j] * (1 - effectAlpha);
+          }
+          rCh[j] = vr; gCh[j] = vg; bCh[j] = vb;
+        }
+
+        await yieldTick();
+      }
+    }
+
+    // Final FS dither to palette (serial; fast enough to be synchronous)
+    const result = new ImageData(w, h);
+    const rd = result.data;
+    const rBuf = new Float32Array(rCh), gBuf = new Float32Array(gCh), bBuf = new Float32Array(bCh);
+    const dm = [[1,0,7/16],[-1,1,3/16],[0,1,5/16],[1,1,1/16]];
+    for (let y = 0; y < h; y++) {
+      const ltr = y % 2 === 0;
+      const sx = ltr ? 0 : w-1, ex = ltr ? w : -1, dx = ltr ? 1 : -1;
+      for (let x = sx; x !== ex; x += dx) {
+        const i = y*w+x, o = i*4;
+        const or2 = clampByte(rBuf[i]), og = clampByte(gBuf[i]), ob = clampByte(bBuf[i]);
+        const [nr, ng, nb] = nearestColor(or2, og, ob, palette);
+        rd[o] = nr; rd[o+1] = ng; rd[o+2] = nb; rd[o+3] = 255;
+        const er = (or2-nr)*.7, eg = (og-ng)*.7, eb = (ob-nb)*.7;
+        for (const [mdx, mdy, mw] of dm) {
+          const nx = x + (ltr ? mdx : -mdx), ny = y + mdy;
+          if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+            const ni = ny*w+nx;
+            rBuf[ni] += er*mw; gBuf[ni] += eg*mw; bBuf[ni] += eb*mw;
+          }
+        }
+      }
+    }
+    return result;
+  }
+
   function exportFullSize(pipeline, globals) {
     const imageData = process(pipeline, globals, 0);
     if (!imageData) return null;
@@ -690,7 +1014,8 @@ const DitherEngine = (() => {
   }
 
   return {
-    loadImage, getSourceSize, bake, bakeImageData, process, exportFullSize, exportWithOptions, exportImageData,
+    loadImage, getSourceSize, bake, bakeImageData, process, processAsync,
+    exportFullSize, exportWithOptions, exportImageData,
     hexToRgb, rgbToHex, clampByte, blendPixel,
     getPalettePresets, getPalette, extractPalette, medianCut, nearestColor
   };

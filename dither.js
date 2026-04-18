@@ -1388,10 +1388,13 @@ const DitherAlgorithms = (() => {
     {id:'sampleDrift',label:'Sample Drift',min:0,max:1,step:.05,default:.55},
     {id:'sampleJitter',label:'Sample Jitter (px)',min:0,max:12,step:.5,default:2},
     {id:'canvasStart',label:'Canvas',type:'select',options:[
-      {value:'source',label:'From source (filter)'},
+      {value:'underpaint',label:'Painterly underpaint (mosaic of source tones)'},
+      {value:'source',label:'From source (filter feel)'},
       {value:'clean',label:'From blank canvas'}
-    ],default:'source'},
+    ],default:'underpaint'},
     {id:'bgTone',label:'Blank BG Tone',min:0,max:255,step:1,default:255},
+    {id:'underpaintBlock',label:'Underpaint Block Size',min:4,max:40,step:1,default:14},
+    {id:'underpaintPosterize',label:'Underpaint Posterize',min:2,max:32,step:1,default:12},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.8},
@@ -1431,6 +1434,36 @@ const DitherAlgorithms = (() => {
     ],default:'default'},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
+    // Sync drain: runs the generator to completion with no yields. Zero
+    // behavioral diff vs. the original synchronous body.
+    const gen = this._gen(px, w, h, p);
+    let r = gen.next();
+    while (!r.done) r = gen.next();
+    return r.value;
+  },
+  // Cooperative async variant: yields between chunks of rows and between
+  // layers. Checks signal.cancelled at each yield point and calls onProgress
+  // with a snapshot of the in-progress canvas so the UI can paint block-by-
+  // block progress instead of freezing. Same output as apply().
+  async applyAsync(px, w, h, p, ctx) {
+    const signal = (ctx && ctx.signal) || { cancelled: false };
+    const onProgress = (ctx && ctx.onProgress) || null;
+    const gen = this._gen(px, w, h, p);
+    let r = gen.next();
+    let lastProg = 0;
+    while (!r.done) {
+      if (signal.cancelled) { try { gen.return(); } catch(_){} return r.value || new Uint8ClampedArray(w*h); }
+      const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+      if (onProgress && r.value && now - lastProg > 60) {
+        lastProg = now;
+        onProgress(new Uint8ClampedArray(r.value));
+      }
+      await new Promise(res => setTimeout(res, 0));
+      r = gen.next();
+    }
+    return r.value;
+  },
+  *_gen(px, w, h, p) {
     const o = new Uint8ClampedArray(w*h);
 
     const strokeStyle = p.strokeStyle || 'pixel';
@@ -1446,8 +1479,10 @@ const DitherAlgorithms = (() => {
     const coverageDensity = (p.coverageDensity != null) ? p.coverageDensity : 0.85;
     const sampleDrift   = (p.sampleDrift  != null) ? p.sampleDrift  : 0.55;
     const sampleJitter  = (p.sampleJitter != null) ? p.sampleJitter : 2;
-    const canvasStart   = p.canvasStart || 'source';
+    const canvasStart   = p.canvasStart || 'underpaint';
     const bgTone        = (p.bgTone != null) ? p.bgTone : 255;
+    const underpaintBlock    = (p.underpaintBlock    != null) ? p.underpaintBlock|0    : 14;
+    const underpaintPosterize= (p.underpaintPosterize!= null) ? p.underpaintPosterize|0: 12;
     const colorPickup   = (p.colorPickup != null) ? p.colorPickup : 0;
     const detailAware    = (p.detailAware     != null) ? p.detailAware     : 1;
     const sizeByDetail   = (p.sizeByDetail    != null) ? p.sizeByDetail    : 0.8;
@@ -1491,9 +1526,46 @@ const DitherAlgorithms = (() => {
     }
 
     // PIXEL mode — sharp, dithered, real source pixels in every stroke.
-    // Start canvas: either the source image (filter feel) or a clean bg tone.
+    // Start canvas:
+    //   'underpaint' = mosaic of posterized source colors (painterly base;
+    //                  output looks RECONSTRUCTED from paint, not filtered)
+    //   'source'     = raw source (filter feel; minimal stroke coverage leaves
+    //                  the image legible everywhere)
+    //   'clean'      = blank bgTone (classic impressionism base, reveals paint
+    //                  only where strokes land)
     if (canvasStart === 'clean') {
       for (let i = 0; i < w*h; i++) o[i] = bgTone;
+    } else if (canvasStart === 'underpaint') {
+      const bsz = Math.max(3, underpaintBlock);
+      const steps = Math.max(2, Math.min(32, underpaintPosterize));
+      const blocksW = Math.ceil(w / bsz);
+      const blocksH = Math.ceil(h / bsz);
+      const blockVals = new Uint8ClampedArray(blocksW * blocksH);
+      for (let by = 0; by < blocksH; by++) {
+        for (let bx = 0; bx < blocksW; bx++) {
+          // 4-sample grid within the block; average + posterize + slight
+          // stochastic tone jitter (hash-based) to prevent banding.
+          let sum = 0, cnt = 0;
+          for (let sy = 0; sy < 2; sy++) for (let sx = 0; sx < 2; sx++) {
+            const xs = Math.min(w-1, bx*bsz + Math.floor((sx+0.5)*bsz/2));
+            const ys = Math.min(h-1, by*bsz + Math.floor((sy+0.5)*bsz/2));
+            sum += clamp(px[ys*w+xs]); cnt++;
+          }
+          const avg = sum / cnt;
+          const q = Math.round(avg / 255 * (steps-1)) / (steps-1) * 255;
+          blockVals[by*blocksW+bx] = Math.max(0, Math.min(255, q | 0));
+        }
+      }
+      // Fill o with block value + small per-pixel hash-dither so the base
+      // is painterly-mottled, not purely blocky.
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const bx = (x / bsz) | 0, by = (y / bsz) | 0;
+          const base = blockVals[by*blocksW + bx];
+          const dither = (sh(x, y, 300) - 0.5) * 10;  // ~±5 of tone jitter
+          o[y*w+x] = Math.max(0, Math.min(255, (base + dither) | 0));
+        }
+      }
     } else {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     }
@@ -1507,12 +1579,19 @@ const DitherAlgorithms = (() => {
 
     const baseSp = Math.max(2, Math.round(p.size * 0.8));
 
+    // Chunk cadence for cooperative yielding: `yield o` here lets applyAsync
+    // pause the browser event loop + report progress. In sync apply() drain,
+    // these yields become no-op wrappers.
+    const ROW_CHUNK = 12;
+
     for (let layer = 0; layer < layers; layer++) {
       const layerAng = (layers > 1) ? (layer / layers) * Math.PI * 0.35 : 0;
       const ox = (layer * (baseSp >> 1)) % baseSp;
       const oy = (layer * (baseSp >> 2)) % baseSp;
 
-      for (let y = oy; y < h; y += baseSp) for (let x = ox; x < w; x += baseSp) {
+      let rowsThisChunk = 0;
+      for (let y = oy; y < h; y += baseSp) {
+        for (let x = ox; x < w; x += baseSp) {
         const ex = Math.min(w-2, Math.max(1, x));
         const ey = Math.min(h-2, Math.max(1, y));
         const eIdx = ey * w + ex;
@@ -1663,7 +1742,14 @@ const DitherAlgorithms = (() => {
             }
           }
         }
-      }
+        }  // end x-loop
+        rowsThisChunk++;
+        if (rowsThisChunk >= ROW_CHUNK) {
+          rowsThisChunk = 0;
+          yield o;  // cooperative pause — applyAsync sees this; sync drain ignores.
+        }
+      }  // end y-loop
+      yield o;
     }
 
     // — Post-pass: WET BLEED (capillary spread, crisp) —
@@ -1683,6 +1769,7 @@ const DitherAlgorithms = (() => {
           const ny = Math.max(0, Math.min(h-1, y + dy));
           o[yr + x] = tmp[ny * w + nx];
         }
+        if ((y & 31) === 0) yield o;
       }
     }
 
@@ -5008,9 +5095,12 @@ const DitherAlgorithms = (() => {
     {id:'sampleDrift',label:'Sample Drift',min:0,max:1,step:.05,default:.55},
     {id:'sampleJitter',label:'Sample Jitter (px)',min:0,max:12,step:.5,default:2},
     {id:'canvasStart',label:'Canvas',type:'select',options:[
+      {value:'underpaint',label:'Painterly underpaint (mosaic of source tones)'},
       {value:'source',label:'From source (coherent color)'},
       {value:'clean',label:'From blank canvas (classic)'}
-    ],default:'source'},
+    ],default:'underpaint'},
+    {id:'underpaintBlock',label:'Underpaint Block Size',min:4,max:40,step:1,default:14},
+    {id:'underpaintPosterize',label:'Underpaint Posterize',min:2,max:32,step:1,default:12},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.7},
@@ -5061,17 +5151,80 @@ const DitherAlgorithms = (() => {
     {id:'softness',label:'Dab Softness',min:0,max:1,step:.05,default:.4},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
+    const gen = this._gen(px, w, h, p);
+    let r = gen.next();
+    while (!r.done) r = gen.next();
+    return r.value;
+  },
+  async applyAsync(px, w, h, p, ctx) {
+    const signal = (ctx && ctx.signal) || { cancelled: false };
+    const onProgress = (ctx && ctx.onProgress) || null;
+    const gen = this._gen(px, w, h, p);
+    let r = gen.next();
+    let lastProg = 0;
+    while (!r.done) {
+      if (signal.cancelled) { try { gen.return(); } catch(_){} return r.value || new Uint8ClampedArray(w*h); }
+      const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+      if (onProgress && r.value && now - lastProg > 60) {
+        lastProg = now;
+        onProgress(new Uint8ClampedArray(r.value));
+      }
+      await new Promise(res => setTimeout(res, 0));
+      r = gen.next();
+    }
+    return r.value;
+  },
+  *_gen(px, w, h, p) {
     const o = new Uint8ClampedArray(w*h);
     const bgTone = (p.bgTone != null) ? p.bgTone : 255;
-    const canvasStart = p.canvasStart || 'source';
+    const canvasStart = p.canvasStart || 'underpaint';
     const dabStyle = p.dabStyle || 'pixel';
+    const underpaintBlock    = (p.underpaintBlock    != null) ? p.underpaintBlock|0    : 14;
+    const underpaintPosterize= (p.underpaintPosterize!= null) ? p.underpaintPosterize|0: 12;
+    const seedUnder          = (p.seed|0) || 42;
+    function shUnder(a, b, k) {
+      let h = Math.imul((a|0) + 374761393, 0x9E3779B1) ^
+              Math.imul((b|0) + 2246822519, 0x85EBCA77) ^
+              Math.imul((k|0) + 3266489917, 0xC2B2AE3D) ^ seedUnder;
+      h = Math.imul(h ^ (h >>> 15), 0x85EBCA77);
+      h = Math.imul(h ^ (h >>> 13), 0xC2B2AE3D);
+      return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+    }
 
-    // Initial canvas: 'source' starts from image (every un-dabbed pixel shows
-    // real color → perfectly coherent across RGB channels, no bgTone bleeding
-    // through per-channel acceptance differences). 'clean' = classic blank
-    // canvas revealed only where dabs land (may show color fringing at edges).
+    // Initial canvas:
+    //   'underpaint' = posterized mosaic of source tones (painterly RECONSTRUCTION
+    //                  — output reads as paint-built-up, not filter-overlayed)
+    //   'source'     = raw source pixels (filter feel; coherent across channels)
+    //   'clean'      = bgTone (classic canvas, paint revealed only where dabs land)
     if (dabStyle === 'pixel' && canvasStart === 'source') {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
+    } else if (dabStyle === 'pixel' && canvasStart === 'underpaint') {
+      const bsz = Math.max(3, underpaintBlock);
+      const steps = Math.max(2, Math.min(32, underpaintPosterize));
+      const blocksW = Math.ceil(w / bsz);
+      const blocksH = Math.ceil(h / bsz);
+      const blockVals = new Uint8ClampedArray(blocksW * blocksH);
+      for (let by = 0; by < blocksH; by++) {
+        for (let bx = 0; bx < blocksW; bx++) {
+          let sum = 0, cnt = 0;
+          for (let sy = 0; sy < 2; sy++) for (let sx = 0; sx < 2; sx++) {
+            const xs = Math.min(w-1, bx*bsz + Math.floor((sx+0.5)*bsz/2));
+            const ys = Math.min(h-1, by*bsz + Math.floor((sy+0.5)*bsz/2));
+            sum += clamp(px[ys*w+xs]); cnt++;
+          }
+          const avg = sum / cnt;
+          const q = Math.round(avg / 255 * (steps-1)) / (steps-1) * 255;
+          blockVals[by*blocksW+bx] = Math.max(0, Math.min(255, q | 0));
+        }
+      }
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const bx = (x / bsz) | 0, by = (y / bsz) | 0;
+          const base = blockVals[by*blocksW + bx];
+          const dither = (shUnder(x, y, 300) - 0.5) * 10;
+          o[y*w+x] = Math.max(0, Math.min(255, (base + dither) | 0));
+        }
+      }
     } else {
       o.fill(bgTone);
     }
@@ -5147,7 +5300,13 @@ const DitherAlgorithms = (() => {
       totalDabs = Math.round(totalDabs * (1 - detailAware * 0.15));
     }
 
+    // Chunk cadence for cooperative yielding — yield every N dabs so
+    // applyAsync can paint progress + respond to cancellation. Sync drain
+    // ignores these yields, so zero perf cost in the sync path.
+    const DAB_CHUNK = 500;
+
     for (let i = 0; i < totalDabs; i++) {
+      if (i > 0 && (i % DAB_CHUNK) === 0) yield o;
       // Dab origin — position-hash so channels agree on locations.
       let x = Math.floor(sh(i, 0, 100) * w);
       let y = Math.floor(sh(i, 0, 101) * h);
