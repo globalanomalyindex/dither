@@ -873,7 +873,7 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
 /* ── Processing overlay ──
    Blocks pointer events so rapid clicks on Shuffle/Apply/etc. don't queue
    up extra work while the engine is busy. Appears instantly for any render
-   but only fades in a visible plate + label after 180ms so fast renders
+   but only fades in a visible plate + label after 90ms so fast renders
    stay silent. */
 .processing-overlay {
   position: absolute;
@@ -887,7 +887,7 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
   z-index: 12;
   pointer-events: auto;
   cursor: progress;
-  animation: processing-fade 220ms ease-out 180ms forwards;
+  animation: processing-fade 220ms ease-out 90ms forwards;
 }
 
 @keyframes processing-fade {
@@ -903,11 +903,11 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
   opacity: 0;
-  animation-delay: 180ms;
+  animation-delay: 90ms;
   animation-fill-mode: forwards;
   box-shadow: 0 0 22px var(--fun-glow);
 }
-.processing-overlay .processing-spinner { animation: spin 0.7s linear infinite, processing-show 220ms ease-out 180ms forwards; }
+.processing-overlay .processing-spinner { animation: spin 0.7s linear infinite, processing-show 220ms ease-out 90ms forwards; }
 @keyframes processing-show { to { opacity: 1; } }
 
 .processing-label {
@@ -917,7 +917,7 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
   text-transform: uppercase;
   color: var(--text-dim);
   opacity: 0;
-  animation: processing-show 220ms ease-out 180ms forwards;
+  animation: processing-show 220ms ease-out 90ms forwards;
   text-shadow: 0 1px 2px rgba(0,0,0,0.5);
 }
 

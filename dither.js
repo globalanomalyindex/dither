@@ -55,6 +55,70 @@ const DitherAlgorithms = (() => {
     return { mag: Math.sqrt(gx*gx + gy*gy), ang: Math.atan2(gy, gx) };
   }
 
+  // Precompute full-image sobel magnitude + angle grids. Calling sobelAt()
+  // inside a hot loop (4000 dabs × bbox pixels × per-pixel edge checks) is
+  // what makes painterly algorithms slow. Precomputing once is ~O(w*h) and
+  // makes per-dab/per-pixel edge lookups O(1). Returns
+  // { mag: Float32Array, ang: Float32Array } sized w*h.
+  function sobelField(px, w, h) {
+    const mag = new Float32Array(w * h);
+    const ang = new Float32Array(w * h);
+    for (let y = 1; y < h - 1; y++) {
+      const ym1 = (y - 1) * w, yp1 = (y + 1) * w, yr = y * w;
+      for (let x = 1; x < w - 1; x++) {
+        const gx = px[ym1 + x + 1] + 2*px[yr + x + 1] + px[yp1 + x + 1]
+                 - px[ym1 + x - 1] - 2*px[yr + x - 1] - px[yp1 + x - 1];
+        const gy = px[yp1 + x - 1] + 2*px[yp1 + x] + px[yp1 + x + 1]
+                 - px[ym1 + x - 1] - 2*px[ym1 + x] - px[ym1 + x + 1];
+        const i = yr + x;
+        mag[i] = Math.sqrt(gx*gx + gy*gy);
+        ang[i] = Math.atan2(gy, gx);
+      }
+    }
+    return { mag, ang };
+  }
+
+  // Local detail / variance grid, downsampled for speed. Used to let
+  // painterly algorithms place fewer, larger strokes in low-variance areas
+  // (sky, walls) and many small strokes in detailed areas. Block size is
+  // coarse (8px) — gives a chunky "this area is busy / this one is smooth"
+  // map without much cost. Returns Float32Array same size as px, with each
+  // cell holding the local luminance standard deviation (0..~100).
+  function detailField(px, w, h, block) {
+    const B = block || 8;
+    const d = new Float32Array(w * h);
+    const bw = Math.ceil(w / B), bh = Math.ceil(h / B);
+    const blockStd = new Float32Array(bw * bh);
+    for (let by = 0; by < bh; by++) {
+      for (let bx = 0; bx < bw; bx++) {
+        let sum = 0, sumSq = 0, n = 0;
+        const x0 = bx * B, y0 = by * B;
+        const x1 = Math.min(w, x0 + B), y1 = Math.min(h, y0 + B);
+        for (let yy = y0; yy < y1; yy++) {
+          const yr = yy * w;
+          for (let xx = x0; xx < x1; xx++) {
+            const v = px[yr + xx]; sum += v; sumSq += v * v; n++;
+          }
+        }
+        if (n > 0) {
+          const mean = sum / n;
+          const varc = Math.max(0, sumSq / n - mean * mean);
+          blockStd[by * bw + bx] = Math.sqrt(varc);
+        }
+      }
+    }
+    // Expand block grid back to full resolution (nearest-neighbor)
+    for (let y = 0; y < h; y++) {
+      const by = (y / B) | 0;
+      const brow = by * bw;
+      const drow = y * w;
+      for (let x = 0; x < w; x++) {
+        d[drow + x] = blockStd[brow + ((x / B) | 0)];
+      }
+    }
+    return d;
+  }
+
   const A = [];
 
   function addED(id, name, matrix, cat='classic') {
@@ -1328,6 +1392,15 @@ const DitherAlgorithms = (() => {
       {value:'clean',label:'From blank canvas'}
     ],default:'source'},
     {id:'bgTone',label:'Blank BG Tone',min:0,max:255,step:1,default:255},
+    // — Detail awareness (human-like placement) —
+    {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
+    {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.8},
+    {id:'skipSmoothAreas',label:'Skip Smooth Areas',min:0,max:1,step:.05,default:.4},
+    // — Wet paint (bleed/streak/smudge) —
+    {id:'wetBleed',label:'Wet Bleed',min:0,max:1,step:.05,default:0},
+    {id:'wetSmudge',label:'Wet Smudge',min:0,max:1,step:.05,default:0},
+    {id:'wetStreak',label:'Wet Streak',min:0,max:1,step:.05,default:0},
+    {id:'colorVariety',label:'Color Variety (multi-color stroke)',min:0,max:1,step:.05,default:.2},
     // — Intensity & layering —
     {id:'intensity',label:'Intensity',min:.3,max:3,step:.05,default:1.2},
     {id:'layers',label:'Layered Passes',min:1,max:5,step:1,default:1},
@@ -1376,6 +1449,13 @@ const DitherAlgorithms = (() => {
     const canvasStart   = p.canvasStart || 'source';
     const bgTone        = (p.bgTone != null) ? p.bgTone : 255;
     const colorPickup   = (p.colorPickup != null) ? p.colorPickup : 0;
+    const detailAware    = (p.detailAware     != null) ? p.detailAware     : 1;
+    const sizeByDetail   = (p.sizeByDetail    != null) ? p.sizeByDetail    : 0.8;
+    const skipSmoothAreas= (p.skipSmoothAreas != null) ? p.skipSmoothAreas : 0.4;
+    const wetBleed       = (p.wetBleed        != null) ? p.wetBleed        : 0;
+    const wetSmudge      = (p.wetSmudge       != null) ? p.wetSmudge       : 0;
+    const wetStreak      = (p.wetStreak       != null) ? p.wetStreak       : 0;
+    const colorVariety   = (p.colorVariety    != null) ? p.colorVariety    : 0.2;
     const brushShape    = p.brushShape || 'default';
     const seedI         = (p.seed|0) || 42;
 
@@ -1418,6 +1498,13 @@ const DitherAlgorithms = (() => {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     }
 
+    // Precompute edge field + detail field once — the old code was calling
+    // sobelAt() per pixel inside hot loops, which dominated the runtime.
+    const sf = sobelField(px, w, h);
+    const edgeMag = sf.mag, edgeAng = sf.ang;
+    const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0;
+    const detail = needDetail ? detailField(px, w, h, 8) : null;
+
     const baseSp = Math.max(2, Math.round(p.size * 0.8));
 
     for (let layer = 0; layer < layers; layer++) {
@@ -1428,9 +1515,22 @@ const DitherAlgorithms = (() => {
       for (let y = oy; y < h; y += baseSp) for (let x = ox; x < w; x += baseSp) {
         const ex = Math.min(w-2, Math.max(1, x));
         const ey = Math.min(h-2, Math.max(1, y));
-        const e = sobelAt(px, ex, ey, w, h);
-        const edgeN = Math.min(1, e.mag / 120);
+        const eIdx = ey * w + ex;
+        const eMag = edgeMag[eIdx], eAng = edgeAng[eIdx];
+        const edgeN = Math.min(1, eMag / 120);
         const lum = clamp(px[y*w+x]) / 255;
+
+        // — Detail-aware placement: smooth-area strokes get skipped more
+        //   aggressively so the knife doesn't plaster a flat sky with 50
+        //   identical strokes (a human would just put a few big ones).
+        let localDetail = 0;  // 0..1
+        if (detail) {
+          localDetail = Math.min(1, detail[y * w + x] / 40);
+          if (skipSmoothAreas > 0) {
+            const keepProb = localDetail + (1 - skipSmoothAreas * 0.8);
+            if (sh(x, y, 120) > Math.min(1, keepProb)) continue;
+          }
+        }
 
         // Per-stroke random decisions use position-hash, NOT a call-ordered
         // RNG, so R/G/B channels make identical decisions (coherent color).
@@ -1443,24 +1543,40 @@ const DitherAlgorithms = (() => {
           if (sh(x, y, 2) > 0.3 + target * Math.abs(lsBias) * 0.7) continue;
         }
 
-        const ang = e.ang + Math.PI/2 + (sh(x, y, 3) - 0.5) * angleJitter + layerAng;
+        const ang = eAng + Math.PI/2 + (sh(x, y, 3) - 0.5) * angleJitter + layerAng;
         const dx = Math.cos(ang), dy = Math.sin(ang);
 
-        const sizeMul = 1 + (sizeByLight > 0 ? lum : (1 - lum)) * Math.abs(sizeByLight) * 1.8;
-        const knifeW = Math.max(1.5, p.size * sizeMul);
+        // Detail-aware knife size: in smooth regions, make strokes bigger
+        // and longer (painterly sky sweep); in detailed regions, keep small.
+        let detailSizeMul = 1;
+        if (detail && sizeByDetail > 0) {
+          const smoothFactor = 1 - localDetail;
+          detailSizeMul = 1 + smoothFactor * sizeByDetail * 3.0;
+        }
 
-        const lenBase = p.smear * (0.5 + sh(x, y, 4) * 0.5);
-        const smearLen = lenBase * (1 + edgeN * lengthByEdge * 2.5);
+        const sizeMul = 1 + (sizeByLight > 0 ? lum : (1 - lum)) * Math.abs(sizeByLight) * 1.8;
+        const knifeW = Math.max(1.5, p.size * sizeMul * detailSizeMul);
+
+        const lenBase = p.smear * (0.5 + sh(x, y, 4) * 0.5) * detailSizeMul;
+        const realSmearLen = lenBase * (1 + edgeN * lengthByEdge * 2.5);
+        // WET STREAK extends the smear with a decaying tail — long painterly
+        // drag from a loaded brush.
+        const streakExt = wetStreak > 0 ? realSmearLen * wetStreak * 1.5 : 0;
+        const smearLen = realSmearLen + streakExt;
 
         const jitterMul = pressureJit > 0 ? (1 + (sh(x, y, 5) - 0.5) * pressureJit) : 1;
         const edgeBoost = pressureByEdge > 0 ? (1 + edgeN * pressureByEdge * 2) : 1;
         const pressure = Math.max(0, Math.min(2, p.pressure * intensity * jitterMul * edgeBoost));
 
+        // Color-variety radius: lets a single stroke reveal multiple source
+        // colors via additional per-pixel sample offsets. Like fiber-bundle
+        // behavior in the paint engine.
+        const varietyRadius = colorVariety * knifeW * 0.6;
+        const smudgeDrag = wetSmudge * realSmearLen * 0.5;
+
         // Sample-origin drift: sampleDrift=0 → stroke keeps smearing the
-        // origin pixel (long trail of one color). sampleDrift=1 → each
-        // stamp samples from the CURRENT stroke position (pixels change
-        // along the length, revealing the image). Mid values = partial
-        // smear that still reveals underlying color variation.
+        // origin pixel. sampleDrift=1 → each stamp samples from the CURRENT
+        // stroke position. Mid = partial smear that reveals color variation.
         const originX = x, originY = y;
 
         // Brush-stamp inner loop
@@ -1471,10 +1587,22 @@ const DitherAlgorithms = (() => {
           for (let t = 0; t < smearLen; t++) {
             const fx = Math.round(x + dx*t), fy = Math.round(y + dy*t);
             if (fx < 0 || fx >= w || fy < 0 || fy >= h) break;
-            const decay = 1 - t/smearLen;
+            // Decay: during real smear it linearly fades; in streak-tail it
+            // fades faster (so you get a long thinning tail not a uniform bar).
+            const inReal = t < realSmearLen;
+            const decay = inReal
+              ? 1 - t / realSmearLen
+              : Math.max(0, 1 - (t - realSmearLen) / Math.max(1e-6, streakExt)) * 0.5;
             // Drifting sample origin along the stroke
-            const sOrigX = originX + (fx - originX) * sampleDrift;
-            const sOrigY = originY + (fy - originY) * sampleDrift;
+            let sOrigX = originX + (fx - originX) * sampleDrift;
+            let sOrigY = originY + (fy - originY) * sampleDrift;
+            // WET SMUDGE drags the sample back along stroke — colors from
+            // earlier in the stroke bleed into the tail.
+            if (wetSmudge > 0) {
+              const dragT = t / Math.max(1, realSmearLen);
+              sOrigX -= dx * smudgeDrag * Math.min(1, dragT);
+              sOrigY -= dy * smudgeDrag * Math.min(1, dragT);
+            }
 
             for (let by = -stampSz; by <= stampSz; by++) {
               const wy2 = Math.round(fy + by);
@@ -1482,7 +1610,6 @@ const DitherAlgorithms = (() => {
               for (let bx = -stampSz; bx <= stampSz; bx++) {
                 const wx2 = Math.round(fx + bx);
                 if (wx2 < 0 || wx2 >= w) continue;
-                // Rotate brush coord into stroke-local (rake/flat land edge-on)
                 const lxr =  bx * dx + by * dy;
                 const lyr = -bx * dy + by * dx;
                 const mx = Math.round(halfMask + lxr * invStamp * bSize);
@@ -1490,15 +1617,14 @@ const DitherAlgorithms = (() => {
                 if (mx < 0 || mx >= bSize || my < 0 || my >= bSize) continue;
                 const maskV = bMask[my * bSize + mx];
                 if (maskV < 0.01) continue;
-                // DITHERED coverage — place-or-skip decision via spatial hash,
-                // probability = maskV × decay × pressure × density
                 const prob = Math.min(1, maskV * decay * pressure * coverageDensity);
                 if (sh(wx2, wy2, 10 + ((t|0) & 3)) > prob) continue;
-                // Sample the SOURCE image (real pixel value, no blending)
                 const jx = sampleJitter > 0 ? (sh(wx2, wy2, 20) - 0.5) * sampleJitter * 2 : 0;
                 const jy = sampleJitter > 0 ? (sh(wx2, wy2, 21) - 0.5) * sampleJitter * 2 : 0;
-                const sXi = Math.max(0, Math.min(w-1, Math.round(sOrigX + jx)));
-                const sYi = Math.max(0, Math.min(h-1, Math.round(sOrigY + jy)));
+                const vx = varietyRadius > 0 ? (sh(wx2, wy2, 50 + (t & 3)) - 0.5) * varietyRadius * 2 : 0;
+                const vy = varietyRadius > 0 ? (sh(wx2, wy2, 51 + (t & 3)) - 0.5) * varietyRadius * 2 : 0;
+                const sXi = Math.max(0, Math.min(w-1, Math.round(sOrigX + jx + vx)));
+                const sYi = Math.max(0, Math.min(h-1, Math.round(sOrigY + jy + vy)));
                 o[wy2 * w + wx2] = clamp(px[sYi * w + sXi]);
               }
             }
@@ -1509,24 +1635,53 @@ const DitherAlgorithms = (() => {
           for (let t = 0; t < smearLen; t++) {
             const fx = Math.round(x + dx*t), fy = Math.round(y + dy*t);
             if (fx < 0 || fx >= w || fy < 0 || fy >= h) break;
-            const decay = 1 - t/smearLen;
-            const sOrigX = originX + (fx - originX) * sampleDrift;
-            const sOrigY = originY + (fy - originY) * sampleDrift;
+            const inReal = t < realSmearLen;
+            const decay = inReal
+              ? 1 - t / realSmearLen
+              : Math.max(0, 1 - (t - realSmearLen) / Math.max(1e-6, streakExt)) * 0.5;
+            let sOrigX = originX + (fx - originX) * sampleDrift;
+            let sOrigY = originY + (fy - originY) * sampleDrift;
+            if (wetSmudge > 0) {
+              const dragT = t / Math.max(1, realSmearLen);
+              sOrigX -= dx * smudgeDrag * Math.min(1, dragT);
+              sOrigY -= dy * smudgeDrag * Math.min(1, dragT);
+            }
             for (let ww = -halfKnife; ww < halfKnife; ww++) {
               const wx2 = Math.round(fx - dy*ww);
               const wy2 = Math.round(fy + dx*ww);
               if (wx2 < 0 || wx2 >= w || wy2 < 0 || wy2 >= h) continue;
-              // Edge falloff across the knife width
               const edgeFalloff = 1 - Math.abs(ww) / Math.max(1, halfKnife);
               const prob = Math.min(1, edgeFalloff * decay * pressure * coverageDensity);
               if (sh(wx2, wy2, 10 + ((t|0) & 3)) > prob) continue;
               const jx = sampleJitter > 0 ? (sh(wx2, wy2, 20) - 0.5) * sampleJitter * 2 : 0;
               const jy = sampleJitter > 0 ? (sh(wx2, wy2, 21) - 0.5) * sampleJitter * 2 : 0;
-              const sXi = Math.max(0, Math.min(w-1, Math.round(sOrigX + jx)));
-              const sYi = Math.max(0, Math.min(h-1, Math.round(sOrigY + jy)));
+              const vx = varietyRadius > 0 ? (sh(wx2, wy2, 50 + (t & 3)) - 0.5) * varietyRadius * 2 : 0;
+              const vy = varietyRadius > 0 ? (sh(wx2, wy2, 51 + (t & 3)) - 0.5) * varietyRadius * 2 : 0;
+              const sXi = Math.max(0, Math.min(w-1, Math.round(sOrigX + jx + vx)));
+              const sYi = Math.max(0, Math.min(h-1, Math.round(sOrigY + jy + vy)));
               o[wy2 * w + wx2] = clamp(px[sYi * w + sXi]);
             }
           }
+        }
+      }
+    }
+
+    // — Post-pass: WET BLEED (capillary spread, crisp) —
+    //   Dithered pixel-swap with random neighbor; no blur because we COPY
+    //   source-palette pixels rather than averaging.
+    if (wetBleed > 0) {
+      const bleedRadius = Math.max(1, Math.round(wetBleed * 3));
+      const bleedProb = wetBleed * 0.45;
+      const tmp = new Uint8ClampedArray(o);
+      for (let y = 1; y < h - 1; y++) {
+        const yr = y * w;
+        for (let x = 1; x < w - 1; x++) {
+          if (sh(x, y, 200) > bleedProb) continue;
+          const dx = Math.round((sh(x, y, 201) - 0.5) * 2 * bleedRadius);
+          const dy = Math.round((sh(x, y, 202) - 0.5) * 2 * bleedRadius);
+          const nx = Math.max(0, Math.min(w-1, x + dx));
+          const ny = Math.max(0, Math.min(h-1, y + dy));
+          o[yr + x] = tmp[ny * w + nx];
         }
       }
     }
@@ -4856,6 +5011,15 @@ const DitherAlgorithms = (() => {
       {value:'source',label:'From source (coherent color)'},
       {value:'clean',label:'From blank canvas (classic)'}
     ],default:'source'},
+    // — Detail awareness (human-like placement) —
+    {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
+    {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.7},
+    {id:'skipSmoothAreas',label:'Skip Smooth Areas',min:0,max:1,step:.05,default:.5},
+    // — Wet paint (bleed/streak/smudge) —
+    {id:'wetBleed',label:'Wet Bleed',min:0,max:1,step:.05,default:0},
+    {id:'wetSmudge',label:'Wet Smudge',min:0,max:1,step:.05,default:0},
+    {id:'wetStreak',label:'Wet Streak',min:0,max:1,step:.05,default:0},
+    {id:'colorVariety',label:'Color Variety (multi-color stroke)',min:0,max:1,step:.05,default:.25},
     // — Intensity & adaptive —
     {id:'intensity',label:'Intensity',min:.3,max:3,step:.05,default:1},
     {id:'layers',label:'Layered Passes',min:1,max:4,step:1,default:1},
@@ -4928,6 +5092,13 @@ const DitherAlgorithms = (() => {
     const coverageDensity  = (p.coverageDensity  != null) ? p.coverageDensity  : 0.85;
     const sampleDrift      = (p.sampleDrift      != null) ? p.sampleDrift      : 0.55;
     const sampleJitter     = (p.sampleJitter     != null) ? p.sampleJitter     : 2;
+    const detailAware      = (p.detailAware      != null) ? p.detailAware      : 1;
+    const sizeByDetail     = (p.sizeByDetail     != null) ? p.sizeByDetail     : 0.7;
+    const skipSmoothAreas  = (p.skipSmoothAreas  != null) ? p.skipSmoothAreas  : 0.5;
+    const wetBleed         = (p.wetBleed         != null) ? p.wetBleed         : 0;
+    const wetSmudge        = (p.wetSmudge        != null) ? p.wetSmudge        : 0;
+    const wetStreak        = (p.wetStreak        != null) ? p.wetStreak        : 0;
+    const colorVariety     = (p.colorVariety     != null) ? p.colorVariety     : 0.25;
     const brushShape       = p.brushShape || 'default';
     const seedI            = (p.seed|0) || 42;
 
@@ -4961,30 +5132,46 @@ const DitherAlgorithms = (() => {
     // PIXEL mode — hard writes of sampled source pixels, dithered coverage.
     const cx0 = w / 2, cy0 = h / 2;
     const maxR = Math.sqrt(cx0 * cx0 + cy0 * cy0);
-    const totalDabs = Math.round(p.dabCount * intensity) * layers;
+    let totalDabs = Math.round(p.dabCount * intensity) * layers;
+
+    // Precompute edge field + detail field once (huge speedup vs per-pixel
+    // sobelAt in the inner loops). Also used to drive detail-aware sizing.
+    const sf = sobelField(px, w, h);
+    const edgeMag = sf.mag, edgeAng = sf.ang;
+    const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0;
+    const detail = needDetail ? detailField(px, w, h, 8) : null;
+
+    // When detail-awareness is active, reduce total dabs (a human would
+    // not paint 4000 strokes in a flat sky; we redistribute them).
+    if (detailAware > 0) {
+      totalDabs = Math.round(totalDabs * (1 - detailAware * 0.15));
+    }
 
     for (let i = 0; i < totalDabs; i++) {
       // Dab origin — position-hash so channels agree on locations.
       let x = Math.floor(sh(i, 0, 100) * w);
       let y = Math.floor(sh(i, 0, 101) * h);
 
-      // Edge-boost / adaptive-density acceptance
+      // — Detail-aware placement: skip low-detail candidates more aggressively
+      //   (a human doesn't waste 50 strokes on a smooth sky — a few large
+      //   painterly dabs are enough).
+      let localDetail = 0;  // 0..1, roughly
+      if (detail) {
+        localDetail = Math.min(1, detail[y * w + x] / 40);
+        if (skipSmoothAreas > 0) {
+          // Keep ALL detail strokes, skip up to ~80% of smooth-area strokes.
+          const keepProb = localDetail + (1 - skipSmoothAreas * 0.8);
+          if (sh(i, 0, 120) > Math.min(1, keepProb)) continue;
+        }
+      }
+
+      // Edge-boost / adaptive-density acceptance (uses precomputed fields)
       if (p.edgeBoost > 0 || adaptiveDensity > 0) {
-        const e0 = sobelAt(px, Math.min(w-2, Math.max(1, x)), Math.min(h-2, Math.max(1, y)), w, h);
-        let accept = 0.4 + Math.min(1, e0.mag / 120) * p.edgeBoost * 0.6;
-        if (adaptiveDensity > 0) {
-          let sum = 0, sumSq = 0, n = 0;
-          for (let dyy = -3; dyy <= 3; dyy += 3) for (let dxx = -3; dxx <= 3; dxx += 3) {
-            const nx = x + dxx, ny = y + dyy;
-            if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-              const v = px[ny*w+nx]; sum += v; sumSq += v*v; n++;
-            }
-          }
-          if (n > 0) {
-            const mean = sum / n;
-            const varc = Math.max(0, sumSq / n - mean*mean);
-            accept += Math.min(1, varc / 2500) * adaptiveDensity * 0.8;
-          }
+        const ci = Math.min(h-2, Math.max(1, y)) * w + Math.min(w-2, Math.max(1, x));
+        const mag0 = edgeMag[ci];
+        let accept = 0.4 + Math.min(1, mag0 / 120) * p.edgeBoost * 0.6;
+        if (adaptiveDensity > 0 && detail) {
+          accept += Math.min(1, (detail[y*w+x] / 50) * 2) * adaptiveDensity * 0.8;
         }
         if (sh(i, 0, 102) > accept) continue;
       }
@@ -5001,9 +5188,10 @@ const DitherAlgorithms = (() => {
       // Dark-first weighting: probabilistically skip light areas
       if (darkStrokeWeight > 0 && sh(i, 0, 105) < lumN * darkStrokeWeight) continue;
 
-      // Base stroke direction (perpendicular to gradient)
-      const e = sobelAt(px, Math.min(w-2, Math.max(1, x)), Math.min(h-2, Math.max(1, y)), w, h);
-      let dirAng = e.mag > 5 ? e.ang + Math.PI / 2 : sh(i, 0, 106) * Math.PI * 2;
+      // Base stroke direction (perpendicular to gradient) — precomputed
+      const cIdx = Math.min(h-2, Math.max(1, y)) * w + Math.min(w-2, Math.max(1, x));
+      const eMag = edgeMag[cIdx], eAng = edgeAng[cIdx];
+      let dirAng = eMag > 5 ? eAng + Math.PI / 2 : sh(i, 0, 106) * Math.PI * 2;
       dirAng = dirAng * p.flowStrength + (sh(i, 0, 107) * Math.PI * 2) * (1 - p.flowStrength);
       if (angleJitter > 0) dirAng += (sh(i, 0, 108) - 0.5) * angleJitter * Math.PI;
 
@@ -5017,11 +5205,21 @@ const DitherAlgorithms = (() => {
       else if (p.illusion === 'chromabber') { const ofs = rN * p.illusionStrength * 6; ox = Math.cos(phi)*ofs; oy = Math.sin(phi)*ofs; }
       else if (p.illusion === 'spiral') dirAng += (phi + rN * Math.PI * 2 * p.illusionStrength);
 
+      // Detail-aware sizing: smooth regions → big painterly dabs,
+      // detail regions → small precise dabs. sizeByDetail controls strength.
+      // (Classic impressionist behavior: broad sky strokes, tight feature strokes.)
+      let detailSizeMul = 1;
+      if (detail && sizeByDetail > 0) {
+        // smoothFactor: 0 where lots of detail, 1 where smooth
+        const smoothFactor = 1 - localDetail;
+        detailSizeMul = 1 + smoothFactor * sizeByDetail * 3.0; // up to 4x in skies
+      }
+
       // Dab size + length modulation
       const lenMul = 1 + (1 - srcVal/255) * p.lumModulation * 0.4;
-      let len = p.dabLen * lenMul;
+      let len = p.dabLen * lenMul * detailSizeMul;
       if (lengthJitter > 0) len *= (1 + (sh(i, 0, 109) - 0.5) * lengthJitter * 1.5);
-      let width = p.dabWidth;
+      let width = p.dabWidth * detailSizeMul;
       if (sizeJitter > 0) width *= (1 + (sh(i, 0, 110) - 0.5) * sizeJitter * 1.5);
       width = Math.max(0.5, width);
       len   = Math.max(1, len);
@@ -5029,93 +5227,139 @@ const DitherAlgorithms = (() => {
       const opacMul = 1 + (1 - lumN) * opacityByLum;
       const curveAmp = strokeCurve * len * 0.15;
 
-      // Impurities: shift sample origin for this dab (so the whole stroke
-      // reveals a different nearby pixel — "dirty paint" sampled from the
-      // neighborhood instead of the exact click point)
+      // Impurities: shift sample origin for this dab (dirty paint)
       const impX = impurities > 0 ? (sh(i, 0, 111) - 0.5) * impurities * 10 : 0;
       const impY = impurities > 0 ? (sh(i, 0, 112) - 0.5) * impurities * 10 : 0;
 
+      // — Wet-paint per-dab offsets —
+      // STREAK extends the stroke beyond its "real" length with decaying
+      // coverage and sample-drift. The stroke looks like it was pulled with
+      // a loaded brush — long tail of diminishing color.
+      const streakLen = wetStreak > 0 ? len * (0.5 + wetStreak * 1.5) : 0;
+      // SMUDGE drags the sample origin ALONG the stroke direction for every
+      // stamp — colors from earlier in the stroke bleed forward, like when
+      // your brush hasn't fully released the pigment from the start-point.
+      const smudgeDrag = wetSmudge * len * 0.6;
+      // COLOR VARIETY: this stroke's "fiber bundle" — an additional
+      // per-pixel sample offset that lets a single stroke reveal multiple
+      // source colors. Hashed per-dab and per-pixel for a painterly mix.
+      const varietyRadius = colorVariety * (Math.max(width, len) * 0.35);
+
       const cosA = Math.cos(dirAng), sinA = Math.sin(dirAng);
-      const halfLen = len / 2, halfW = width / 2;
+      const halfLen = Math.max(len, streakLen) / 2, halfW = width / 2;
       const bboxR = Math.ceil(Math.max(halfLen, halfW)) + 1;
 
-      // — Rasterize with dithered hard-writes of source pixels —
-      if (bMask && bSize > 0) {
-        // Brush-mask stamp oriented along stroke
-        for (let ty = -bboxR; ty <= bboxR; ty++) for (let tx = -bboxR; tx <= bboxR; tx++) {
-          const lx = tx * cosA + ty * sinA;
-          const ly = -tx * sinA + ty * cosA;
-          const dn = lx / halfLen, dw = ly / halfW;
-          if (dn*dn + dw*dw > 1) continue;
-          const mx = Math.round((dn + 1) * 0.5 * (bSize - 1));
+      // Main rasterize loop — use `stamp()` helper for both brush-mask and
+      // built-in ellipse paths. Unified so wet-paint effects apply uniformly.
+      const useMask = (bMask && bSize > 0);
+      const halfLenReal = len / 2;
+      for (let ty = -bboxR; ty <= bboxR; ty++) for (let tx = -bboxR; tx <= bboxR; tx++) {
+        const lx = tx * cosA + ty * sinA;    // along stroke
+        const ly = -tx * sinA + ty * cosA;   // perpendicular
+        const dn = lx / halfLenReal;
+        const dw = ly / halfW;
+
+        // Coverage profile — maskV or soft ellipse. For streak extension,
+        // coverage fades from the end of the real dab out along +stroke.
+        let maskV;
+        if (useMask) {
+          // Brush mask — allow extension beyond real length via streak tail
+          if (dn < -1 || dn > 1 + streakLen/len || Math.abs(dw) > 1) continue;
+          // Map dn∈[-1,1] to mask x; dn>1 falls into streak tail
+          const inDab = (dn >= -1 && dn <= 1);
+          const mx = inDab ? Math.round((dn + 1) * 0.5 * (bSize - 1))
+                           : (bSize - 1);
           const my = Math.round((dw + 1) * 0.5 * (bSize - 1));
           if (mx < 0 || mx >= bSize || my < 0 || my >= bSize) continue;
-          const maskV = bMask[my * bSize + mx];
+          maskV = bMask[my * bSize + mx];
+          if (!inDab) {
+            // Streak falloff — exponentially decaying tail beyond dab
+            const streakT = (dn - 1) / Math.max(1e-6, streakLen / len);
+            maskV *= Math.max(0, 1 - streakT);
+          }
           if (maskV < 0.01) continue;
-          let pxx = x + tx + ox;
-          let pyy = y + ty + oy;
-          if (curveAmp > 0) {
-            const sn = dn;
-            pxx += Math.sin(sn * Math.PI) * curveAmp * (-sinA);
-            pyy += Math.sin(sn * Math.PI) * curveAmp * cosA;
+        } else {
+          const dnA = Math.abs(dn), dwA = Math.abs(dw);
+          const r2 = dnA*dnA + dwA*dwA;
+          if (r2 > 1) {
+            // Streak extension: only allowed forward along stroke
+            if (streakLen <= 0 || dn <= 1 || Math.abs(dw) > 1) continue;
+            const streakT = (dn - 1) / Math.max(1e-6, streakLen / len);
+            if (streakT > 1) continue;
+            maskV = (1 - streakT) * (1 - Math.abs(dw)) * 0.7;
+            if (maskV < 0.01) continue;
+          } else {
+            maskV = p.softness > 0 ? (1 - Math.pow(r2, 0.5 + p.softness * 2)) : 1;
           }
-          pxx = Math.round(pxx); pyy = Math.round(pyy);
-          if (pxx < 0 || pxx >= w || pyy < 0 || pyy >= h) continue;
-          if (edgeBreak > 0) {
-            const e2 = sobelAt(px, Math.min(w-2, Math.max(1, pxx)), Math.min(h-2, Math.max(1, pyy)), w, h);
-            if (sh(pxx, pyy, 30) < Math.min(1, e2.mag / 120) * edgeBreak) continue;
-          }
-          // Dithered coverage: place-or-skip decision via position hash,
-          // probability = maskV × opacityMul × density. Pixel decisions are
-          // identical across channels → dabs have crisp edges, not alpha blur.
-          const prob = Math.min(1, maskV * opacMul * coverageDensity);
-          if (sh(pxx, pyy, 31 + (i & 7)) > prob) continue;
-          // Sample origin drifts from dab center towards this pixel.
-          // sampleDrift=0 → whole dab is one source pixel (solid color).
-          // sampleDrift=1 → dab reveals image under mask (varied color).
-          const sOx = x + (pxx - x) * sampleDrift + impX;
-          const sOy = y + (pyy - y) * sampleDrift + impY;
-          const jx = sampleJitter > 0 ? (sh(pxx, pyy, 40) - 0.5) * sampleJitter * 2 : 0;
-          const jy = sampleJitter > 0 ? (sh(pxx, pyy, 41) - 0.5) * sampleJitter * 2 : 0;
-          const sXi = Math.max(0, Math.min(w-1, Math.round(sOx + jx)));
-          const sYi = Math.max(0, Math.min(h-1, Math.round(sOy + jy)));
-          // HARD write — no blending. Source pixel value goes straight in.
-          o[pyy * w + pxx] = clamp(px[sYi * w + sXi]);
         }
-      } else {
-        // Built-in soft elliptical dab
-        for (let ty = -bboxR; ty <= bboxR; ty++) for (let tx = -bboxR; tx <= bboxR; tx++) {
-          const lx = tx * cosA + ty * sinA;
-          const ly = -tx * sinA + ty * cosA;
-          const dn = Math.abs(lx) / halfLen, dw = Math.abs(ly) / halfW;
-          const r2 = dn*dn + dw*dw;
-          if (r2 > 1) continue;
-          const soft = p.softness > 0 ? (1 - Math.pow(r2, 0.5 + p.softness * 2)) : 1;
-          let pxx = x + tx + ox;
-          let pyy = y + ty + oy;
-          if (curveAmp > 0) {
-            const sn = lx / halfLen;
-            pxx += Math.sin(sn * Math.PI) * curveAmp * (-sinA);
-            pyy += Math.sin(sn * Math.PI) * curveAmp * cosA;
-          }
-          pxx = Math.round(pxx); pyy = Math.round(pyy);
-          if (pxx < 0 || pxx >= w || pyy < 0 || pyy >= h) continue;
-          if (edgeBreak > 0) {
-            const e2 = sobelAt(px, Math.min(w-2, Math.max(1, pxx)), Math.min(h-2, Math.max(1, pyy)), w, h);
-            if (sh(pxx, pyy, 30) < Math.min(1, e2.mag / 120) * edgeBreak) continue;
-          }
-          const prob = Math.min(1, soft * opacMul * coverageDensity);
-          if (sh(pxx, pyy, 31 + (i & 7)) > prob) continue;
-          const sOx = x + (pxx - x) * sampleDrift + impX;
-          const sOy = y + (pyy - y) * sampleDrift + impY;
-          const jx = sampleJitter > 0 ? (sh(pxx, pyy, 40) - 0.5) * sampleJitter * 2 : 0;
-          const jy = sampleJitter > 0 ? (sh(pxx, pyy, 41) - 0.5) * sampleJitter * 2 : 0;
-          const sXi = Math.max(0, Math.min(w-1, Math.round(sOx + jx)));
-          const sYi = Math.max(0, Math.min(h-1, Math.round(sOy + jy)));
-          o[pyy * w + pxx] = clamp(px[sYi * w + sXi]);
+
+        let pxx = x + tx + ox;
+        let pyy = y + ty + oy;
+        if (curveAmp > 0) {
+          const sn = dn;
+          pxx += Math.sin(sn * Math.PI) * curveAmp * (-sinA);
+          pyy += Math.sin(sn * Math.PI) * curveAmp * cosA;
+        }
+        pxx = Math.round(pxx); pyy = Math.round(pyy);
+        if (pxx < 0 || pxx >= w || pyy < 0 || pyy >= h) continue;
+
+        if (edgeBreak > 0) {
+          const e2mag = edgeMag[pyy * w + pxx];
+          if (sh(pxx, pyy, 30) < Math.min(1, e2mag / 120) * edgeBreak) continue;
+        }
+
+        // Dithered coverage threshold
+        const prob = Math.min(1, maskV * opacMul * coverageDensity);
+        if (sh(pxx, pyy, 31 + (i & 7)) > prob) continue;
+
+        // — Sample origin: drift from dab center towards pixel, plus impurities
+        //   and smudge drag along stroke direction.
+        let sOx = x + (pxx - x) * sampleDrift + impX;
+        let sOy = y + (pyy - y) * sampleDrift + impY;
+        if (wetSmudge > 0) {
+          // "Drag" the sample back along stroke direction by dn∈[-1..streakT]
+          // — pixels at the end of the stroke reveal colors from the start.
+          const dragT = Math.max(0, dn + 1) * 0.5;  // 0 at start, 1 at end
+          sOx -= cosA * smudgeDrag * dragT;
+          sOy -= sinA * smudgeDrag * dragT;
+        }
+
+        // Jitter + color variety (fiber-style multi-color within a stroke)
+        const jx = sampleJitter > 0 ? (sh(pxx, pyy, 40) - 0.5) * sampleJitter * 2 : 0;
+        const jy = sampleJitter > 0 ? (sh(pxx, pyy, 41) - 0.5) * sampleJitter * 2 : 0;
+        const vx = varietyRadius > 0 ? (sh(pxx, pyy, 50 + (i & 3)) - 0.5) * varietyRadius * 2 : 0;
+        const vy = varietyRadius > 0 ? (sh(pxx, pyy, 51 + (i & 3)) - 0.5) * varietyRadius * 2 : 0;
+
+        const sXi = Math.max(0, Math.min(w-1, Math.round(sOx + jx + vx)));
+        const sYi = Math.max(0, Math.min(h-1, Math.round(sOy + jy + vy)));
+        // HARD write — no blending.
+        o[pyy * w + pxx] = clamp(px[sYi * w + sXi]);
+      }
+    }
+
+    // — Post-pass: WET BLEED (capillary spread) —
+    //   Dithered pixel-swap with neighbors, so wet color creeps outward
+    //   without blurring — same "crisp bleed" approach as the paint engine's
+    //   wetLayer evolution. Seeded by position so it's deterministic &
+    //   coherent across RGB channels.
+    if (wetBleed > 0) {
+      const bleedRadius = Math.max(1, Math.round(wetBleed * 3));
+      const bleedProb = wetBleed * 0.45;
+      const tmp = new Uint8ClampedArray(o);
+      for (let y = 1; y < h - 1; y++) {
+        const yr = y * w;
+        for (let x = 1; x < w - 1; x++) {
+          if (sh(x, y, 200) > bleedProb) continue;
+          // Pick a neighbor to copy from (dithered random direction)
+          const dx = Math.round((sh(x, y, 201) - 0.5) * 2 * bleedRadius);
+          const dy = Math.round((sh(x, y, 202) - 0.5) * 2 * bleedRadius);
+          const nx = Math.max(0, Math.min(w-1, x + dx));
+          const ny = Math.max(0, Math.min(h-1, y + dy));
+          o[yr + x] = tmp[ny * w + nx];
         }
       }
     }
+
     return o;
   }});
 

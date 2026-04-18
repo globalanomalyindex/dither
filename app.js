@@ -286,7 +286,12 @@
     const paintedState = hasPaint ? PaintEngine.getPaintedState() : null;
     const paintBase = hasPaint ? PaintEngine.getBaseSnapshot() : null;
 
-    requestAnimationFrame(() => {
+    // Double-rAF: first frame paints the overlay; second frame actually runs
+    // the (blocking) heavy work. Without this, a synchronous algorithm runs
+    // inside the same rAF that just inserted the overlay into the DOM — the
+    // browser never gets a paint tick, so the "Processing…" dialog never
+    // shows up until AFTER the work already finished and got removed again.
+    requestAnimationFrame(() => { requestAnimationFrame(() => {
       let result = DitherEngine.process(buildPipeline(), buildGlobals(), PREVIEW_MAX);
       if (result) {
         // Apply grain layers
@@ -308,7 +313,7 @@
       // Capture the final frame for Undo — state + pixels from the same
       // moment so restoration is pixel-exact.
       pushUndo();
-    });
+    });});
   }
 
   // Processing overlay: blocks pointer events on the canvas and "heavy"
