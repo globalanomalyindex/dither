@@ -1579,17 +1579,19 @@ const DitherAlgorithms = (() => {
 
     const baseSp = Math.max(2, Math.round(p.size * 0.8));
 
-    // Chunk cadence for cooperative yielding: `yield o` here lets applyAsync
-    // pause the browser event loop + report progress. In sync apply() drain,
-    // these yields become no-op wrappers.
-    const ROW_CHUNK = 12;
+    // Chunk cadence for cooperative yielding: `yield o` lets applyAsync
+    // pause the event loop + paint progress. Yield STROKE-based (not row-
+    // based) so brush-mask strokes — which can each take 10+ms with a
+    // big stamp footprint — still produce visible progress before the row
+    // completes. Sync apply() drain ignores these yields.
+    const STROKE_CHUNK = 40;
+    let strokesSinceYield = 0;
 
     for (let layer = 0; layer < layers; layer++) {
       const layerAng = (layers > 1) ? (layer / layers) * Math.PI * 0.35 : 0;
       const ox = (layer * (baseSp >> 1)) % baseSp;
       const oy = (layer * (baseSp >> 2)) % baseSp;
 
-      let rowsThisChunk = 0;
       for (let y = oy; y < h; y += baseSp) {
         for (let x = ox; x < w; x += baseSp) {
         const ex = Math.min(w-2, Math.max(1, x));
@@ -1660,7 +1662,13 @@ const DitherAlgorithms = (() => {
 
         // Brush-stamp inner loop
         if (bMask && bSize > 0) {
-          const stampSz = Math.max(1, knifeW * 0.5);
+          // HARD CAP on stampSz — stamp footprint is stampSz^2 per t-step, so
+          // letting detail-aware sizing push knifeW up to ~80 means 40x40=1600
+          // inner ops per stamp × ~150 smear steps = 240k per stroke. With
+          // ~2000 strokes that's 500M ops — tens of seconds. Capping stampSz
+          // at 10 keeps the brush visually meaningful while killing the
+          // quadratic explosion that was freezing the page.
+          const stampSz = Math.min(10, Math.max(1, knifeW * 0.5));
           const invStamp = 1 / (2 * stampSz);
           const halfMask = (bSize - 1) / 2;
           for (let t = 0; t < smearLen; t++) {
@@ -1742,12 +1750,12 @@ const DitherAlgorithms = (() => {
             }
           }
         }
-        }  // end x-loop
-        rowsThisChunk++;
-        if (rowsThisChunk >= ROW_CHUNK) {
-          rowsThisChunk = 0;
+        strokesSinceYield++;
+        if (strokesSinceYield >= STROKE_CHUNK) {
+          strokesSinceYield = 0;
           yield o;  // cooperative pause — applyAsync sees this; sync drain ignores.
         }
+        }  // end x-loop
       }  // end y-loop
       yield o;
     }
@@ -5303,7 +5311,9 @@ const DitherAlgorithms = (() => {
     // Chunk cadence for cooperative yielding — yield every N dabs so
     // applyAsync can paint progress + respond to cancellation. Sync drain
     // ignores these yields, so zero perf cost in the sync path.
-    const DAB_CHUNK = 500;
+    // Smaller chunks = more frequent visible progress. 150 dabs typically
+    // = ~15-30ms of work, giving ~30fps progress updates.
+    const DAB_CHUNK = 150;
 
     for (let i = 0; i < totalDabs; i++) {
       if (i > 0 && (i % DAB_CHUNK) === 0) yield o;
@@ -5406,7 +5416,12 @@ const DitherAlgorithms = (() => {
 
       const cosA = Math.cos(dirAng), sinA = Math.sin(dirAng);
       const halfLen = Math.max(len, streakLen) / 2, halfW = width / 2;
-      const bboxR = Math.ceil(Math.max(halfLen, halfW)) + 1;
+      // HARD CAP on bbox radius — the dab rasterize loop iterates bboxR²
+      // pixels PER DAB. Detail-aware sizing can push halfLen past 100,
+      // which explodes to 40k+ iterations per dab × 4000 dabs = freeze.
+      // Capping at 25 keeps dabs visually large enough without the
+      // quadratic blowup; users who want huge dabs can raise dabLen.
+      const bboxR = Math.min(25, Math.ceil(Math.max(halfLen, halfW)) + 1);
 
       // Main rasterize loop — use `stamp()` helper for both brush-mask and
       // built-in ellipse paths. Unified so wet-paint effects apply uniformly.
