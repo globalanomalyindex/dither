@@ -2049,6 +2049,24 @@ const PaintEngine = (() => {
     _cursorCache = { brush: -1, size: 0, url: '' };
   }
 
+  // ── Brush mask accessors for cross-module use (algorithms that want to
+  // stamp using a paintstroke brush shape). Returns {mask, size} or null. ──
+  function getBrushMask(idx) {
+    if (brushLibrary.length === 0) initDefaultBrushes();
+    const i = idx | 0;
+    if (i < 0 || i >= brushLibrary.length) return null;
+    const b = brushLibrary[i];
+    return b && b.mask ? { mask: b.mask, size: b.size, name: b.name } : null;
+  }
+  function getBrushMaskCount() {
+    if (brushLibrary.length === 0) initDefaultBrushes();
+    return brushLibrary.length;
+  }
+  function getBrushNames() {
+    if (brushLibrary.length === 0) initDefaultBrushes();
+    return brushLibrary.map(b => b.name);
+  }
+
   // ── Public API ──
   return {
     init, beginStroke, continueStroke, endStroke,
@@ -2072,6 +2090,8 @@ const PaintEngine = (() => {
     selectBrush, getBrushes, getSelectedBrush, getBrushThumbnail,
     addBrush, extractBrushFromImage, capturePickupStamp, hasStamp, getStampSize,
     getSettings, updateActiveMask,
-    getBrushCursorURL, invalidateCursorCache
+    getBrushCursorURL, invalidateCursorCache,
+    // Cross-module brush access (for algorithms like palette-knife/impressionism)
+    getBrushMask, getBrushMaskCount, getBrushNames
   };
 })();

@@ -1311,38 +1311,174 @@ const DitherAlgorithms = (() => {
   }});
 
   A.push({ id:'palette-knife', name:'Palette Knife', category:'reconstructive', params:[
-    {id:'size',label:'Knife Size',min:4,max:20,step:1,default:10},
-    {id:'smear',label:'Smear Length',min:5,max:40,step:1,default:15},
-    {id:'pressure',label:'Pressure',min:.3,max:1,step:.05,default:.7},
+    // — Core shape (same defaults as before) —
+    {id:'size',label:'Knife Size',min:4,max:40,step:1,default:10},
+    {id:'smear',label:'Smear Length',min:5,max:100,step:1,default:15},
+    {id:'pressure',label:'Pressure',min:.1,max:1.5,step:.05,default:.7},
+    // — Intensity & layering —
+    {id:'intensity',label:'Intensity',min:.3,max:3,step:.05,default:1},
+    {id:'layers',label:'Layered Passes',min:1,max:5,step:1,default:1},
+    // — Light/shadow/edge sensitivity —
+    {id:'edgeSensitivity',label:'Edge Sensitivity',min:0,max:2,step:.05,default:0},
+    {id:'lightShadowBias',label:'Light/Shadow Bias',min:-1,max:1,step:.05,default:0},
+    {id:'sizeByLight',label:'Size from Luminance',min:-1,max:1,step:.05,default:0},
+    {id:'lengthByEdge',label:'Length from Edge',min:0,max:1,step:.05,default:0},
+    {id:'pressureByEdge',label:'Pressure from Edge',min:0,max:1,step:.05,default:0},
+    // — Paint behavior —
+    {id:'colorPickup',label:'Color Pickup',min:-1,max:1,step:.05,default:0},
+    {id:'angleJitter',label:'Angle Jitter',min:0,max:2,step:.05,default:.5},
+    {id:'pressureJitter',label:'Pressure Jitter',min:0,max:1,step:.05,default:0},
+    // — Brush shape (optional: use PaintEngine brush mask) —
+    {id:'brushShape',label:'Brush Shape',type:'select',options:[
+      {value:'default',label:'Built-in knife edge'},
+      {value:'0',label:'Round Soft'},
+      {value:'1',label:'Round Hard'},
+      {value:'2',label:'Flat'},
+      {value:'3',label:'Splatter'},
+      {value:'4',label:'Noise'},
+      {value:'5',label:'Stipple'},
+      {value:'6',label:'Rake'},
+      {value:'7',label:'Dry Brush'},
+      {value:'8',label:'Charcoal'},
+      {value:'9',label:'Fan'}
+    ],default:'default'},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
-    const o=new Uint8ClampedArray(w*h),r=mkRand(p.seed);
-    const buf=new Float32Array(px); // start from source
-    const sp=Math.max(2,Math.round(p.size*0.8));
-    for(let y=0;y<h;y+=sp)for(let x=0;x<w;x+=sp){
-      // Edge direction for smear
-      const e=sobelAt(px,Math.min(w-2,Math.max(1,x)),Math.min(h-2,Math.max(1,y)),w,h);
-      const ang=e.ang+Math.PI/2+(r()-.5)*0.5;
-      const dx=Math.cos(ang),dy=Math.sin(ang);
-      // Pick up paint from starting point
-      let paint=clamp(buf[y*w+x]);
-      const len=p.smear*(0.5+r()*0.5);
-      for(let t=0;t<len;t++){
-        const fx=Math.round(x+dx*t),fy=Math.round(y+dy*t);
-        if(fx<0||fx>=w||fy<0||fy>=h)break;
-        for(let ww=-p.size/3;ww<p.size/3;ww++){
-          const wx2=Math.round(fx-dy*ww),wy2=Math.round(fy+dx*ww);
-          if(wx2>=0&&wx2<w&&wy2>=0&&wy2<h){
-            const decay=1-t/len;
-            const alpha=decay*p.pressure*0.6;
-            // Mix paint with surface
-            paint=paint*0.98+buf[wy2*w+wx2]*0.02;
-            buf[wy2*w+wx2]=buf[wy2*w+wx2]*(1-alpha)+paint*alpha;
+    const o = new Uint8ClampedArray(w*h);
+    const r = mkRand(p.seed);
+    const buf = new Float32Array(px); // start from source
+
+    // — Param normalization (all optional so defaults match the legacy knife) —
+    const intensity     = (p.intensity     != null) ? p.intensity     : 1;
+    const layers        = Math.max(1, (p.layers    != null) ? p.layers|0 : 1);
+    const edgeSens      = (p.edgeSensitivity != null) ? p.edgeSensitivity : 0;
+    const lsBias        = (p.lightShadowBias != null) ? p.lightShadowBias : 0;
+    const sizeByLight   = (p.sizeByLight  != null) ? p.sizeByLight  : 0;
+    const lengthByEdge  = (p.lengthByEdge != null) ? p.lengthByEdge : 0;
+    const pressureByEdge= (p.pressureByEdge != null) ? p.pressureByEdge : 0;
+    const colorPickup   = (p.colorPickup  != null) ? p.colorPickup  : 0;
+    const angleJitter   = (p.angleJitter  != null) ? p.angleJitter  : 0.5;
+    const pressureJit   = (p.pressureJitter != null) ? p.pressureJitter : 0;
+    const brushShape    = p.brushShape || 'default';
+
+    // Pull brush mask lazily — PaintEngine lives in a separate script, loaded
+    // after dither.js. If the user picked a shape but the engine isn't ready
+    // (test/headless contexts), fall through to the built-in knife edge.
+    let bMask = null, bSize = 0;
+    if (brushShape !== 'default' && typeof PaintEngine !== 'undefined' && PaintEngine.getBrushMask) {
+      const bi = parseInt(brushShape, 10);
+      if (!isNaN(bi)) {
+        const b = PaintEngine.getBrushMask(bi);
+        if (b) { bMask = b.mask; bSize = b.size; }
+      }
+    }
+
+    const baseSp = Math.max(2, Math.round(p.size * 0.8));
+
+    for (let layer = 0; layer < layers; layer++) {
+      // Per-layer angle nudge so multi-pass looks like genuine cross-hatched
+      // knife work rather than the same pass repeated.
+      const layerAng = (layers > 1) ? (layer / layers) * Math.PI * 0.35 : 0;
+      // Stagger the grid origin per layer so strokes interleave
+      const ox = (layer * (baseSp >> 1)) % baseSp;
+      const oy = (layer * (baseSp >> 2)) % baseSp;
+
+      for (let y = oy; y < h; y += baseSp) for (let x = ox; x < w; x += baseSp) {
+        const e = sobelAt(px, Math.min(w-2, Math.max(1, x)), Math.min(h-2, Math.max(1, y)), w, h);
+        const edgeN = Math.min(1, e.mag / 120);
+        const lum = clamp(buf[y*w+x]) / 255;  // 0..1
+
+        // Edge sensitivity: probabilistically reject flat regions (higher
+        // edgeSens = only stroke near edges; 0 = uniform like the original).
+        if (edgeSens > 0) {
+          const accept = 1 - edgeSens * 0.5 + edgeN * edgeSens * 0.9;
+          if (r() > accept) continue;
+        }
+
+        // Light/shadow bias: +1 keeps strokes only in highlights,
+        // -1 keeps strokes only in shadows, 0 = accept all.
+        if (lsBias !== 0) {
+          const target = lsBias > 0 ? lum : (1 - lum);
+          if (r() > 0.3 + target * Math.abs(lsBias) * 0.7) continue;
+        }
+
+        // Stroke direction: perpendicular to gradient + jitter + layer angle
+        const ang = e.ang + Math.PI/2 + (r() - 0.5) * angleJitter + layerAng;
+        const dx = Math.cos(ang), dy = Math.sin(ang);
+
+        // Knife size modulated by luminance (±). sizeByLight=+1 → wider in
+        // highlights (dramatic whites); -1 → wider in shadows.
+        const sizeMul = 1 + (sizeByLight > 0 ? lum : (1 - lum)) * Math.abs(sizeByLight) * 1.8;
+        const knifeW = p.size * sizeMul;
+
+        // Smear length modulated by edge magnitude (lengthByEdge>0 = long
+        // strokes at edges, short in flat areas — reads like real knife marks).
+        const lenBase = p.smear * (0.5 + r() * 0.5);
+        const smearLen = lenBase * (1 + edgeN * lengthByEdge * 2.5);
+
+        // Pressure = base × intensity × jitter × edge-boost. Skip r() when
+        // jitter is 0 so seeded output matches the legacy knife exactly.
+        const jitterMul = pressureJit > 0 ? (1 + (r() - 0.5) * pressureJit) : 1;
+        const edgeBoost = pressureByEdge > 0 ? (1 + edgeN * pressureByEdge * 2) : 1;
+        const pressure = Math.max(0, Math.min(2, p.pressure * intensity * jitterMul * edgeBoost));
+
+        let paint = clamp(buf[y*w+x]);
+
+        for (let t = 0; t < smearLen; t++) {
+          const fx = Math.round(x + dx*t), fy = Math.round(y + dy*t);
+          if (fx < 0 || fx >= w || fy < 0 || fy >= h) break;
+
+          if (bMask && bSize > 0) {
+            // Stamp using a PaintEngine brush mask — shape varies per brush
+            const stampSz = Math.max(1, knifeW * 0.5);
+            const invStamp = 1 / (2 * stampSz);
+            const halfMask = (bSize - 1) / 2;
+            for (let by = -stampSz; by <= stampSz; by++) {
+              const wy2 = Math.round(fy + by);
+              if (wy2 < 0 || wy2 >= h) continue;
+              // Orient the brush along the stroke direction so rake/flat
+              // brushes land edge-on like a real knife pull.
+              for (let bx = -stampSz; bx <= stampSz; bx++) {
+                const wx2 = Math.round(fx + bx);
+                if (wx2 < 0 || wx2 >= w) continue;
+                // Rotate local brush coord into stroke-local space before sampling
+                const lxr =  bx * dx + by * dy;
+                const lyr = -bx * dy + by * dx;
+                const mx = Math.round(halfMask + lxr * invStamp * bSize);
+                const my = Math.round(halfMask + lyr * invStamp * bSize);
+                if (mx < 0 || mx >= bSize || my < 0 || my >= bSize) continue;
+                const maskV = bMask[my * bSize + mx];
+                if (maskV < 0.01) continue;
+                const decay = 1 - t/smearLen;
+                const alpha = Math.min(1, decay * pressure * 0.6 * maskV);
+                // Pickup: colorPickup>0 → paint holds color further (longer smear),
+                // colorPickup<0 → paint mixes with surface faster (washed look).
+                const stickiness = Math.max(0.5, Math.min(1, 0.98 + colorPickup * 0.02));
+                paint = paint * stickiness + buf[wy2*w+wx2] * (1 - stickiness);
+                buf[wy2*w+wx2] = buf[wy2*w+wx2] * (1 - alpha) + paint * alpha;
+              }
+            }
+          } else {
+            // Original perpendicular knife-edge line (unchanged math when
+            // all advanced params are at defaults).
+            const halfKnife = knifeW / 3;
+            for (let ww = -halfKnife; ww < halfKnife; ww++) {
+              const wx2 = Math.round(fx - dy*ww);
+              const wy2 = Math.round(fy + dx*ww);
+              if (wx2 >= 0 && wx2 < w && wy2 >= 0 && wy2 < h) {
+                const decay = 1 - t/smearLen;
+                const alpha = Math.min(1, decay * pressure * 0.6);
+                const stickiness = Math.max(0.5, Math.min(1, 0.98 + colorPickup * 0.02));
+                paint = paint * stickiness + buf[wy2*w+wx2] * (1 - stickiness);
+                buf[wy2*w+wx2] = buf[wy2*w+wx2] * (1 - alpha) + paint * alpha;
+              }
+            }
           }
         }
       }
     }
-    for(let i=0;i<w*h;i++) o[i]=clamp(buf[i]);
+
+    for (let i = 0; i < w*h; i++) o[i] = clamp(buf[i]);
     return o;
   }});
 
@@ -4575,12 +4711,28 @@ const DitherAlgorithms = (() => {
   // several "optical illusion" variants that bend the dab placement to
   // produce Riley-style op-art or subtle chromatic-aberration feel.
   A.push({ id:'impressionism', name:'Impressionism / Op-Art', category:'artistic', params:[
-    {id:'dabCount',label:'Dab Count',min:500,max:20000,step:100,default:4000},
-    {id:'dabLen',label:'Dab Length',min:2,max:30,step:1,default:8},
-    {id:'dabWidth',label:'Dab Width',min:1,max:8,step:1,default:2},
+    // — Core (same defaults as legacy) —
+    {id:'dabCount',label:'Dab Count',min:500,max:40000,step:100,default:4000},
+    {id:'dabLen',label:'Dab Length',min:2,max:60,step:1,default:8},
+    {id:'dabWidth',label:'Dab Width',min:1,max:16,step:1,default:2},
     {id:'flowStrength',label:'Gradient Alignment',min:0,max:1,step:.05,default:.85},
     {id:'lumModulation',label:'Luminance Modulation',min:0,max:2,step:.05,default:1},
     {id:'edgeBoost',label:'Edge Dab Density',min:0,max:2,step:.05,default:.8},
+    // — Intensity & adaptive —
+    {id:'intensity',label:'Intensity',min:.3,max:3,step:.05,default:1},
+    {id:'layers',label:'Layered Passes',min:1,max:4,step:1,default:1},
+    {id:'adaptiveDensity',label:'Adaptive Density (detail)',min:0,max:2,step:.05,default:0},
+    {id:'edgeBreak',label:'Edge Break (stop at edges)',min:0,max:1,step:.05,default:0},
+    {id:'darkStrokeWeight',label:'Dark-First Weight',min:0,max:1,step:.05,default:0},
+    {id:'opacityByLum',label:'Opacity by Luminance',min:0,max:1,step:.05,default:0},
+    // — Per-dab jitter / impurities —
+    {id:'sizeJitter',label:'Size Jitter',min:0,max:1,step:.05,default:0},
+    {id:'lengthJitter',label:'Length Jitter',min:0,max:1,step:.05,default:0},
+    {id:'angleJitter',label:'Angle Jitter',min:0,max:1,step:.05,default:0},
+    {id:'scatter',label:'Position Scatter',min:0,max:30,step:.5,default:0},
+    {id:'impurities',label:'Impurities (tone jitter)',min:0,max:1,step:.05,default:0},
+    {id:'strokeCurve',label:'Stroke Curve',min:0,max:1,step:.05,default:0},
+    // — Illusion modes (unchanged) —
     {id:'illusion',label:'Illusion Mode',type:'select',options:[
       {value:'none',label:'None'},
       {value:'riley',label:'Riley Moiré (wavy bands)'},
@@ -4589,6 +4741,20 @@ const DitherAlgorithms = (() => {
       {value:'spiral',label:'Spiral Twist'}
     ],default:'none'},
     {id:'illusionStrength',label:'Illusion Strength',min:0,max:1,step:.05,default:.5},
+    // — Brush shape (optional PaintEngine mask) —
+    {id:'brushShape',label:'Dab Shape',type:'select',options:[
+      {value:'default',label:'Built-in soft ellipse'},
+      {value:'0',label:'Round Soft'},
+      {value:'1',label:'Round Hard'},
+      {value:'2',label:'Flat'},
+      {value:'3',label:'Splatter'},
+      {value:'4',label:'Noise'},
+      {value:'5',label:'Stipple'},
+      {value:'6',label:'Rake'},
+      {value:'7',label:'Dry Brush'},
+      {value:'8',label:'Charcoal'},
+      {value:'9',label:'Fan'}
+    ],default:'default'},
     {id:'bgTone',label:'Background Tone',min:0,max:255,step:1,default:255},
     {id:'softness',label:'Dab Softness',min:0,max:1,step:.05,default:.4},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
@@ -4599,76 +4765,166 @@ const DitherAlgorithms = (() => {
     const cx0 = w / 2, cy0 = h / 2;
     const maxR = Math.sqrt(cx0 * cx0 + cy0 * cy0);
 
-    // Importance-sampled density: sample more in high-edge regions
-    // (computed cheaply by rejection against local edge magnitude)
+    // — Param normalization (defaults preserve legacy behavior) —
+    const intensity        = (p.intensity        != null) ? p.intensity        : 1;
+    const layers           = Math.max(1, (p.layers != null) ? p.layers|0 : 1);
+    const adaptiveDensity  = (p.adaptiveDensity  != null) ? p.adaptiveDensity  : 0;
+    const edgeBreak        = (p.edgeBreak        != null) ? p.edgeBreak        : 0;
+    const darkStrokeWeight = (p.darkStrokeWeight != null) ? p.darkStrokeWeight : 0;
+    const opacityByLum     = (p.opacityByLum     != null) ? p.opacityByLum     : 0;
+    const sizeJitter       = (p.sizeJitter       != null) ? p.sizeJitter       : 0;
+    const lengthJitter     = (p.lengthJitter     != null) ? p.lengthJitter     : 0;
+    const angleJitter      = (p.angleJitter      != null) ? p.angleJitter      : 0;
+    const scatter          = (p.scatter          != null) ? p.scatter          : 0;
+    const impurities       = (p.impurities       != null) ? p.impurities       : 0;
+    const strokeCurve      = (p.strokeCurve      != null) ? p.strokeCurve      : 0;
+    const brushShape       = p.brushShape || 'default';
+
+    // Brush mask (optional, from PaintEngine)
+    let bMask = null, bSize = 0;
+    if (brushShape !== 'default' && typeof PaintEngine !== 'undefined' && PaintEngine.getBrushMask) {
+      const bi = parseInt(brushShape, 10);
+      if (!isNaN(bi)) {
+        const b = PaintEngine.getBrushMask(bi);
+        if (b) { bMask = b.mask; bSize = b.size; }
+      }
+    }
+
+    const totalDabs = Math.round(p.dabCount * intensity) * layers;
+
     function trySample() {
       const x = Math.floor(rnd() * w), y = Math.floor(rnd() * h);
-      if (p.edgeBoost > 0) {
+      if (p.edgeBoost > 0 || adaptiveDensity > 0) {
         const e = sobelAt(px, Math.min(w-2, Math.max(1, x)), Math.min(h-2, Math.max(1, y)), w, h);
-        const accept = 0.4 + Math.min(1, e.mag / 120) * p.edgeBoost * 0.6;
+        let accept = 0.4 + Math.min(1, e.mag / 120) * p.edgeBoost * 0.6;
+        if (adaptiveDensity > 0) {
+          // Cheap 3x3-ish luminance variance — detail-rich regions draw more dabs
+          let sum = 0, sumSq = 0, n = 0;
+          for (let dyy = -3; dyy <= 3; dyy += 3) for (let dxx = -3; dxx <= 3; dxx += 3) {
+            const nx = x + dxx, ny = y + dyy;
+            if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+              const v = px[ny*w+nx]; sum += v; sumSq += v*v; n++;
+            }
+          }
+          if (n > 0) {
+            const mean = sum / n;
+            const varc = Math.max(0, sumSq / n - mean*mean);
+            accept += Math.min(1, varc / 2500) * adaptiveDensity * 0.8;
+          }
+        }
         if (rnd() > accept) return null;
       }
       return [x, y];
     }
 
-    for (let i = 0; i < p.dabCount; i++) {
+    for (let i = 0; i < totalDabs; i++) {
       const s = trySample();
       if (!s) continue;
-      const [x, y] = s;
-      const srcVal = clamp(px[y * w + x]);
-      const ink = 255 - srcVal;  // dark dabs where image is dark
-      if (ink < 8 && p.lumModulation > 0.5) continue;  // skip white zones
+      let [x, y] = s;
 
-      // Base stroke direction: perpendicular to gradient
+      // Position scatter
+      if (scatter > 0) {
+        x += Math.round((rnd() - 0.5) * scatter * 2);
+        y += Math.round((rnd() - 0.5) * scatter * 2);
+        if (x < 0 || x >= w || y < 0 || y >= h) continue;
+      }
+
+      const srcVal = clamp(px[y * w + x]);
+      const ink = 255 - srcVal;
+      const lumN = srcVal / 255;
+      if (ink < 8 && p.lumModulation > 0.5) continue;
+      // Dark-first weighting: probabilistically skip light areas
+      if (darkStrokeWeight > 0 && rnd() < lumN * darkStrokeWeight) continue;
+
+      // Base stroke direction (unchanged: perpendicular to gradient)
       const e = sobelAt(px, Math.min(w-2, Math.max(1, x)), Math.min(h-2, Math.max(1, y)), w, h);
       let dirAng = e.mag > 5 ? e.ang + Math.PI / 2 : rnd() * Math.PI * 2;
       dirAng = dirAng * p.flowStrength + (rnd() * Math.PI * 2) * (1 - p.flowStrength);
+      if (angleJitter > 0) dirAng += (rnd() - 0.5) * angleJitter * Math.PI;
 
-      // Apply illusion modulation to the dab's direction and position
+      // Illusion modulation (unchanged)
       let ox = 0, oy = 0;
       const dx0 = x - cx0, dy0 = y - cy0;
       const rN = Math.sqrt(dx0*dx0 + dy0*dy0) / maxR;
       const phi = Math.atan2(dy0, dx0);
-      if (p.illusion === 'riley') {
-        // Wavy bands: sine based on distance from center of canvas
-        dirAng += Math.sin(y * 0.05) * p.illusionStrength * 1.2;
-      } else if (p.illusion === 'radial') {
-        // Align dabs toward center so everything radiates out
-        dirAng = phi * (1 - p.illusionStrength) + dirAng * (1 - p.illusionStrength) * 0.5 + phi * p.illusionStrength;
-      } else if (p.illusion === 'chromabber') {
-        // Offset dabs by an amount proportional to radius → chromatic split
-        const ofs = rN * p.illusionStrength * 6;
-        ox = Math.cos(phi) * ofs;
-        oy = Math.sin(phi) * ofs;
-      } else if (p.illusion === 'spiral') {
-        dirAng += (phi + rN * Math.PI * 2 * p.illusionStrength);
-      }
+      if (p.illusion === 'riley') dirAng += Math.sin(y * 0.05) * p.illusionStrength * 1.2;
+      else if (p.illusion === 'radial') dirAng = phi * (1 - p.illusionStrength) + dirAng * (1 - p.illusionStrength) * 0.5 + phi * p.illusionStrength;
+      else if (p.illusion === 'chromabber') { const ofs = rN * p.illusionStrength * 6; ox = Math.cos(phi)*ofs; oy = Math.sin(phi)*ofs; }
+      else if (p.illusion === 'spiral') dirAng += (phi + rN * Math.PI * 2 * p.illusionStrength);
 
-      // Dab length modulated by luminance (darker = longer stroke)
+      // Dab size + length modulation
       const lenMul = 1 + (1 - srcVal/255) * p.lumModulation * 0.4;
-      const len = p.dabLen * lenMul;
-      const width = p.dabWidth;
-      const cosA = Math.cos(dirAng), sinA = Math.sin(dirAng);
+      let len = p.dabLen * lenMul;
+      if (lengthJitter > 0) len *= (1 + (rnd() - 0.5) * lengthJitter * 1.5);
+      let width = p.dabWidth;
+      if (sizeJitter > 0) width *= (1 + (rnd() - 0.5) * sizeJitter * 1.5);
+      width = Math.max(0.5, width);
+      len   = Math.max(1, len);
 
-      // Rasterize a soft elliptical dab
+      // Impurities: per-dab ink tone variation (dirty paint)
+      const inkJit = impurities > 0 ? clamp(ink + (rnd() - 0.5) * 128 * impurities) : ink;
+      const opacMul = 1 + (1 - lumN) * opacityByLum;
+      const curveAmp = strokeCurve * len * 0.15;
+
+      const cosA = Math.cos(dirAng), sinA = Math.sin(dirAng);
       const halfLen = len / 2, halfW = width / 2;
       const bboxR = Math.ceil(Math.max(halfLen, halfW)) + 1;
-      for (let ty = -bboxR; ty <= bboxR; ty++) {
-        for (let tx = -bboxR; tx <= bboxR; tx++) {
-          // Rotate tx/ty into stroke-local space
+
+      // — Rasterize —
+      if (bMask && bSize > 0) {
+        // Brush-mask stamp oriented along stroke
+        for (let ty = -bboxR; ty <= bboxR; ty++) for (let tx = -bboxR; tx <= bboxR; tx++) {
+          const lx = tx * cosA + ty * sinA;
+          const ly = -tx * sinA + ty * cosA;
+          const dn = lx / halfLen, dw = ly / halfW;
+          if (dn*dn + dw*dw > 1) continue;
+          const mx = Math.round((dn + 1) * 0.5 * (bSize - 1));
+          const my = Math.round((dw + 1) * 0.5 * (bSize - 1));
+          if (mx < 0 || mx >= bSize || my < 0 || my >= bSize) continue;
+          const maskV = bMask[my * bSize + mx];
+          if (maskV < 0.01) continue;
+          let px_x = x + tx + ox;
+          let px_y = y + ty + oy;
+          if (curveAmp > 0) {
+            const sn = dn;  // -1..1 along stroke
+            px_x += Math.sin(sn * Math.PI) * curveAmp * (-sinA);
+            px_y += Math.sin(sn * Math.PI) * curveAmp * cosA;
+          }
+          px_x = Math.round(px_x); px_y = Math.round(px_y);
+          if (px_x < 0 || px_x >= w || px_y < 0 || px_y >= h) continue;
+          if (edgeBreak > 0) {
+            const e2 = sobelAt(px, Math.min(w-2, Math.max(1, px_x)), Math.min(h-2, Math.max(1, px_y)), w, h);
+            if (rnd() < Math.min(1, e2.mag / 120) * edgeBreak) continue;
+          }
+          const idx = px_y * w + px_x;
+          const blend = Math.min(1, maskV * (0.4 + Math.min(1, inkJit/128) * 0.6) * opacMul);
+          o[idx] = Math.round(o[idx] * (1 - blend) + (255 - inkJit) * blend);
+        }
+      } else {
+        // Original soft elliptical dab (legacy-compatible at defaults)
+        for (let ty = -bboxR; ty <= bboxR; ty++) for (let tx = -bboxR; tx <= bboxR; tx++) {
           const lx = tx * cosA + ty * sinA;
           const ly = -tx * sinA + ty * cosA;
           const dn = Math.abs(lx) / halfLen, dw = Math.abs(ly) / halfW;
           const r2 = dn*dn + dw*dw;
           if (r2 > 1) continue;
           const soft = p.softness > 0 ? (1 - Math.pow(r2, 0.5 + p.softness * 2)) : 1;
-          const px_x = Math.round(x + tx + ox);
-          const px_y = Math.round(y + ty + oy);
+          let px_x = x + tx + ox;
+          let px_y = y + ty + oy;
+          if (curveAmp > 0) {
+            const sn = lx / halfLen;
+            px_x += Math.sin(sn * Math.PI) * curveAmp * (-sinA);
+            px_y += Math.sin(sn * Math.PI) * curveAmp * cosA;
+          }
+          px_x = Math.round(px_x); px_y = Math.round(px_y);
           if (px_x < 0 || px_x >= w || px_y < 0 || px_y >= h) continue;
+          if (edgeBreak > 0) {
+            const e2 = sobelAt(px, Math.min(w-2, Math.max(1, px_x)), Math.min(h-2, Math.max(1, px_y)), w, h);
+            if (rnd() < Math.min(1, e2.mag / 120) * edgeBreak) continue;
+          }
           const idx = px_y * w + px_x;
-          const blend = soft * (0.4 + Math.min(1, ink/128) * 0.6);
-          // Darken the output toward ink (alpha-style stamp)
-          o[idx] = Math.round(o[idx] * (1 - blend) + (255 - ink) * blend);
+          const blend = Math.min(1, soft * (0.4 + Math.min(1, inkJit/128) * 0.6) * opacMul);
+          o[idx] = Math.round(o[idx] * (1 - blend) + (255 - inkJit) * blend);
         }
       }
     }

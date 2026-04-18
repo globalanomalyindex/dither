@@ -41,6 +41,11 @@
   const paramsContainer = $('params-container');
 
   // ── Undo/Redo System ──
+  // Each entry stores BOTH the state JSON (for sliders/pipeline) AND the
+  // exact canvas bitmap that was visible at snapshot time. Undo is WYSIWYG:
+  // we paint the pixels back directly and do NOT re-run the pipeline, so
+  // any algorithm with even the slightest RNG drift can't make the image
+  // change on undo.
   const undoStack = [];
   const redoStack = [];
   const MAX_UNDO = 40;
@@ -53,18 +58,26 @@
     });
   }
 
+  function capturePixels() {
+    if (!canvas.width || !canvas.height) return null;
+    try { return ctx.getImageData(0, 0, canvas.width, canvas.height); }
+    catch (_) { return null; }
+  }
+
   let lastSnapshot = null;
   function pushUndo() {
     const snap = getStateSnapshot();
     if (snap === lastSnapshot) return;
-    undoStack.push(snap);
+    undoStack.push({ state: snap, pixels: capturePixels() });
     if (undoStack.length > MAX_UNDO) undoStack.shift();
     redoStack.length = 0;
     lastSnapshot = snap;
     updateUndoButtons();
   }
 
-  function restoreSnapshot(json) {
+  function restoreSnapshot(entry) {
+    const json = typeof entry === 'string' ? entry : entry.state;
+    const pixels = typeof entry === 'string' ? null : entry.pixels;
     const data = JSON.parse(json);
     state.selectedAlgorithms = data.selectedAlgorithms;
     state.globals = data.globals;
@@ -75,26 +88,44 @@
       buildGrainParamPanels();
     }
     lastSnapshot = json;
-    // Sync UI
+    // Sync UI first so the sidebar matches the restored state.
     syncUIFromState();
     updateAlgorithmUI();
     buildParamPanels();
-    runProcess();
+    // WYSIWYG restore: paint the snapshot pixels back and skip the pipeline.
+    // The next user-driven change will re-run the pipeline from source.
+    if (pixels && pixels.width && pixels.height) {
+      canvas.width = pixels.width;
+      canvas.height = pixels.height;
+      ctx.putImageData(pixels, 0, 0);
+      updateCanvasTransform();
+    } else {
+      // Legacy entry without pixels — fall back to re-render.
+      runProcess();
+    }
     updateUndoButtons();
   }
 
   function undo() {
     if (undoStack.length === 0) return;
     const currentSnap = getStateSnapshot();
-    redoStack.push(currentSnap);
-    const prev = undoStack.pop();
+    const currentPixels = capturePixels();
+    // If the top of the stack equals the state we're already in (because
+    // scheduleProcess just pushed it), pop past it so "Undo" visibly moves.
+    let prev = undoStack.pop();
+    while (prev && prev.state === currentSnap && undoStack.length > 0) {
+      prev = undoStack.pop();
+    }
+    if (!prev) { updateUndoButtons(); return; }
+    redoStack.push({ state: currentSnap, pixels: currentPixels });
     restoreSnapshot(prev);
   }
 
   function redo() {
     if (redoStack.length === 0) return;
     const currentSnap = getStateSnapshot();
-    undoStack.push(currentSnap);
+    const currentPixels = capturePixels();
+    undoStack.push({ state: currentSnap, pixels: currentPixels });
     const next = redoStack.pop();
     restoreSnapshot(next);
   }
@@ -208,10 +239,13 @@
   });
 
   // ── Debounced processing ──
+  // Note: pushUndo is invoked *after* runProcess finishes (see runProcess
+  // below) so each snapshot's state and pixels are captured from the same
+  // moment — guaranteeing Undo is WYSIWYG.
   let processTimer = null;
   function scheduleProcess(delay = 16) {
     clearTimeout(processTimer);
-    processTimer = setTimeout(() => { pushUndo(); runProcess(); }, delay);
+    processTimer = setTimeout(() => { runProcess(); }, delay);
   }
 
   function buildGlobals() {
@@ -271,17 +305,39 @@
       }
       state.processing = false;
       showProcessing(false);
+      // Capture the final frame for Undo — state + pixels from the same
+      // moment so restoration is pixel-exact.
+      pushUndo();
     });
   }
 
-  function showProcessing(show) {
+  // Processing overlay: blocks pointer events on the canvas and "heavy"
+  // UI buttons while rendering is in flight. Hidden by default for fast
+  // renders — CSS delays the visible plate by 180ms so snappy operations
+  // stay silent; slow ones get a clear "Processing…" indicator so users
+  // don't spam-click or force-reload in frustration.
+  function showProcessing(show, label) {
     let ov = canvasWrapper.querySelector('.processing-overlay');
-    if (show && !ov) {
-      ov = document.createElement('div');
-      ov.className = 'processing-overlay';
-      ov.innerHTML = '<div class="processing-spinner"></div>';
-      canvasWrapper.appendChild(ov);
-    } else if (!show && ov) ov.remove();
+    if (show) {
+      document.body.classList.add('processing');
+      if (!ov) {
+        ov = document.createElement('div');
+        ov.className = 'processing-overlay';
+        ov.innerHTML =
+          '<div class="processing-spinner"></div>' +
+          '<div class="processing-label">' + (label || 'Processing\u2026') + '</div>';
+        // Swallow clicks so spam doesn't queue up more work
+        ov.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); });
+        ov.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); });
+        canvasWrapper.appendChild(ov);
+      } else if (label) {
+        const l = ov.querySelector('.processing-label');
+        if (l) l.textContent = label;
+      }
+    } else {
+      document.body.classList.remove('processing');
+      if (ov) ov.remove();
+    }
   }
 
   // ── Image Upload ──
@@ -331,11 +387,88 @@
 
   let _paintPointerId = null;
 
+  // ── Multi-touch pinch-zoom / two-finger pan state ──
+  // We track every active pointer; as soon as 2 fingers are down, we enter
+  // gesture mode: distance between fingers → zoom, midpoint → pan. This
+  // gives mobile/tablet users native-feeling canvas control without needing
+  // wheel or trackpad gestures.
+  const activePointers = new Map();  // pointerId -> { x, y, type }
+  let gestureMode = false;           // true while 2+ fingers down
+  let gestureStartDist = 0;
+  let gestureStartZoom = 1;
+  let gestureStartPanX = 0, gestureStartPanY = 0;
+  let gestureStartMidX = 0, gestureStartMidY = 0;
+  let gestureStartImgX = 0, gestureStartImgY = 0;  // image-space anchor
+
+  function _gestureMidAndDist() {
+    const pts = [...activePointers.values()];
+    if (pts.length < 2) return null;
+    const a = pts[0], b = pts[1];
+    const midX = (a.x + b.x) / 2, midY = (a.y + b.y) / 2;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    return { midX, midY, dist };
+  }
+
+  function _beginGesture() {
+    const g = _gestureMidAndDist();
+    if (!g) return;
+    gestureMode = true;
+    gestureStartDist = Math.max(1, g.dist);
+    gestureStartZoom = state.zoom;
+    gestureStartPanX = state.panX;
+    gestureStartPanY = state.panY;
+    const rect = canvasWrapper.getBoundingClientRect();
+    gestureStartMidX = g.midX - rect.left;
+    gestureStartMidY = g.midY - rect.top;
+    // Image-space point currently under the midpoint — we keep this
+    // pinned under the midpoint as the pinch scales, like native maps.
+    const cx = rect.width / 2 + state.panX;
+    const cy = rect.height / 2 + state.panY;
+    gestureStartImgX = (gestureStartMidX - cx) / state.zoom;
+    gestureStartImgY = (gestureStartMidY - cy) / state.zoom;
+    // Cancel any in-progress paint/pan — fingers took over.
+    if (isPainting) { PaintEngine.endStroke(); isPainting = false; updateStrokeCount(); }
+    if (isPanning) { isPanning = false; canvasWrapper.classList.remove('panning'); }
+  }
+
+  function _updateGesture() {
+    const g = _gestureMidAndDist();
+    if (!g) return;
+    const rect = canvasWrapper.getBoundingClientRect();
+    const midX = g.midX - rect.left;
+    const midY = g.midY - rect.top;
+    const zoomFactor = g.dist / gestureStartDist;
+    const newZoom = Math.max(0.05, Math.min(gestureStartZoom * zoomFactor, 32));
+    // Keep the pinned image-space point under the (possibly drifting) midpoint.
+    state.zoom = newZoom;
+    state.panX = midX - rect.width / 2 - gestureStartImgX * newZoom;
+    state.panY = midY - rect.height / 2 - gestureStartImgY * newZoom;
+    const zl = $('zoom-level'); if (zl) zl.textContent = Math.round(state.zoom * 100) + '%';
+    updateCanvasTransform();
+  }
+
+  function _endGestureIfNeeded() {
+    if (gestureMode && activePointers.size < 2) {
+      gestureMode = false;
+    }
+  }
+
   canvasWrapper.addEventListener('pointerdown', e => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
     // Brush/pickup selection mode intercepts in capture phase — skip here
     if (brushSelectionMode || pickupSelectionMode) return;
     e.preventDefault();
+
+    // Record every active pointer for multi-touch detection
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
+
+    // Second (or later) touch → enter gesture mode, cancel any active paint/pan
+    if (activePointers.size >= 2 && e.pointerType === 'touch') {
+      _beginGesture();
+      try { canvasWrapper.setPointerCapture(e.pointerId); } catch (_) {}
+      return;
+    }
 
     // Paint mode: paintstroke tab active, Space not held, image loaded
     if (activeTab === 'paintstroke' && !spaceHeld && DitherEngine.getSourceSize()) {
@@ -407,6 +540,17 @@
   }
 
   document.addEventListener('pointermove', e => {
+    // Track every active pointer (multi-touch)
+    if (activePointers.has(e.pointerId)) {
+      activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
+    }
+
+    // Pinch-zoom / two-finger pan takes priority over everything else
+    if (gestureMode) {
+      _updateGesture();
+      return;
+    }
+
     // Update brush cursor position only when shown
     if (activeTab === 'paintstroke' && brushCursor && _cursorOverCanvas) {
       brushCursor.style.left = e.clientX + 'px';
@@ -458,7 +602,25 @@
     updateCanvasTransform();
   });
 
-  document.addEventListener('pointerup', () => {
+  function _handlePointerRelease(e) {
+    activePointers.delete(e.pointerId);
+    // If we were pinching and now only one finger remains, end gesture
+    // but DON'T start pan/paint mid-motion — wait for the user to lift
+    // the last finger and tap again. This avoids a zoom-then-draw glitch.
+    if (gestureMode) {
+      _endGestureIfNeeded();
+      if (!gestureMode) {
+        // Remaining single touch becomes a fresh pan anchor if still down
+        if (activePointers.size === 1) {
+          const [p] = activePointers.values();
+          panStartX = p.x; panStartY = p.y;
+          panStartPanX = state.panX; panStartPanY = state.panY;
+          isPanning = true;
+          canvasWrapper.classList.add('panning');
+        }
+      }
+      return;
+    }
     if (isPainting) {
       isPainting = false;
       PaintEngine.endStroke();
@@ -473,7 +635,9 @@
       isPanning = false;
       canvasWrapper.classList.remove('panning');
     }
-  });
+  }
+  document.addEventListener('pointerup', _handlePointerRelease);
+  document.addEventListener('pointercancel', _handlePointerRelease);
 
   $('btn-fit').addEventListener('click', fitToView);
   $('btn-1x').addEventListener('click', () => { setZoom(1); centerCanvas(); });

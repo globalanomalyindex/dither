@@ -27,6 +27,22 @@
   --fun-glow: rgba(167, 139, 250, 0.35);
   --fun-tint: rgba(167, 139, 250, 0.08);
 
+  /* Gold accent — bake button, "hot" actions */
+  --gold: #f5b939;
+  --gold-bright: #ffd164;
+  --gold-deep: #c88a10;
+  --gold-glow: rgba(245, 185, 57, 0.40);
+  --gold-tint: rgba(245, 185, 57, 0.10);
+
+  /* Cyan accent — pen/paint section, fresh actions */
+  --cyan: #4dd4e2;
+  --cyan-bright: #7aeaf5;
+  --cyan-tint: rgba(77, 212, 226, 0.10);
+
+  /* Pink accent — destructive/reset, caution */
+  --pink: #ff7ab2;
+  --pink-tint: rgba(255, 122, 178, 0.10);
+
   /* Geometry */
   --radius-sm: 4px;
   --radius: 7px;
@@ -198,6 +214,37 @@ button:focus-visible { outline: none; box-shadow: var(--shadow-glow); }
               inset 0 -1px 0 rgba(0,0,0,0.12);
 }
 
+/* ── Bake (golden) — the "commit current look" action ── */
+.btn-bake {
+  background: linear-gradient(180deg, var(--gold-bright) 0%, var(--gold) 55%, var(--gold-deep) 100%);
+  color: #1f1403;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 7px 16px;
+  border: 1px solid rgba(0,0,0,0.15);
+  box-shadow: var(--shadow-sm),
+              inset 0 1px 0 rgba(255,255,255,0.45),
+              inset 0 -1px 0 rgba(0,0,0,0.18),
+              0 0 0 0 var(--gold-glow);
+  text-shadow: 0 1px 0 rgba(255,255,255,0.25);
+  transition: background var(--transition), box-shadow var(--transition),
+              transform var(--transition-fast);
+}
+.btn-bake:hover:not(:disabled) {
+  background: linear-gradient(180deg, #ffdd80 0%, var(--gold-bright) 55%, var(--gold) 100%);
+  box-shadow: var(--shadow-md),
+              inset 0 1px 0 rgba(255,255,255,0.55),
+              inset 0 -1px 0 rgba(0,0,0,0.18),
+              0 0 0 3px var(--gold-glow);
+}
+.btn-bake:disabled {
+  background: var(--bg-raised);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  box-shadow: none;
+  text-shadow: none;
+}
+
 .btn-icon {
   background: var(--bg-raised);
   color: var(--text-dim);
@@ -327,6 +374,31 @@ button:focus-visible { outline: none; box-shadow: var(--shadow-glow); }
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--text-dim);
+  position: relative;
+  padding-left: 8px;
+}
+.sidebar-section h2::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 50%;
+  transform: translateY(-50%);
+  width: 3px; height: 10px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--fun-bright), var(--fun));
+  box-shadow: 0 0 6px var(--fun-glow);
+}
+/* Color-coded accent stripes per tab */
+#tab-dither .sidebar-section h2::before {
+  background: linear-gradient(180deg, var(--gold-bright), var(--gold));
+  box-shadow: 0 0 6px var(--gold-glow);
+}
+#tab-grain .sidebar-section h2::before {
+  background: linear-gradient(180deg, var(--pink), #e85bb0);
+  box-shadow: 0 0 8px rgba(255,122,178,0.4);
+}
+#tab-paintstroke .sidebar-section h2::before {
+  background: linear-gradient(180deg, var(--cyan-bright), var(--cyan));
+  box-shadow: 0 0 8px rgba(77,212,226,0.4);
 }
 
 .sidebar-hint {
@@ -798,25 +870,68 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
 
-/* ── Processing overlay ── */
+/* ── Processing overlay ──
+   Blocks pointer events so rapid clicks on Shuffle/Apply/etc. don't queue
+   up extra work while the engine is busy. Appears instantly for any render
+   but only fades in a visible plate + label after 180ms so fast renders
+   stay silent. */
 .processing-overlay {
   position: absolute;
   inset: 0;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  background: rgba(10,10,10,0.6);
-  z-index: 5;
-  pointer-events: none;
+  gap: 10px;
+  background: rgba(8,8,12,0);
+  z-index: 12;
+  pointer-events: auto;
+  cursor: progress;
+  animation: processing-fade 220ms ease-out 180ms forwards;
+}
+
+@keyframes processing-fade {
+  to { background: rgba(8,8,12,0.55); backdrop-filter: blur(2px) saturate(140%); -webkit-backdrop-filter: blur(2px) saturate(140%); }
 }
 
 .processing-spinner {
-  width: 24px;
-  height: 24px;
+  width: 28px;
+  height: 28px;
   border: 2px solid var(--border);
   border-top-color: var(--fun);
+  border-right-color: var(--gold);
   border-radius: 50%;
-  animation: spin 0.5s linear infinite;
+  animation: spin 0.7s linear infinite;
+  opacity: 0;
+  animation-delay: 180ms;
+  animation-fill-mode: forwards;
+  box-shadow: 0 0 22px var(--fun-glow);
+}
+.processing-overlay .processing-spinner { animation: spin 0.7s linear infinite, processing-show 220ms ease-out 180ms forwards; }
+@keyframes processing-show { to { opacity: 1; } }
+
+.processing-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  opacity: 0;
+  animation: processing-show 220ms ease-out 180ms forwards;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+}
+
+/* Freeze "heavy" action buttons while processing so a user can't queue
+   more work while the current render is still in flight. */
+body.processing .btn-fun,
+body.processing #btn-bake,
+body.processing #btn-randomize-all,
+body.processing .btn-dice,
+body.processing #btn-reset,
+body.processing #btn-apply-algorithm {
+  opacity: 0.5;
+  pointer-events: none;
+  filter: saturate(0.4);
 }
 
 @keyframes spin { to { transform: rotate(360deg); } }
