@@ -99,7 +99,14 @@ const DitherAlgorithms = (() => {
   // is the caller's spatial-hash function for deterministic scatter.
   // `block` is the caller's underpaintBlock (8..40) — controls both wash
   // block size and stroke size.
-  function painterlyUnderpaint(o, px, w, h, block, sh, edgeAng) {
+  //
+  // `bMask` / `bSize` (optional): PaintEngine brush mask (Uint8Array of
+  // bSize*bSize, values 0..255). When supplied, the stroke footprint uses
+  // the mask shape rotated to the stroke angle instead of a hard ellipse,
+  // so underpaint strokes inherit the selected Brush Shape (bristles,
+  // splatter, knife edge, etc.) — matching the top-layer dabs. Falls back
+  // to the ellipse weight when no mask is provided.
+  function painterlyUnderpaint(o, px, w, h, block, sh, edgeAng, bMask, bSize) {
     // ── Pass 1: tonal wash with NOISE DITHER ──
     // Downsample the source into a coarse grid of block-averages, then
     // bilinear-upsample back — but add strong hash noise before writing.
@@ -158,6 +165,7 @@ const DitherAlgorithms = (() => {
     const strokeW = Math.max(5, Math.round(block * 1.0));
     const strokeL = Math.max(14, Math.round(block * 2.6));
     const totalStrokes = Math.max(30, Math.round((w * h) / (strokeW * strokeL * 0.45)));
+    const useMask = !!(bMask && bSize > 1);
     for (let i = 0; i < totalStrokes; i++) {
       const cx = Math.floor(sh(i, 0, 700) * w);
       const cy = Math.floor(sh(i, 0, 701) * h);
@@ -174,18 +182,42 @@ const DitherAlgorithms = (() => {
       const boxMaxX = Math.min(w - 1, Math.ceil(cx + bMax));
       const boxMinY = Math.max(0, Math.floor(cy - bMax));
       const boxMaxY = Math.min(h - 1, Math.ceil(cy + bMax));
+      // Pre-derive inverse half-extents for mask sampling. We map the
+      // stroke's oriented coords (t,u) ∈ [-rLen..rLen] × [-rWid..rWid] onto
+      // mask coords [0..bSize). The brush mask is already square with its
+      // natural aspect baked in; here we stretch it to fit the stroke's
+      // elongated footprint (rLen > rWid for typical strokes) so bristle
+      // streaks and splatter edges run ALONG the stroke length, which is
+      // the orientation painters actually lay strokes.
+      const invHalfL = 1 / rLen;
+      const invHalfW = 1 / rWid;
+      const bSz = bSize | 0;
       for (let yy = boxMinY; yy <= boxMaxY; yy++) {
         for (let xx = boxMinX; xx <= boxMaxX; xx++) {
           const dx = xx - cx, dy = yy - cy;
           const t = dx * ca + dy * sa;
           const u = -dx * sa + dy * ca;
-          const r2 = (t * t) / rLen2 + (u * u) / rWid2;
-          if (r2 > 1) continue;
-          // Hash-threshold: probability of painting = soft falloff weight.
-          // Replaces the earlier alpha blend so the stroke reads as dense
-          // specks near the stroke core and sparse specks at the edges —
-          // same dithered texture as the main stamps.
-          const weight = (1 - r2);
+          let weight;
+          if (useMask) {
+            // Normalize to [-1..1], reject outside rect, then sample mask.
+            const nx = t * invHalfL;
+            const ny = u * invHalfW;
+            if (nx < -1 || nx > 1 || ny < -1 || ny > 1) continue;
+            let mx = ((nx * 0.5 + 0.5) * bSz) | 0;
+            let my = ((ny * 0.5 + 0.5) * bSz) | 0;
+            if (mx < 0) mx = 0; else if (mx >= bSz) mx = bSz - 1;
+            if (my < 0) my = 0; else if (my >= bSz) my = bSz - 1;
+            weight = bMask[my * bSz + mx] / 255;
+            if (weight <= 0) continue;
+          } else {
+            const r2 = (t * t) / rLen2 + (u * u) / rWid2;
+            if (r2 > 1) continue;
+            // Hash-threshold: probability of painting = soft falloff weight.
+            // Replaces the earlier alpha blend so the stroke reads as dense
+            // specks near the stroke core and sparse specks at the edges —
+            // same dithered texture as the main stamps.
+            weight = (1 - r2);
+          }
           if (sh(xx, yy, 705) > weight) continue;
           o[yy * w + xx] = sampleVal;
         }
@@ -1743,7 +1775,10 @@ const DitherAlgorithms = (() => {
     if (canvasStart === 'clean') {
       for (let i = 0; i < w*h; i++) o[i] = bgTone;
     } else if (canvasStart === 'underpaint') {
-      painterlyUnderpaint(o, px, w, h, underpaintBlock, sh, edgeAng);
+      // Pass the active brush mask so underpaint strokes inherit the
+      // selected Brush Shape (bristles/splatter/knife etc.) instead of
+      // staying as a plain ellipse. Falls back to ellipse when bMask null.
+      painterlyUnderpaint(o, px, w, h, underpaintBlock, sh, edgeAng, bMask, bSize);
     } else {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     }
@@ -5516,10 +5551,27 @@ const DitherAlgorithms = (() => {
     //                   abstract brushstrokes that echo the image's forms)
     //   'source'     = raw source pixels (filter feel; coherent across channels)
     //   'clean'      = bgTone (classic canvas, paint revealed only where dabs land)
+    // Resolve brush mask early so the underpaint pass can shape its
+    // strokes with the selected brush. The full mask config (including
+    // per-slot custom brushes) is re-resolved below for the main dab
+    // loop — this pre-resolve is intentionally just the base shape, since
+    // the underpaint is a single unified pass, not slot-dispatched.
+    let _upMask = null, _upSize = 0;
+    {
+      const _bs = p.brushShape || 'default';
+      if (_bs !== 'default' && typeof PaintEngine !== 'undefined' && PaintEngine.getBrushMask) {
+        const _bi = parseInt(_bs, 10);
+        if (!isNaN(_bi)) {
+          const _b = PaintEngine.getBrushMask(_bi);
+          if (_b) { _upMask = _b.mask; _upSize = _b.size; }
+        }
+      }
+    }
+
     if (dabStyle === 'pixel' && canvasStart === 'source') {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     } else if (dabStyle === 'pixel' && canvasStart === 'underpaint') {
-      painterlyUnderpaint(o, px, w, h, underpaintBlock, shUnder, edgeAngUp);
+      painterlyUnderpaint(o, px, w, h, underpaintBlock, shUnder, edgeAngUp, _upMask, _upSize);
     } else {
       o.fill(bgTone);
     }
