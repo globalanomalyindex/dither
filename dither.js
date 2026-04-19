@@ -1907,7 +1907,19 @@ const DitherAlgorithms = (() => {
           // quality (441 ops/step) and 4 for preview (81 ops/step, ~5.4×
           // cheaper). Without this cap, detail-aware sizing at final tier
           // can push knifeW past 80 and freeze the page.
-          const stampSz = Math.min(STAMP_CAP, Math.max(1, knifeW * 0.5));
+          //
+          // IMPORTANT: stampSz MUST be an integer. The inner loop iterates
+          // `for (let by = -stampSz; by <= stampSz; by++)` which produces
+          // fractional `by` values when stampSz is fractional, making
+          // `wy2 = fy + by` fractional too. Writes like `o[wy2*w + wx2] = src`
+          // silently no-op on typed arrays when the index is fractional
+          // (they set a string property instead of an element), so the
+          // entire mask-based stamp path writes nothing whenever
+          // canvasScale pushes knifeW off an even number. That's the bug
+          // that made Brush Shape changes invisible on most canvas sizes —
+          // the stamp path was live only at the exact size where stampSz
+          // happened to be integer.
+          const stampSz = Math.max(1, Math.min(STAMP_CAP, Math.round(knifeW * 0.5)));
           const invStamp = 1 / (2 * stampSz);
           const halfMask = (currSize - 1) / 2;
           for (let t = 0; t < effSmearLen; t++) {
