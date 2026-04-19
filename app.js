@@ -246,53 +246,27 @@
     }
   });
 
-  // ── Two-tier progressive rendering ──
-  // Painterly algorithms process ~1M pixels × 3 channels × expensive
-  // per-stroke math per render — no amount of micro-tuning makes that
-  // "instant" on a full-size canvas. So instead we render at TWO qualities:
+  // ── Scheduling ──
+  // Single-tier render: just the final at full 1200px. We used to run a
+  // low-res preview at 300px during drag and nearest-neighbor upscale it
+  // to the canvas so the user got a "live" but chunky preview. The user
+  // called the upscale flash ugly and asked for speed-over-polish instead,
+  // so now we only ever render the final — the canvas shows the last
+  // completed render until the new one's progress paint replaces it.
   //
-  //   1. INTERACTIVE preview — fires ~60ms after any param change, at
-  //      ~1/4 canvas resolution (300px max dim vs 1200px). ~16× fewer
-  //      pixels = ~16× faster — typically 80-200ms. Nearest-neighbor
-  //      upscale to canvas so strokes stay crisp instead of blurring.
+  // Debounce is tight (140ms) so quick flick-of-the-slider still feels
+  // responsive; cancellation token drops the in-flight render the instant
+  // a new change arrives, so rapid slider moves never queue up.
   //
-  //   2. FINAL render — fires 500ms after the LAST change, at full
-  //      1200px. Progressive channel paint + undoable.
-  //
-  // A max-wait cap ensures previews fire at least every ~220ms during
-  // sustained dragging (not just on pause) — so the canvas updates
-  // continuously rather than freezing until the user releases the slider.
-  //
-  // Canvas invariant: never blank. Preview stays visible until final
-  // replaces it. Undo history only snapshots finals, so ephemeral
-  // in-flight previews don't pollute undo.
-  let previewTimer = null;
+  // Undo only snapshots completed finals (see pushUndo at end of runProcess).
   let finalTimer = null;
-  let firstPendingAt = null;  // when the current debounce window started
+  const SCHEDULE_DEBOUNCE_MS = 140;
 
   function scheduleProcess() {
-    const now = performance.now();
-    if (firstPendingAt === null) firstPendingAt = now;
-    const timeSinceFirst = now - firstPendingAt;
-
-    // Cancel any in-flight render — new params supersede it.
+    // Cancel any in-flight render — new params supersede it immediately.
     if (currentToken) currentToken.cancelled = true;
-    clearTimeout(previewTimer);
     clearTimeout(finalTimer);
-
-    // Preview: 60ms debounce, BUT capped so it fires at most every ~220ms
-    // even during sustained drag. Without the cap, rapid slider movement
-    // would keep resetting the timer and the canvas would never update.
-    const previewDelay = Math.max(0, Math.min(60, 220 - timeSinceFirst));
-    previewTimer = setTimeout(() => {
-      firstPendingAt = null;
-      runProcess({ interactive: true });
-    }, previewDelay);
-
-    // Final: 500ms after last change. Full quality replaces preview.
-    finalTimer = setTimeout(() => {
-      runProcess({ interactive: false });
-    }, 500);
+    finalTimer = setTimeout(() => runProcess(), SCHEDULE_DEBOUNCE_MS);
   }
 
   function buildGlobals() {
@@ -552,72 +526,31 @@
     edge:   'rgb(240, 80, 180)'
   };
 
-  const PREVIEW_MAX_FULL = 1200;        // final-quality render size
-  const PREVIEW_MAX_INTERACTIVE = 300;  // live-drag preview size (~16x fewer pixels)
+  const PREVIEW_MAX_FULL = 1200;        // render size
 
   // Cancellation token for the currently-running process. We mutate an
   // existing token's `.cancelled` flag so in-flight async work sees it
   // promptly without us having to thread a new arg through every callback.
   let currentToken = null;
 
-  // Track the display size of the LAST final render so interactive previews
-  // know what size to upscale to. Initialized lazily on first final.
+  // Remembers the most recent final render dims. Used to detect whether
+  // the next render can skip the "save current canvas, blit it scaled,
+  // putImageData" dance (when dims already match, no flash is possible).
   let lastFinalDisplayW = 0, lastFinalDisplayH = 0;
 
-  // Paint an ImageData upscaled (nearest-neighbor) to match the size of
-  // the last final render. Used by interactive previews: we render at low
-  // resolution for speed, then blit scaled-up so the canvas shows the
-  // same display size regardless of quality tier. Nearest-neighbor keeps
-  // dithered/painterly strokes crisp instead of smearing them.
-  function paintUpscaled(smallImageData) {
-    const srcSz = DitherEngine.getSourceSize();
-    if (!srcSz) return;
-
-    // Determine target display size: mirror what a final render would be,
-    // so the canvas doesn't resize when final replaces preview.
-    const aspect = smallImageData.width / smallImageData.height;
-    const srcMax = Math.max(srcSz.width, srcSz.height);
-    const targetMax = Math.min(PREVIEW_MAX_FULL, srcMax);
-    const tw = (aspect >= 1) ? targetMax : Math.round(targetMax * aspect);
-    const th = (aspect >= 1) ? Math.round(targetMax / aspect) : targetMax;
-
-    // If we already know the final size (from a previous final render),
-    // use it to keep dimensions identical across quality swaps.
-    const finalW = lastFinalDisplayW || tw;
-    const finalH = lastFinalDisplayH || th;
-
-    // putImageData into an offscreen canvas, then drawImage with scaling.
-    // drawImage respects imageSmoothingEnabled; putImageData does not.
-    const tmp = document.createElement('canvas');
-    tmp.width = smallImageData.width;
-    tmp.height = smallImageData.height;
-    tmp.getContext('2d').putImageData(smallImageData, 0, 0);
-
-    if (canvas.width !== finalW || canvas.height !== finalH) {
-      canvas.width = finalW;
-      canvas.height = finalH;
-    }
-    const prevSmooth = ctx.imageSmoothingEnabled;
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(tmp, 0, 0, finalW, finalH);
-    ctx.imageSmoothingEnabled = prevSmooth;
-  }
-
-  function runProcess(opts) {
-    const interactive = !!(opts && opts.interactive);
+  function runProcess() {
     const size = DitherEngine.getSourceSize();
     if (!size) return;
 
     // ── Zone visualizer short-circuit ──
-    // If any selected algo has customBrushes.showZones enabled, bypass
-    // the painterly pipeline entirely and render a color-coded zone map
-    // instead. Lets users tune shadow/mid/high/edge thresholds while
-    // seeing EXACTLY which pixels get which brush. Fast (single-pass
-    // CPU sample) so it's near-instant even on big images.
+    // If any selected algo has customBrushes.showZones enabled, bypass the
+    // painterly pipeline and render a color-coded zone map instead — lets
+    // users tune shadow/mid/high/edge thresholds while seeing EXACTLY
+    // which pixels get which brush. Single-pass CPU sample; near-instant.
     const vizCfg = hasZoneVizActive();
     if (vizCfg) {
       if (currentToken) currentToken.cancelled = true;
-      const vizData = renderZoneViz(vizCfg, interactive ? PREVIEW_MAX_INTERACTIVE : PREVIEW_MAX_FULL);
+      const vizData = renderZoneViz(vizCfg, PREVIEW_MAX_FULL);
       if (vizData) {
         canvas.width = vizData.width;
         canvas.height = vizData.height;
@@ -625,47 +558,58 @@
         updateCanvasTransform();
       }
       state.processing = false;
-      if (!interactive) showProcessing(false);
+      showProcessing(false);
       return;
     }
 
-    // If a render is already in flight, cancel it. The async loop inside
-    // DitherEngine.processAsync yields between pipeline steps / color
-    // channels / stroke chunks, so the previous run sees the flag quickly
-    // and bails out — no more "drop the call and ignore the user".
+    // Cancel any in-flight render — new params supersede it. The async
+    // loop inside DitherEngine.processAsync checks .cancelled between
+    // pipeline steps / channels / stroke chunks, so the previous run
+    // bails fast.
     if (currentToken) currentToken.cancelled = true;
-    const token = { cancelled: false, interactive };
+    const token = { cancelled: false };
     currentToken = token;
 
     state.processing = true;
-    // Only show the "Processing…" overlay for final renders. Interactive
-    // previews finish in ~100-200ms and would flicker the overlay during
-    // slider drag. CSS has a 180ms delay on overlay visibility anyway,
-    // but body.processing class sets cursor + disables buttons instantly,
-    // which we DO want for finals and DON'T want for previews.
-    if (!interactive) showProcessing(true);
+    showProcessing(true);  // deferred 450ms — fast renders never see it
 
     // Save paint state before re-render if strokes exist
     const hasPaint = PaintEngine.hasStrokes();
     const paintedState = hasPaint ? PaintEngine.getPaintedState() : null;
     const paintBase = hasPaint ? PaintEngine.getBaseSnapshot() : null;
 
-    // Double-rAF: first frame paints the overlay; second frame actually runs
-    // the (blocking) heavy work. Without this, a synchronous algorithm runs
-    // inside the same rAF that just inserted the overlay into the DOM — the
-    // browser never gets a paint tick, so the "Processing…" dialog never
-    // shows up until AFTER the work already finished and got removed again.
-    requestAnimationFrame(() => { requestAnimationFrame(async () => {
-      // Progressive preview: only for final renders. Interactive previews
-      // are fast enough that partial paints would just add flicker and
-      // overhead. The final onProgress paints each channel as it completes
-      // so the user sees the full-quality image emerge block-by-block.
-      const onProgress = interactive ? null : (partial) => {
+    // One rAF yields to the browser so that any pending paint ticks (from
+    // slider thumb position, tooltip updates, etc.) land before we start
+    // the heavy compute. Also ensures showProcessing(true) got a chance to
+    // queue its delayed overlay timer in a fresh task.
+    requestAnimationFrame(async () => {
+      // Progress-paint: fires as each channel / step completes. Canvas
+      // width/height is set only on the FIRST progress update so the
+      // existing canvas content (the previous final) stays visible right
+      // up until the new render paints over it — no blank flash mid-frame.
+      let dimsInitialized = (canvas.width === lastFinalDisplayW && canvas.height === lastFinalDisplayH && lastFinalDisplayW > 0);
+      const onProgress = (partial) => {
         if (token.cancelled) return;
         if (!partial) return;
-        if (canvas.width !== partial.width || canvas.height !== partial.height) {
+        if (!dimsInitialized || canvas.width !== partial.width || canvas.height !== partial.height) {
+          // If dims change (first render, or user switched image), we have
+          // to reset canvas. Cover the flash by blitting the prior content
+          // scaled to the new size first, THEN drop the partial on top.
+          const prev = (canvas.width > 0 && canvas.height > 0)
+            ? (() => { try { return ctx.getImageData(0, 0, canvas.width, canvas.height); } catch(_) { return null; } })()
+            : null;
           canvas.width = partial.width;
           canvas.height = partial.height;
+          if (prev) {
+            const tmp = document.createElement('canvas');
+            tmp.width = prev.width; tmp.height = prev.height;
+            tmp.getContext('2d').putImageData(prev, 0, 0);
+            const prevSmooth = ctx.imageSmoothingEnabled;
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(tmp, 0, 0, partial.width, partial.height);
+            ctx.imageSmoothingEnabled = prevSmooth;
+          }
+          dimsInitialized = true;
         }
         ctx.putImageData(partial, 0, 0);
       };
@@ -673,8 +617,7 @@
       let result;
       try {
         const processFn = DitherEngine.processAsync || DitherEngine.process;
-        const maxDim = interactive ? PREVIEW_MAX_INTERACTIVE : PREVIEW_MAX_FULL;
-        const ret = processFn(buildPipeline(), buildGlobals(), maxDim, {
+        const ret = processFn(buildPipeline(), buildGlobals(), PREVIEW_MAX_FULL, {
           signal: token, onProgress
         });
         result = (ret && typeof ret.then === 'function') ? await ret : ret;
@@ -689,35 +632,24 @@
         if (grainLayers.length > 0) {
           result = GrainEngine.applyGrainLayers(result, buildAllGrainOpts());
         }
-        if (interactive) {
-          // Upscale small preview to display size with crisp nearest-neighbor.
-          paintUpscaled(result);
-        } else {
+        if (canvas.width !== result.width || canvas.height !== result.height) {
           canvas.width = result.width;
           canvas.height = result.height;
-          ctx.putImageData(result, 0, 0);
-          // Remember the final display dims so subsequent previews upscale
-          // to the same canvas size (no layout flicker when quality swaps).
-          lastFinalDisplayW = result.width;
-          lastFinalDisplayH = result.height;
         }
+        ctx.putImageData(result, 0, 0);
+        lastFinalDisplayW = result.width;
+        lastFinalDisplayH = result.height;
         updateCanvasTransform();
-        // Skip paint reapply on interactive previews: the upscale path may
-        // change canvas dimensions, and applyPaintDelta expects matching
-        // buffer sizes. Interactive is ephemeral anyway — the final render
-        // that follows will reapply paint correctly at full resolution.
-        if (!interactive && hasPaint && paintedState && paintBase) {
+        if (hasPaint && paintedState && paintBase) {
           PaintEngine.applyPaintDelta(paintedState, paintBase, paintComposite.mode, paintComposite.opacity);
         }
       }
 
       state.processing = false;
       currentToken = null;
-      if (!interactive) {
-        showProcessing(false);
-        pushUndo();  // only snapshot final renders in undo history
-      }
-    });});
+      showProcessing(false);
+      pushUndo();  // snapshot completed render into undo history
+    });
   }
 
   // Processing overlay: blocks pointer events on the canvas and "heavy"

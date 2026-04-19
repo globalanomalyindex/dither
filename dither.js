@@ -1666,11 +1666,13 @@ const DitherAlgorithms = (() => {
     const SMEAR_CAP = PREVIEW ? 8 : Infinity;
 
     // Chunk cadence for cooperative yielding: `yield o` lets applyAsync
-    // pause the event loop + paint progress. Yield STROKE-based (not row-
-    // based) so brush-mask strokes — which can each take 10+ms with a
-    // big stamp footprint — still produce visible progress before the row
-    // completes. Sync apply() drain ignores these yields.
-    const STROKE_CHUNK = 40;
+    // pause the event loop + paint progress. Each yield costs ~4ms of
+    // setTimeout(0) minimum in Chrome, so chunk size directly trades paint-
+    // smoothness against total render time. 200 strokes/chunk ≈ 5 yields
+    // per layer at typical stroke counts — enough for visible progress
+    // painted block-by-block, without burning hundreds of ms on deadweight
+    // timer ticks. Preview mode bypasses the yields entirely (applyAsync).
+    const STROKE_CHUNK = 200;
     let strokesSinceYield = 0;
 
     for (let layer = 0; layer < layers; layer++) {
@@ -5498,9 +5500,11 @@ const DitherAlgorithms = (() => {
     // Chunk cadence for cooperative yielding — yield every N dabs so
     // applyAsync can paint progress + respond to cancellation. Sync drain
     // ignores these yields, so zero perf cost in the sync path.
-    // Smaller chunks = more frequent visible progress. 150 dabs typically
-    // = ~15-30ms of work, giving ~30fps progress updates.
-    const DAB_CHUNK = 150;
+    // Larger chunks = less setTimeout deadweight in the async path. Each
+    // yield costs ~4ms of clamped timer latency, so we batch aggressively:
+    // 600 dabs = ~100-200ms of work between yields = responsive but not
+    // bleeding frames into timer overhead.
+    const DAB_CHUNK = 600;
 
     for (let i = 0; i < totalDabs; i++) {
       if (i > 0 && (i % DAB_CHUNK) === 0) yield o;
