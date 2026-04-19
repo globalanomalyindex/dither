@@ -1521,17 +1521,14 @@ body.processing #btn-apply-algorithm {
 .cb-body.cb-disabled {
   pointer-events: none;
 }
-.cb-body.cb-disabled .cb-slot {
-  opacity: 0.82;
-  filter: saturate(0.75);
-}
-.cb-body.cb-disabled .cb-slot-thumb,
-.cb-body.cb-disabled .cb-slot-thumb img {
-  opacity: 1;
-  filter: none;
-}
-.cb-body.cb-disabled .cb-thresholds,
-.cb-body.cb-disabled .cb-slot-minis {
+/* Don't dim `.cb-slot` itself — that cascades to the thumbnail image
+   through CSS compositing, washing out drawn-brush previews. Dim the
+   text/controls around the thumbnail instead, so the thumbnail stays
+   full-strength (crisp dark ink on white paper) even when disabled. */
+.cb-body.cb-disabled .cb-slot-title,
+.cb-body.cb-disabled .cb-slot-desc,
+.cb-body.cb-disabled .cb-slot-minis,
+.cb-body.cb-disabled .cb-thresholds {
   opacity: 0.55;
 }
 .cb-thresholds {
@@ -1586,7 +1583,11 @@ body.processing #btn-apply-algorithm {
   width: 100%;
   aspect-ratio: 1;
   padding: 0;
-  background: #0b0b0e;
+  /* White bg so drawn brushes (which are typically soft-edged masks with
+     low values) read clearly as dark ink against paper. object-fit:contain
+     also letterboxes non-square brushes — on white, those gaps blend with
+     the inverted image background instead of creating a two-tone halo. */
+  background: #ffffff;
   border: 1px solid var(--border-light);
   border-radius: var(--radius-sm);
   cursor: pointer;

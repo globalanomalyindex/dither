@@ -2008,8 +2008,13 @@ const PaintEngine = (() => {
     const tctx = c.getContext('2d');
     const img = tctx.createImageData(thumbSize, thumbSize);
     const scaled = scaleMask(brush.mask, brush.size, thumbSize);
+    // Mild power-curve boost so soft drawn brushes (whose mask values are
+    // mostly in the 0.1–0.4 feather range) read clearly in thumbnails.
+    // pow(0.65) pushes mid-tones brighter in the white-on-black mask dump,
+    // which inverts to darker ink in the side-menu preview — faint strokes
+    // stay visible instead of washing out to near-invisible light gray.
     for (let i = 0; i < thumbSize * thumbSize; i++) {
-      const v = Math.round(scaled[i] * 255);
+      const v = Math.round(Math.pow(Math.min(1, Math.max(0, scaled[i])), 0.65) * 255);
       const idx = i * 4;
       img.data[idx] = v; img.data[idx + 1] = v; img.data[idx + 2] = v; img.data[idx + 3] = 255;
     }

@@ -78,6 +78,102 @@ const DitherAlgorithms = (() => {
     return { mag, ang };
   }
 
+  // Painterly underpainting base. Replaces the older blocky posterized
+  // mosaic with a two-pass "wash + loose strokes" base:
+  //   1. Tonal wash  — downsample the source, bilinear-upsample it back.
+  //      Yields smooth soft gradients that echo the image's broad light/
+  //      shadow structure, no visible block edges.
+  //   2. Loose strokes — scatter oriented elongated elliptical dabs across
+  //      the canvas, each sampling source color at its origin. Strokes
+  //      follow the local edge tangent (perpendicular to the gradient)
+  //      with some angle jitter, so they read as brushwork that FOLLOWS
+  //      the image's forms instead of arbitrary random marks.
+  //
+  // Writes into `o` (Uint8ClampedArray w*h). `edgeAng` (Float32Array from
+  // sobelField) must be precomputed so strokes can orient along it. `sh`
+  // is the caller's spatial-hash function for deterministic scatter.
+  // `block` is the caller's underpaintBlock (8..40) — controls both wash
+  // smoothness and stroke size.
+  function painterlyUnderpaint(o, px, w, h, block, sh, edgeAng) {
+    // ── Pass 1: smooth tonal wash (downsample → bilinear upsample) ──
+    // baseScale controls wash softness. Larger = softer, more abstract.
+    const baseScale = Math.max(4, Math.round(block * 0.9));
+    const bW = Math.max(2, Math.ceil(w / baseScale));
+    const bH = Math.max(2, Math.ceil(h / baseScale));
+    const base = new Uint8ClampedArray(bW * bH);
+    for (let by = 0; by < bH; by++) {
+      const sy0 = by * baseScale, sy1 = Math.min(h, sy0 + baseScale);
+      for (let bx = 0; bx < bW; bx++) {
+        const sx0 = bx * baseScale, sx1 = Math.min(w, sx0 + baseScale);
+        let sum = 0, cnt = 0;
+        for (let sy = sy0; sy < sy1; sy++) {
+          const rowStart = sy * w;
+          for (let sx = sx0; sx < sx1; sx++) { sum += px[rowStart + sx]; cnt++; }
+        }
+        base[by * bW + bx] = cnt ? Math.round(sum / cnt) : 0;
+      }
+    }
+    // Bilinear upsample into `o`. Divisor protected against w/h = 1.
+    const wDenom = (w - 1) || 1, hDenom = (h - 1) || 1;
+    const bWm1 = bW - 1, bHm1 = bH - 1;
+    for (let y = 0; y < h; y++) {
+      const fy = (y * bHm1) / hDenom;
+      const iy0 = Math.floor(fy), iy1 = Math.min(bHm1, iy0 + 1);
+      const ty = fy - iy0;
+      const row0 = iy0 * bW, row1 = iy1 * bW;
+      for (let x = 0; x < w; x++) {
+        const fx = (x * bWm1) / wDenom;
+        const ix0 = Math.floor(fx), ix1 = Math.min(bWm1, ix0 + 1);
+        const tx = fx - ix0;
+        const v00 = base[row0 + ix0], v10 = base[row0 + ix1];
+        const v01 = base[row1 + ix0], v11 = base[row1 + ix1];
+        const v0 = v00 + (v10 - v00) * tx;
+        const v1 = v01 + (v11 - v01) * tx;
+        o[y * w + x] = Math.round(v0 + (v1 - v0) * ty);
+      }
+    }
+
+    // ── Pass 2: scatter loose oriented strokes sampling source color ──
+    // Stroke count scales so coverage density is roughly constant across
+    // image sizes — ~1 stroke per (strokeL × strokeW × 0.45) footprint.
+    const strokeW = Math.max(5, Math.round(block * 1.0));
+    const strokeL = Math.max(14, Math.round(block * 2.6));
+    const totalStrokes = Math.max(30, Math.round((w * h) / (strokeW * strokeL * 0.45)));
+    for (let i = 0; i < totalStrokes; i++) {
+      const cx = Math.floor(sh(i, 0, 700) * w);
+      const cy = Math.floor(sh(i, 0, 701) * h);
+      const sampleIdx = cy * w + cx;
+      const sampleVal = px[sampleIdx];
+      // Orient along edge tangent (perpendicular to gradient) with jitter
+      // so strokes flow around shapes rather than cutting across them.
+      const eIdx = Math.min(h - 2, Math.max(1, cy)) * w + Math.min(w - 2, Math.max(1, cx));
+      const ang = edgeAng[eIdx] + Math.PI * 0.5 + (sh(i, 0, 702) - 0.5) * 0.8;
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      const rLen = strokeL * 0.5 * (0.65 + sh(i, 0, 703) * 0.75);
+      const rWid = strokeW * 0.5 * (0.55 + sh(i, 0, 704) * 0.55);
+      const rLen2 = rLen * rLen, rWid2 = rWid * rWid;
+      const bMax = Math.max(rLen, rWid) + 1;
+      const boxMinX = Math.max(0, Math.floor(cx - bMax));
+      const boxMaxX = Math.min(w - 1, Math.ceil(cx + bMax));
+      const boxMinY = Math.max(0, Math.floor(cy - bMax));
+      const boxMaxY = Math.min(h - 1, Math.ceil(cy + bMax));
+      for (let yy = boxMinY; yy <= boxMaxY; yy++) {
+        for (let xx = boxMinX; xx <= boxMaxX; xx++) {
+          const dx = xx - cx, dy = yy - cy;
+          // Rotate into stroke-local axis
+          const t = dx * ca + dy * sa;
+          const u = -dx * sa + dy * ca;
+          const r2 = (t * t) / rLen2 + (u * u) / rWid2;
+          if (r2 > 1) continue;
+          // Soft radial falloff → stroke edges blend with wash naturally
+          const weight = (1 - r2) * 0.82;
+          const oi = yy * w + xx;
+          o[oi] = Math.round(o[oi] * (1 - weight) + sampleVal * weight);
+        }
+      }
+    }
+  }
+
   // Local detail / variance grid, downsampled for speed. Used to let
   // painterly algorithms place fewer, larger strokes in low-variance areas
   // (sky, walls) and many small strokes in detailed areas. Block size is
@@ -1388,13 +1484,12 @@ const DitherAlgorithms = (() => {
     {id:'sampleDrift',label:'Sample Drift',min:0,max:1,step:.05,default:.55},
     {id:'sampleJitter',label:'Sample Jitter (px)',min:0,max:12,step:.5,default:2},
     {id:'canvasStart',label:'Canvas',type:'select',options:[
-      {value:'underpaint',label:'Painterly underpaint (mosaic of source tones)'},
+      {value:'underpaint',label:'Painterly underpaint (wash + oriented strokes)'},
       {value:'source',label:'From source (filter feel)'},
       {value:'clean',label:'From blank canvas'}
     ],default:'underpaint'},
     {id:'bgTone',label:'Blank BG Tone',min:0,max:255,step:1,default:255},
-    {id:'underpaintBlock',label:'Underpaint Block Size',min:4,max:40,step:1,default:14},
-    {id:'underpaintPosterize',label:'Underpaint Posterize',min:2,max:32,step:1,default:12},
+    {id:'underpaintBlock',label:'Underpaint Stroke Scale',min:4,max:40,step:1,default:14},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.8},
@@ -1523,7 +1618,6 @@ const DitherAlgorithms = (() => {
     const canvasStart   = p.canvasStart || 'underpaint';
     const bgTone        = (p.bgTone != null) ? p.bgTone : 255;
     const underpaintBlock    = (p.underpaintBlock    != null) ? p.underpaintBlock|0    : 14;
-    const underpaintPosterize= (p.underpaintPosterize!= null) ? p.underpaintPosterize|0: 12;
     const colorPickup   = (p.colorPickup != null) ? p.colorPickup : 0;
     const detailAware    = (p.detailAware     != null) ? p.detailAware     : 1;
     const sizeByDetail   = (p.sizeByDetail    != null) ? p.sizeByDetail    : 0.8;
@@ -1596,9 +1690,20 @@ const DitherAlgorithms = (() => {
     }
 
     // PIXEL mode — sharp, dithered, real source pixels in every stroke.
+    // Precompute edge field + detail field once — the old code was calling
+    // sobelAt() per pixel inside hot loops, which dominated the runtime.
+    // Moved above the underpaint branch so the painterly-wash step can use
+    // edge orientations to lay oriented strokes.
+    const sf = sobelField(px, w, h);
+    const edgeMag = sf.mag, edgeAng = sf.ang;
+
     // Start canvas:
-    //   'underpaint' = mosaic of posterized source colors (painterly base;
-    //                  output looks RECONSTRUCTED from paint, not filtered)
+    //   'underpaint' = painterly base built from a smooth tonal wash
+    //                  (downsample + bilinear upsample) plus scattered
+    //                  loose oriented strokes sampling source color.
+    //                  Replaces the older blocky posterized mosaic —
+    //                  reads as paint laid down with a broad wet brush,
+    //                  not a pixel grid.
     //   'source'     = raw source (filter feel; minimal stroke coverage leaves
     //                  the image legible everywhere)
     //   'clean'      = blank bgTone (classic impressionism base, reveals paint
@@ -1606,44 +1711,11 @@ const DitherAlgorithms = (() => {
     if (canvasStart === 'clean') {
       for (let i = 0; i < w*h; i++) o[i] = bgTone;
     } else if (canvasStart === 'underpaint') {
-      const bsz = Math.max(3, underpaintBlock);
-      const steps = Math.max(2, Math.min(32, underpaintPosterize));
-      const blocksW = Math.ceil(w / bsz);
-      const blocksH = Math.ceil(h / bsz);
-      const blockVals = new Uint8ClampedArray(blocksW * blocksH);
-      for (let by = 0; by < blocksH; by++) {
-        for (let bx = 0; bx < blocksW; bx++) {
-          // 4-sample grid within the block; average + posterize + slight
-          // stochastic tone jitter (hash-based) to prevent banding.
-          let sum = 0, cnt = 0;
-          for (let sy = 0; sy < 2; sy++) for (let sx = 0; sx < 2; sx++) {
-            const xs = Math.min(w-1, bx*bsz + Math.floor((sx+0.5)*bsz/2));
-            const ys = Math.min(h-1, by*bsz + Math.floor((sy+0.5)*bsz/2));
-            sum += clamp(px[ys*w+xs]); cnt++;
-          }
-          const avg = sum / cnt;
-          const q = Math.round(avg / 255 * (steps-1)) / (steps-1) * 255;
-          blockVals[by*blocksW+bx] = Math.max(0, Math.min(255, q | 0));
-        }
-      }
-      // Fill o with block value + small per-pixel hash-dither so the base
-      // is painterly-mottled, not purely blocky.
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          const bx = (x / bsz) | 0, by = (y / bsz) | 0;
-          const base = blockVals[by*blocksW + bx];
-          const dither = (sh(x, y, 300) - 0.5) * 10;  // ~±5 of tone jitter
-          o[y*w+x] = Math.max(0, Math.min(255, (base + dither) | 0));
-        }
-      }
+      painterlyUnderpaint(o, px, w, h, underpaintBlock, sh, edgeAng);
     } else {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     }
 
-    // Precompute edge field + detail field once — the old code was calling
-    // sobelAt() per pixel inside hot loops, which dominated the runtime.
-    const sf = sobelField(px, w, h);
-    const edgeMag = sf.mag, edgeAng = sf.ang;
     const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0;
     const detail = needDetail ? detailField(px, w, h, 8) : null;
 
@@ -5232,12 +5304,11 @@ const DitherAlgorithms = (() => {
     {id:'sampleDrift',label:'Sample Drift',min:0,max:1,step:.05,default:.55},
     {id:'sampleJitter',label:'Sample Jitter (px)',min:0,max:12,step:.5,default:2},
     {id:'canvasStart',label:'Canvas',type:'select',options:[
-      {value:'underpaint',label:'Painterly underpaint (mosaic of source tones)'},
+      {value:'underpaint',label:'Painterly underpaint (wash + oriented strokes)'},
       {value:'source',label:'From source (coherent color)'},
       {value:'clean',label:'From blank canvas (classic)'}
     ],default:'underpaint'},
-    {id:'underpaintBlock',label:'Underpaint Block Size',min:4,max:40,step:1,default:14},
-    {id:'underpaintPosterize',label:'Underpaint Posterize',min:2,max:32,step:1,default:12},
+    {id:'underpaintBlock',label:'Underpaint Stroke Scale',min:4,max:40,step:1,default:14},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.7},
@@ -5345,7 +5416,6 @@ const DitherAlgorithms = (() => {
     const canvasStart = p.canvasStart || 'underpaint';
     const dabStyle = p.dabStyle || 'pixel';
     const underpaintBlock    = (p.underpaintBlock    != null) ? p.underpaintBlock|0    : 14;
-    const underpaintPosterize= (p.underpaintPosterize!= null) ? p.underpaintPosterize|0: 12;
     const seedUnder          = (p.seed|0) || 42;
     function shUnder(a, b, k) {
       let h = Math.imul((a|0) + 374761393, 0x9E3779B1) ^
@@ -5356,40 +5426,23 @@ const DitherAlgorithms = (() => {
       return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
     }
 
+    // Precompute the sobel field early — the painterly underpaint uses its
+    // angle channel to orient the scattered wash strokes, and the main dab
+    // loop uses it again later (no duplicate compute; we reuse this).
+    const sfUp = sobelField(px, w, h);
+    const edgeMagUp = sfUp.mag, edgeAngUp = sfUp.ang;
+
     // Initial canvas:
-    //   'underpaint' = posterized mosaic of source tones (painterly RECONSTRUCTION
-    //                  — output reads as paint-built-up, not filter-overlayed)
+    //   'underpaint' = painterly wash + loose oriented strokes from source
+    //                  (replaces the old blocky posterized mosaic — reads
+    //                   as a broad wet underpaint with gradients and large
+    //                   abstract brushstrokes that echo the image's forms)
     //   'source'     = raw source pixels (filter feel; coherent across channels)
     //   'clean'      = bgTone (classic canvas, paint revealed only where dabs land)
     if (dabStyle === 'pixel' && canvasStart === 'source') {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     } else if (dabStyle === 'pixel' && canvasStart === 'underpaint') {
-      const bsz = Math.max(3, underpaintBlock);
-      const steps = Math.max(2, Math.min(32, underpaintPosterize));
-      const blocksW = Math.ceil(w / bsz);
-      const blocksH = Math.ceil(h / bsz);
-      const blockVals = new Uint8ClampedArray(blocksW * blocksH);
-      for (let by = 0; by < blocksH; by++) {
-        for (let bx = 0; bx < blocksW; bx++) {
-          let sum = 0, cnt = 0;
-          for (let sy = 0; sy < 2; sy++) for (let sx = 0; sx < 2; sx++) {
-            const xs = Math.min(w-1, bx*bsz + Math.floor((sx+0.5)*bsz/2));
-            const ys = Math.min(h-1, by*bsz + Math.floor((sy+0.5)*bsz/2));
-            sum += clamp(px[ys*w+xs]); cnt++;
-          }
-          const avg = sum / cnt;
-          const q = Math.round(avg / 255 * (steps-1)) / (steps-1) * 255;
-          blockVals[by*blocksW+bx] = Math.max(0, Math.min(255, q | 0));
-        }
-      }
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          const bx = (x / bsz) | 0, by = (y / bsz) | 0;
-          const base = blockVals[by*blocksW + bx];
-          const dither = (shUnder(x, y, 300) - 0.5) * 10;
-          o[y*w+x] = Math.max(0, Math.min(255, (base + dither) | 0));
-        }
-      }
+      painterlyUnderpaint(o, px, w, h, underpaintBlock, shUnder, edgeAngUp);
     } else {
       o.fill(bgTone);
     }
@@ -5476,10 +5529,10 @@ const DitherAlgorithms = (() => {
     const maxR = Math.sqrt(cx0 * cx0 + cy0 * cy0);
     let totalDabs = Math.round(p.dabCount * intensity) * layers;
 
-    // Precompute edge field + detail field once (huge speedup vs per-pixel
-    // sobelAt in the inner loops). Also used to drive detail-aware sizing.
-    const sf = sobelField(px, w, h);
-    const edgeMag = sf.mag, edgeAng = sf.ang;
+    // Edge field already computed above (sfUp / edgeAngUp / edgeMagUp) so the
+    // underpaint could orient its wash strokes. Reuse those aliases here
+    // under the names the main dab loop expects — no duplicate sobel pass.
+    const edgeMag = edgeMagUp, edgeAng = edgeAngUp;
     const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0;
     const detail = needDetail ? detailField(px, w, h, 8) : null;
 
