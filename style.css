@@ -1544,6 +1544,25 @@ body.processing #btn-apply-algorithm {
 .cb-edge-row { gap: 4px; }
 .cb-dim { opacity: 0.4; pointer-events: none; }
 
+/* Brush Shape dropdown dim/disable treatment when Custom Brushes is on.
+   Keep the label legible (parens note explains why) but make it clear the
+   control is inert. `select:disabled` already fades via the browser; this
+   just gives the whole param-group a consistent muted feel. */
+.param-group.param-cb-override { opacity: 0.55; }
+.param-group.param-cb-override select {
+  cursor: not-allowed;
+  background: var(--bg-muted, #1a1a1f);
+}
+.param-note {
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--fun, #b388ff);
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.85;
+  margin-left: 4px;
+}
+
 /* 2x2 slot grid */
 .cb-slots {
   display: grid;

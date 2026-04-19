@@ -1602,6 +1602,15 @@ const DitherAlgorithms = (() => {
     const o = new Uint8ClampedArray(w*h);
     const PREVIEW = !!preview;
 
+    // Canvas-relative size multiplier. All brush/stroke pixel knobs below
+    // (knife size, smear length, underpaint block, sample jitter) were
+    // tuned for a ~720px canvas. Without scaling, a 10px knife on a 1600×
+    // 1600 image reads as stippling while the same 10px knife on a 200×200
+    // image dominates the frame. sqrt(area)/REF gives the same effective
+    // footprint-as-fraction-of-canvas across sizes. Clamped so extreme
+    // aspect ratios don't produce absurd values.
+    const canvasScale = Math.max(0.5, Math.min(3.0, Math.sqrt(w * h) / 720));
+
     const strokeStyle = p.strokeStyle || 'pixel';
     const intensity     = (p.intensity     != null) ? p.intensity     : 1;
     const layers        = Math.max(1, (p.layers    != null) ? p.layers|0 : 1);
@@ -1614,10 +1623,14 @@ const DitherAlgorithms = (() => {
     const pressureJit   = (p.pressureJitter != null) ? p.pressureJitter : 0;
     const coverageDensity = (p.coverageDensity != null) ? p.coverageDensity : 0.85;
     const sampleDrift   = (p.sampleDrift  != null) ? p.sampleDrift  : 0.55;
-    const sampleJitter  = (p.sampleJitter != null) ? p.sampleJitter : 2;
+    // sampleJitter is a pixel distance → scale with canvas so the jitter
+    // radius stays a consistent fraction of stroke width on any canvas.
+    const sampleJitter  = ((p.sampleJitter != null) ? p.sampleJitter : 2) * canvasScale;
     const canvasStart   = p.canvasStart || 'underpaint';
     const bgTone        = (p.bgTone != null) ? p.bgTone : 255;
-    const underpaintBlock    = (p.underpaintBlock    != null) ? p.underpaintBlock|0    : 14;
+    // Scale underpaint block size so the wash granularity + stroke length
+    // grow proportionally on larger canvases.
+    const underpaintBlock = Math.max(2, Math.round(((p.underpaintBlock != null) ? p.underpaintBlock : 14) * canvasScale));
     const colorPickup   = (p.colorPickup != null) ? p.colorPickup : 0;
     const detailAware    = (p.detailAware     != null) ? p.detailAware     : 1;
     const sizeByDetail   = (p.sizeByDetail    != null) ? p.sizeByDetail    : 0.8;
@@ -1722,9 +1735,11 @@ const DitherAlgorithms = (() => {
     // Stride between strokes. PREVIEW widens stride (~1.5×) so the preview
     // runs on roughly half as many strokes — quality drops slightly but
     // the user can still read stroke direction + color while dragging.
+    // Stroke spacing tracks effective (canvas-scaled) knife width so the
+    // coverage density stays consistent across canvas sizes.
     const baseSp = PREVIEW
-      ? Math.max(3, Math.round(p.size * 0.8 * 1.5))
-      : Math.max(2, Math.round(p.size * 0.8));
+      ? Math.max(3, Math.round(p.size * canvasScale * 0.8 * 1.5))
+      : Math.max(2, Math.round(p.size * canvasScale * 0.8));
 
     // Stamp-pixel budget cap. Brush-shape mode does a (2*stampSz+1)^2 inner
     // loop PER smear step, so this is the single biggest knob for preview
@@ -1831,9 +1846,11 @@ const DitherAlgorithms = (() => {
         }
 
         const sizeMul = 1 + (sizeByLight > 0 ? lum : (1 - lum)) * Math.abs(sizeByLight) * 1.8;
-        const knifeW = Math.max(1.5, p.size * sizeMul * detailSizeMul * slotSizeMul);
+        // Canvas-scale the raw knife width/smear so brush footprint is a
+        // consistent fraction of the canvas rather than a fixed pixel size.
+        const knifeW = Math.max(1.5, p.size * canvasScale * sizeMul * detailSizeMul * slotSizeMul);
 
-        const lenBase = p.smear * (0.5 + sh(x, y, 4) * 0.5) * detailSizeMul;
+        const lenBase = p.smear * canvasScale * (0.5 + sh(x, y, 4) * 0.5) * detailSizeMul;
         const realSmearLen = lenBase * (1 + edgeN * lengthByEdge * 2.5);
         // WET STREAK extends the smear with a decaying tail — long painterly
         // drag from a loaded brush.
@@ -1992,7 +2009,10 @@ const DitherAlgorithms = (() => {
     const o = new Uint8ClampedArray(w*h);
     const r = mkRand(p.seed);
     const buf = new Float32Array(px);
-    const baseSp = Math.max(2, Math.round(p.size * 0.8));
+    // Match the pixel-path's canvas-relative size scaling so switching to
+    // blend mode doesn't also change effective brush size.
+    const canvasScale = Math.max(0.5, Math.min(3.0, Math.sqrt(w * h) / 720));
+    const baseSp = Math.max(2, Math.round(p.size * canvasScale * 0.8));
 
     for (let layer = 0; layer < layers; layer++) {
       const layerAng = (layers > 1) ? (layer / layers) * Math.PI * 0.35 : 0;
@@ -2007,8 +2027,8 @@ const DitherAlgorithms = (() => {
         const ang = e.ang + Math.PI/2 + (r() - 0.5) * angleJitter + layerAng;
         const dx = Math.cos(ang), dy = Math.sin(ang);
         const sizeMul = 1 + (sizeByLight > 0 ? lum : (1 - lum)) * Math.abs(sizeByLight) * 1.8;
-        const knifeW = p.size * sizeMul;
-        const lenBase = p.smear * (0.5 + r() * 0.5);
+        const knifeW = p.size * canvasScale * sizeMul;
+        const lenBase = p.smear * canvasScale * (0.5 + r() * 0.5);
         const smearLen = lenBase * (1 + edgeN * lengthByEdge * 2.5);
         const jitterMul = pressureJit > 0 ? (1 + (r() - 0.5) * pressureJit) : 1;
         const edgeBoost = pressureByEdge > 0 ? (1 + edgeN * pressureByEdge * 2) : 1;
@@ -5415,7 +5435,14 @@ const DitherAlgorithms = (() => {
     const bgTone = (p.bgTone != null) ? p.bgTone : 255;
     const canvasStart = p.canvasStart || 'underpaint';
     const dabStyle = p.dabStyle || 'pixel';
-    const underpaintBlock    = (p.underpaintBlock    != null) ? p.underpaintBlock|0    : 14;
+    // Canvas-relative size multiplier. Dab dimensions (length/width),
+    // underpaint block scale, and pixel-distance jitter were tuned for a
+    // ~720px canvas. Scaling by sqrt(area)/720 keeps stroke footprint as
+    // a consistent fraction of canvas — small images stay readable, large
+    // ones don't end up with stippling. Clamped so extreme sizes still
+    // produce sensible values.
+    const canvasScale = Math.max(0.5, Math.min(3.0, Math.sqrt(w * h) / 720));
+    const underpaintBlock = Math.max(2, Math.round(((p.underpaintBlock != null) ? p.underpaintBlock : 14) * canvasScale));
     const seedUnder          = (p.seed|0) || 42;
     function shUnder(a, b, k) {
       let h = Math.imul((a|0) + 374761393, 0x9E3779B1) ^
@@ -5457,12 +5484,15 @@ const DitherAlgorithms = (() => {
     const sizeJitter       = (p.sizeJitter       != null) ? p.sizeJitter       : 0;
     const lengthJitter     = (p.lengthJitter     != null) ? p.lengthJitter     : 0;
     const angleJitter      = (p.angleJitter      != null) ? p.angleJitter      : 0;
-    const scatter          = (p.scatter          != null) ? p.scatter          : 0;
+    // scatter and sampleJitter are pixel distances → scale with canvas so
+    // they stay a consistent visual fraction of stroke footprint regardless
+    // of image size.
+    const scatter          = ((p.scatter          != null) ? p.scatter          : 0) * canvasScale;
     const impurities       = (p.impurities       != null) ? p.impurities       : 0;
     const strokeCurve      = (p.strokeCurve      != null) ? p.strokeCurve      : 0;
     const coverageDensity  = (p.coverageDensity  != null) ? p.coverageDensity  : 0.85;
     const sampleDrift      = (p.sampleDrift      != null) ? p.sampleDrift      : 0.55;
-    const sampleJitter     = (p.sampleJitter     != null) ? p.sampleJitter     : 2;
+    const sampleJitter     = ((p.sampleJitter     != null) ? p.sampleJitter     : 2) * canvasScale;
     const detailAware      = (p.detailAware      != null) ? p.detailAware      : 1;
     const sizeByDetail     = (p.sizeByDetail     != null) ? p.sizeByDetail     : 0.7;
     const skipSmoothAreas  = (p.skipSmoothAreas  != null) ? p.skipSmoothAreas  : 0.5;
@@ -5663,11 +5693,12 @@ const DitherAlgorithms = (() => {
       }
 
       // Dab size + length modulation (slotSizeMul lets each tonal zone
-      // paint with a different dab scale — big shadows, tiny highlights)
+      // paint with a different dab scale — big shadows, tiny highlights).
+      // canvasScale keeps brush footprint consistent across canvas sizes.
       const lenMul = 1 + (1 - srcVal/255) * p.lumModulation * 0.4;
-      let len = p.dabLen * lenMul * detailSizeMul * slotSizeMul;
+      let len = p.dabLen * canvasScale * lenMul * detailSizeMul * slotSizeMul;
       if (lengthJitter > 0) len *= (1 + (sh(i, 0, 109) - 0.5) * lengthJitter * 1.5);
-      let width = p.dabWidth * detailSizeMul * slotSizeMul;
+      let width = p.dabWidth * canvasScale * detailSizeMul * slotSizeMul;
       if (sizeJitter > 0) width *= (1 + (sh(i, 0, 110) - 0.5) * sizeJitter * 1.5);
       width = Math.max(0.5, width);
       len   = Math.max(1, len);
@@ -5825,6 +5856,9 @@ const DitherAlgorithms = (() => {
     const rnd = mkRand(p.seed);
     const cx0 = w / 2, cy0 = h / 2;
     const maxR = Math.sqrt(cx0 * cx0 + cy0 * cy0);
+    // Match the pixel-path canvas scaling so switching dab style doesn't
+    // change effective brush footprint.
+    const canvasScale = Math.max(0.5, Math.min(3.0, Math.sqrt(w * h) / 720));
 
     const intensity        = (p.intensity        != null) ? p.intensity        : 1;
     const layers           = Math.max(1, (p.layers != null) ? p.layers|0 : 1);
@@ -5835,7 +5869,7 @@ const DitherAlgorithms = (() => {
     const sizeJitter       = (p.sizeJitter       != null) ? p.sizeJitter       : 0;
     const lengthJitter     = (p.lengthJitter     != null) ? p.lengthJitter     : 0;
     const angleJitter      = (p.angleJitter      != null) ? p.angleJitter      : 0;
-    const scatter          = (p.scatter          != null) ? p.scatter          : 0;
+    const scatter          = ((p.scatter          != null) ? p.scatter          : 0) * canvasScale;
     const impurities       = (p.impurities       != null) ? p.impurities       : 0;
     const strokeCurve      = (p.strokeCurve      != null) ? p.strokeCurve      : 0;
 
@@ -5897,9 +5931,9 @@ const DitherAlgorithms = (() => {
       else if (p.illusion === 'spiral') dirAng += (phi + rN * Math.PI * 2 * p.illusionStrength);
 
       const lenMul = 1 + (1 - srcVal/255) * p.lumModulation * 0.4;
-      let len = p.dabLen * lenMul;
+      let len = p.dabLen * canvasScale * lenMul;
       if (lengthJitter > 0) len *= (1 + (rnd() - 0.5) * lengthJitter * 1.5);
-      let width = p.dabWidth;
+      let width = p.dabWidth * canvasScale;
       if (sizeJitter > 0) width *= (1 + (rnd() - 0.5) * sizeJitter * 1.5);
       width = Math.max(0.5, width);
       len   = Math.max(1, len);

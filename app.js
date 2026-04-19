@@ -1358,10 +1358,22 @@
           const opts = p.options.map(o =>
             `<option value="${o.value}" ${sel.params[p.id] == o.value ? 'selected' : ''}>${o.label}</option>`
           ).join('');
+          // Brush Shape dropdown is superseded by Custom Brushes when the
+          // master toggle is on (per-zone brushes override the single-brush
+          // shape). Disable + dim the dropdown so users can see at a glance
+          // that it has no effect in custom-brush mode. Mark the group with
+          // data-brush-shape-group so the cb-enabled handler can toggle it
+          // live without a full panel rebuild.
+          const isBrushShape = (p.id === 'brushShape');
+          const cbOverride   = isBrushShape && !!(sel.params.customBrushes && sel.params.customBrushes.enabled);
+          const disMark      = isBrushShape ? ' data-brush-shape-group="1"' : '';
+          const disCls       = cbOverride ? ' param-cb-override' : '';
+          const disAttr      = cbOverride ? ' disabled' : '';
+          const overrideNote = cbOverride ? ' <span class="param-note">(overridden by Custom Brushes)</span>' : '';
           html += `
-            <div class="param-group">
-              <span class="param-label">${p.label}</span>
-              <select data-algo="${sel.id}" data-param="${p.id}">${opts}</select>
+            <div class="param-group${disCls}"${disMark}>
+              <span class="param-label">${p.label}${overrideNote}</span>
+              <select data-algo="${sel.id}" data-param="${p.id}"${disAttr}>${opts}</select>
             </div>
           `;
         } else if (p.type === 'customBrushes') {
@@ -1684,6 +1696,27 @@
             const hint = e.target.closest('.cb-panel').querySelector('.cb-master-hint');
             if (body) body.classList.toggle('cb-disabled', !input.checked);
             if (hint) hint.textContent = input.checked ? 'Active — tonal brush routing' : 'Off (uses single brush)';
+            // Disable/enable the standard Brush Shape dropdown in the same
+            // algo section — per-zone custom brushes override the single
+            // brushShape, so surfacing that fact in the UI prevents users
+            // from fiddling with a dropdown that has no effect.
+            const brushGroup = section.querySelector('[data-brush-shape-group="1"]');
+            if (brushGroup) {
+              const on = input.checked;
+              brushGroup.classList.toggle('param-cb-override', on);
+              const bsSel = brushGroup.querySelector('select');
+              if (bsSel) bsSel.disabled = on;
+              const label = brushGroup.querySelector('.param-label');
+              let note = brushGroup.querySelector('.param-note');
+              if (on && !note && label) {
+                note = document.createElement('span');
+                note.className = 'param-note';
+                note.textContent = ' (overridden by Custom Brushes)';
+                label.appendChild(note);
+              } else if (!on && note) {
+                note.remove();
+              }
+            }
           }
           // Edge toggle → dim its slider.
           if (path === 'edgeEnabled') {
