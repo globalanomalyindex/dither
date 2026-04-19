@@ -2138,14 +2138,49 @@
     document.querySelector('input[name="export-format"][value="png"]').checked = true;
     $('export-compress-toggle').checked = false;
     $('export-compress-section').style.display = 'none';
+    $('export-print-ready').checked = false;
+    $('export-print-hint').style.display = 'none';
     $('export-quality').value = 92;
     $('export-quality-val').textContent = '92';
     $('export-artifact-intensity').value = 15;
     $('export-artifact-val').textContent = '15';
     $('export-recompress-passes').value = 1;
     $('export-recompress-val').textContent = '1';
+    $('export-filename').value = '';
+    updateFilenamePreview();
+    updatePrintReadyLocks();
     exportModal.classList.remove('hidden');
     renderExportPreview();
+  }
+
+  function sanitizeFilename(name) {
+    // Strip path separators, control chars, and trailing dots/spaces.
+    return name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '').replace(/\.+$/, '').trim();
+  }
+
+  function currentFilenameBase() {
+    const raw = sanitizeFilename(($('export-filename').value || '').trim());
+    return raw || 'dithered';
+  }
+
+  function updateFilenamePreview() {
+    const opts = getExportOpts();
+    const ext = opts.format === 'jpeg' ? 'jpg' : opts.format;
+    const scaleLabel = exportScale > 1 ? `_${exportScale}x` : '';
+    $('export-filename-preview').textContent = `Will save as: ${currentFilenameBase()}${scaleLabel}.${ext}`;
+  }
+
+  function updatePrintReadyLocks() {
+    const on = $('export-print-ready').checked;
+    $('export-print-hint').style.display = on ? '' : 'none';
+    if (on) {
+      document.querySelector('input[name="export-format"][value="png"]').checked = true;
+      $('export-compress-toggle').checked = false;
+      $('export-compress-section').style.display = 'none';
+    }
+    // Lock format radios + compress toggle while print-ready is on
+    document.querySelectorAll('input[name="export-format"]').forEach(r => { r.disabled = on; });
+    $('export-compress-toggle').disabled = on;
   }
 
   function closeExportModal() {
@@ -2171,16 +2206,70 @@
   }
 
   function getExportOpts() {
-    const fmt = document.querySelector('input[name="export-format"]:checked').value;
-    const compress = $('export-compress-toggle').checked;
+    const printReady = $('export-print-ready').checked;
+    const fmt = printReady ? 'png' : document.querySelector('input[name="export-format"]:checked').value;
+    const compress = !printReady && $('export-compress-toggle').checked;
     return {
       scale: exportScale,
       format: fmt,
       quality: compress ? parseInt($('export-quality').value) : 92,
       artisticMode: compress,
       artifactIntensity: compress ? parseInt($('export-artifact-intensity').value) : 15,
-      recompressPasses: compress ? parseInt($('export-recompress-passes').value) : 1
+      recompressPasses: compress ? parseInt($('export-recompress-passes').value) : 1,
+      printReady
     };
+  }
+
+  // ── PNG pHYs chunk injection for print DPI metadata ──
+  // PNG spec: pHYs chunk (9 bytes) carries pixels-per-unit X, Y, and unit (1 = meter).
+  // 300 DPI = 300 / 0.0254 ≈ 11811 pixels/meter. Must be inserted after IHDR and
+  // before IDAT. Also update CRC32 for the new chunk.
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  function crc32(bytes, start, end) {
+    let c = 0xffffffff;
+    for (let i = start; i < end; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+  function writeUint32BE(arr, offset, v) {
+    arr[offset] = (v >>> 24) & 0xff;
+    arr[offset + 1] = (v >>> 16) & 0xff;
+    arr[offset + 2] = (v >>> 8) & 0xff;
+    arr[offset + 3] = v & 0xff;
+  }
+  async function addPngDpiMetadata(blob, dpi) {
+    const ppm = Math.round(dpi / 0.0254); // pixels per meter
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    // Validate PNG signature 89 50 4E 47 0D 0A 1A 0A
+    if (buf.length < 8 || buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4E || buf[3] !== 0x47) {
+      return blob;
+    }
+    // Find IHDR (should be first chunk) — its length is 13 bytes, so full chunk is 8+13+4 = 25 bytes starting at offset 8.
+    // We insert pHYs immediately after IHDR.
+    const ihdrEnd = 8 + 4 + 4 + 13 + 4; // 33
+    // Build pHYs chunk: length(4) + type(4) + data(9) + crc(4) = 21 bytes
+    const phys = new Uint8Array(21);
+    writeUint32BE(phys, 0, 9); // data length
+    phys[4] = 0x70; phys[5] = 0x48; phys[6] = 0x59; phys[7] = 0x73; // "pHYs"
+    writeUint32BE(phys, 8, ppm);   // X ppu
+    writeUint32BE(phys, 12, ppm);  // Y ppu
+    phys[16] = 1; // unit = meter
+    const crc = crc32(phys, 4, 17);
+    writeUint32BE(phys, 17, crc);
+    // If a pHYs chunk already exists somewhere, skip; browsers rarely add one.
+    // Splice: [0..ihdrEnd) + phys + [ihdrEnd..end)
+    const out = new Uint8Array(buf.length + phys.length);
+    out.set(buf.subarray(0, ihdrEnd), 0);
+    out.set(phys, ihdrEnd);
+    out.set(buf.subarray(ihdrEnd), ihdrEnd + phys.length);
+    return new Blob([out], { type: 'image/png' });
   }
 
   async function renderExportPreview() {
@@ -2256,6 +2345,7 @@
       exportScale = parseInt(btn.dataset.scale);
       const src = DitherEngine.getSourceSize();
       if (src) { updateExportDimReadout(src); updateExportScaleButtons(src); }
+      updateFilenamePreview();
       scheduleExportPreview();
     });
   });
@@ -2273,6 +2363,7 @@
         $('export-compress-toggle').checked = false;
         $('export-compress-section').style.display = 'none';
       }
+      updateFilenamePreview();
       scheduleExportPreview();
     });
   });
@@ -2301,6 +2392,16 @@
     scheduleExportPreview();
   });
 
+  // Print-ready toggle
+  $('export-print-ready').addEventListener('change', () => {
+    updatePrintReadyLocks();
+    updateFilenamePreview();
+    scheduleExportPreview();
+  });
+
+  // Filename input
+  $('export-filename').addEventListener('input', updateFilenamePreview);
+
   // Confirm export — with progress overlay
   $('export-confirm').addEventListener('click', async () => {
     const btn = $('export-confirm');
@@ -2325,10 +2426,17 @@
     const opts = getExportOpts();
     // Always export exactly what's on the canvas — WYSIWYG
     const canvasData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const blob = await DitherEngine.exportImageData(canvasData, opts, (msg, detail) => {
+    let blob = await DitherEngine.exportImageData(canvasData, opts, (msg, detail) => {
       progressText.textContent = msg;
       progressDetail.textContent = detail || '';
     });
+
+    // Print-ready: inject 300 DPI pHYs chunk into the PNG
+    if (blob && opts.printReady && opts.format === 'png') {
+      progressText.textContent = 'Tagging 300 DPI\u2026';
+      progressDetail.textContent = '';
+      try { blob = await addPngDpiMetadata(blob, 300); } catch (e) { console.warn('DPI tag failed', e); }
+    }
 
     if (blob) {
       progressText.textContent = 'Downloading\u2026';
@@ -2339,7 +2447,7 @@
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `dithered${scaleLabel}.${ext}`;
+      a.download = `${currentFilenameBase()}${scaleLabel}.${ext}`;
       a.click();
       URL.revokeObjectURL(url);
     }

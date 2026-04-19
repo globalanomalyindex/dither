@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=40">
+  <link rel="stylesheet" href="style.css?v=41">
 </head>
 <body>
   <div id="app">
@@ -647,6 +647,15 @@
             <p class="modal-hint modal-dim-readout" id="export-dim-readout"></p>
           </div>
 
+          <!-- Print-ready preset -->
+          <div class="modal-section">
+            <label class="export-format-label">
+              <input type="checkbox" id="export-print-ready">
+              <span style="font-weight:600;">Print-ready</span>
+            </label>
+            <p class="modal-hint" id="export-print-hint" style="display:none;">Lossless PNG tagged at 300 DPI, sRGB. For a 4&times;6" print at 300 DPI you want at least 1200&times;1800 px &mdash; bump the scale if the readout above is smaller.</p>
+          </div>
+
           <!-- File Format -->
           <div class="modal-section">
             <h3>Format</h3>
@@ -694,6 +703,13 @@
             </div>
           </div>
 
+          <!-- Filename -->
+          <div class="modal-section">
+            <h3>Filename</h3>
+            <input type="text" id="export-filename" placeholder="dithered" style="width:100%;padding:6px 8px;box-sizing:border-box;font-family:inherit;font-size:13px;background:#1a1a1a;border:1px solid #333;color:#eee;border-radius:3px;">
+            <p class="modal-hint" id="export-filename-preview"></p>
+          </div>
+
         </div>
       </div>
       <div class="modal-footer">
@@ -704,10 +720,10 @@
     </div>
   </div>
 
-  <script src="dither.js?v=40"></script>
-  <script src="engine.js?v=40"></script>
-  <script src="grain.js?v=40"></script>
-  <script src="paintstroke.js?v=40"></script>
-  <script src="app.js?v=40"></script>
+  <script src="dither.js?v=41"></script>
+  <script src="engine.js?v=41"></script>
+  <script src="grain.js?v=41"></script>
+  <script src="paintstroke.js?v=41"></script>
+  <script src="app.js?v=41"></script>
 </body>
 </html>
