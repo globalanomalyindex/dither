@@ -28,7 +28,15 @@
     zoom: 1,
     panX: 0,
     panY: 0,
-    processing: false
+    processing: false,
+    // ── Custom brush library ──
+    // Session-local store for user-drawn + source-sampled brush stamps.
+    // Keyed by generated ID; each entry: { id, name, w, h, mask: Uint8Array,
+    // thumbDataURL, origin: 'drawn'|'sampled' }. The library is separate
+    // from param state so the same brush can be referenced by multiple
+    // algorithm slots, and undo snapshots don't have to embed bitmaps.
+    // Not persisted across reloads (keeps the per-session feel light).
+    customBrushLibrary: {}
   };
 
   const $ = id => document.getElementById(id);
@@ -303,12 +311,246 @@
     };
   }
 
+  // ── Custom brush resolution ──
+  // Each customBrushes slot has a spec like:
+  //   { source: 'builtin'|'drawn'|'sampled', builtin:'5',
+  //     brushId:'cbr_...', sizeMul, angleJitter, opacity }
+  // The algorithm needs an actual Uint8Array mask + size. resolveBrushSpec
+  // dispatches by source and returns { mask, size } or null. For 'drawn'/
+  // 'sampled' the brush lives in state.customBrushLibrary, keyed by brushId.
+  // For 'builtin' we fetch from PaintEngine.getBrushMask.
+  function resolveBrushSpec(spec) {
+    if (!spec) return null;
+    if (spec.source === 'builtin') {
+      if (typeof PaintEngine === 'undefined' || !PaintEngine.getBrushMask) return null;
+      const bi = parseInt(spec.builtin, 10);
+      if (isNaN(bi)) return null;
+      const b = PaintEngine.getBrushMask(bi);
+      return b && b.mask ? { mask: b.mask, size: b.size } : null;
+    }
+    if (spec.source === 'drawn' || spec.source === 'sampled') {
+      const lib = state.customBrushLibrary[spec.brushId];
+      return lib && lib.mask ? { mask: lib.mask, size: lib.w } : null;
+    }
+    return null;
+  }
+
   function buildPipeline() {
     return state.selectedAlgorithms.map(sel => {
       const algo = DitherAlgorithms.find(a => a.id === sel.id);
-      return { algorithm: algo, params: { ...sel.params } };
+      const params = { ...sel.params };
+      // Pre-resolve customBrushes masks so the algorithm gets actual
+      // Uint8Array data, not just spec references. We mutate a shallow
+      // copy of the customBrushes object so the state stays clean (no
+      // large ArrayBuffers leaking into undo snapshots).
+      if (params.customBrushes && params.customBrushes.enabled) {
+        const cb = { ...params.customBrushes };
+        cb._resolvedMaskShadow = resolveBrushSpec(cb.shadow);
+        cb._resolvedMaskMid    = resolveBrushSpec(cb.mid);
+        cb._resolvedMaskHigh   = resolveBrushSpec(cb.high);
+        cb._resolvedMaskEdge   = resolveBrushSpec(cb.edge);
+        params.customBrushes = cb;
+      }
+      return { algorithm: algo, params };
     });
   }
+
+  // ── Zone visualizer ──
+  // When any selected custom-brushes algo has `showZones: true`, we bypass
+  // the normal painterly render and emit a color-coded map of each pixel's
+  // zone assignment (shadow/mid/high/edge). Users toggle this while tuning
+  // thresholds so they can see EXACTLY which brush will paint which part
+  // of the image before committing to a full render.
+  //   shadow → indigo, mid → teal, high → amber, edge → magenta.
+  function hasZoneVizActive() {
+    for (const sel of state.selectedAlgorithms) {
+      const cb = sel.params && sel.params.customBrushes;
+      if (cb && cb.enabled && cb.showZones) return cb;
+    }
+    return null;
+  }
+  function renderZoneViz(cb, maxDim) {
+    const srcData = DitherEngine.getDownsampled
+      ? DitherEngine.getDownsampled(maxDim)
+      : null;
+    if (!srcData) return null;
+    const w = srcData.width, h = srcData.height;
+    const src = srcData.data;
+    // Compute luminance + Sobel magnitude in one pass, then color-code.
+    const lum = new Uint8ClampedArray(w * h);
+    for (let i = 0; i < w * h; i++) {
+      const r = src[i*4], g = src[i*4+1], b = src[i*4+2];
+      lum[i] = (r * 0.2126 + g * 0.7152 + b * 0.0722) | 0;
+    }
+    // Sobel magnitude (3x3 kernel — same family as the engine's sobelField
+    // but inline here so we don't need to expose it).
+    function mag(x, y) {
+      if (x < 1 || x >= w-1 || y < 1 || y >= h-1) return 0;
+      const i = y * w + x;
+      const gx = -lum[i-w-1] - 2*lum[i-1] - lum[i+w-1]
+                 + lum[i-w+1] + 2*lum[i+1] + lum[i+w+1];
+      const gy = -lum[i-w-1] - 2*lum[i-w] - lum[i-w+1]
+                 + lum[i+w-1] + 2*lum[i+w] + lum[i+w+1];
+      return Math.sqrt(gx*gx + gy*gy) * 0.25;
+    }
+    const out = new ImageData(w, h);
+    const od = out.data;
+    const shadowHi = cb.shadowHi != null ? cb.shadowHi : 85;
+    const midHi    = cb.midHi    != null ? cb.midHi    : 170;
+    const edgeEn   = !!cb.edgeEnabled;
+    const edgeThr  = cb.edgeThreshold != null ? cb.edgeThreshold : 80;
+    // Zone palette (contrasty, readable):
+    //   shadow  → indigo  [80,  60,  180]
+    //   mid     → teal    [60,  180, 160]
+    //   high    → amber   [240, 200, 90]
+    //   edge    → magenta [240, 80,  180]
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const l = lum[i];
+      const m = edgeEn ? mag(x, y) : 0;
+      let r, g, b;
+      if (edgeEn && m >= edgeThr) { r = 240; g = 80; b = 180; }
+      else if (l < shadowHi)      { r = 80;  g = 60; b = 180; }
+      else if (l < midHi)         { r = 60;  g = 180; b = 160; }
+      else                        { r = 240; g = 200; b = 90; }
+      // Tint with source luminance so you can still see image structure:
+      //   final = 0.6 * zone + 0.4 * lum
+      const k = l * 0.4;
+      od[i*4]   = (r * 0.6 + k) | 0;
+      od[i*4+1] = (g * 0.6 + k) | 0;
+      od[i*4+2] = (b * 0.6 + k) | 0;
+      od[i*4+3] = 255;
+    }
+    return out;
+  }
+
+  // ── Custom-brush helpers ──
+  // Everything downstream of the data model: naming, thumbnails, library
+  // writes, spec display. Kept small and self-contained so the panel HTML
+  // builder can call them freely without caring about the underlying
+  // storage format.
+
+  function genBrushId() {
+    return 'cbr_' + Date.now().toString(36) + '_' +
+      Math.floor(Math.random() * 46656).toString(36).padStart(3, '0');
+  }
+
+  // Canvas-backed thumbnail renderer used by both drawn and sampled brushes.
+  // Writes a semi-transparent white stamp so it reads cleanly on the dark UI.
+  // The brush "mask" array stores alpha bytes 0..255 row-major.
+  function renderMaskThumbDataURL(mask, w, h, thumbSize) {
+    const ts = thumbSize || 48;
+    const c = document.createElement('canvas');
+    c.width = ts; c.height = ts;
+    const cctx = c.getContext('2d');
+    const img = cctx.createImageData(ts, ts);
+    for (let y = 0; y < ts; y++) for (let x = 0; x < ts; x++) {
+      const sx = Math.min(w - 1, Math.floor(x * w / ts));
+      const sy = Math.min(h - 1, Math.floor(y * h / ts));
+      const a = mask[sy * w + sx] | 0;
+      const i = (y * ts + x) * 4;
+      img.data[i]   = 255;
+      img.data[i+1] = 255;
+      img.data[i+2] = 255;
+      img.data[i+3] = a;
+    }
+    cctx.putImageData(img, 0, 0);
+    return c.toDataURL();
+  }
+
+  // Save a drawn/sampled mask into the session library. mask is a Uint8Array
+  // with alpha bytes (0..255), w pixels wide, square (h = w is enforced by
+  // the modals). Returns the generated id so the caller can wire it into a
+  // slot spec.
+  function saveCustomBrushToLibrary({ origin, name, mask, w }) {
+    const id = genBrushId();
+    const thumbDataURL = renderMaskThumbDataURL(mask, w, w, 48);
+    state.customBrushLibrary[id] = {
+      id, origin: origin || 'drawn',
+      name: name || (origin === 'sampled' ? 'Sampled' : 'Drawn'),
+      w, h: w, mask, thumbDataURL,
+      createdAt: Date.now()
+    };
+    return id;
+  }
+
+  function deleteCustomBrushFromLibrary(id) {
+    delete state.customBrushLibrary[id];
+    // Also clear any selected-algorithm slots referencing this brush so
+    // we don't leave dangling pointers that resolve to nothing.
+    for (const sel of state.selectedAlgorithms) {
+      const cb = sel.params && sel.params.customBrushes;
+      if (!cb) continue;
+      for (const slot of ['shadow', 'mid', 'high', 'edge']) {
+        const s = cb[slot];
+        if (s && (s.source === 'drawn' || s.source === 'sampled') && s.brushId === id) {
+          // Fall back to a sensible builtin so the algorithm still paints.
+          cb[slot] = { ...s, source: 'builtin', builtin: '0', brushId: '' };
+        }
+      }
+    }
+  }
+
+  // Human-readable label for a slot spec. Shows up under each slot thumb.
+  function describeBrushSpec(spec) {
+    if (!spec) return '—';
+    if (spec.source === 'builtin') {
+      const i = parseInt(spec.builtin, 10);
+      if (typeof PaintEngine !== 'undefined' && PaintEngine.getBrushNames) {
+        const names = PaintEngine.getBrushNames();
+        if (!isNaN(i) && names[i]) return names[i];
+      }
+      return 'Built-in #' + spec.builtin;
+    }
+    if (spec.source === 'drawn' || spec.source === 'sampled') {
+      const lib = state.customBrushLibrary[spec.brushId];
+      const prefix = spec.source === 'drawn' ? '✎ ' : '◉ ';
+      if (!lib) return prefix + 'missing';
+      return prefix + (lib.name || 'Untitled');
+    }
+    return String(spec.source || '—');
+  }
+
+  // DataURL of the thumbnail for a slot spec. Built-ins go through
+  // PaintEngine.getBrushThumbnail; library entries have a pre-baked dataURL.
+  function brushThumbDataURL(spec, sz) {
+    sz = sz || 48;
+    if (!spec) return '';
+    if (spec.source === 'builtin') {
+      if (typeof PaintEngine === 'undefined' || !PaintEngine.getBrushThumbnail) return '';
+      const bi = parseInt(spec.builtin, 10);
+      if (isNaN(bi)) return '';
+      return PaintEngine.getBrushThumbnail(bi, sz) || '';
+    }
+    if (spec.source === 'drawn' || spec.source === 'sampled') {
+      const lib = state.customBrushLibrary[spec.brushId];
+      return (lib && lib.thumbDataURL) || '';
+    }
+    return '';
+  }
+
+  // Write a single named-path update into the param state, dot-paths allowed
+  // (e.g. 'shadow.sizeMul'). Returns the modified root object. Keeps the
+  // event-handler call-site small.
+  function setCustomBrushField(cb, path, value) {
+    const parts = path.split('.');
+    let obj = cb;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!obj[parts[i]] || typeof obj[parts[i]] !== 'object') obj[parts[i]] = {};
+      obj = obj[parts[i]];
+    }
+    obj[parts[parts.length - 1]] = value;
+    return cb;
+  }
+
+  // Zone-color swatches. Must match the palette in renderZoneViz so the
+  // slot UI reads as visually linked to the debug-view colors.
+  const CB_ZONE_COLORS = {
+    shadow: 'rgb(80, 60, 180)',
+    mid:    'rgb(60, 180, 160)',
+    high:   'rgb(240, 200, 90)',
+    edge:   'rgb(240, 80, 180)'
+  };
 
   const PREVIEW_MAX_FULL = 1200;        // final-quality render size
   const PREVIEW_MAX_INTERACTIVE = 300;  // live-drag preview size (~16x fewer pixels)
@@ -365,6 +607,27 @@
     const interactive = !!(opts && opts.interactive);
     const size = DitherEngine.getSourceSize();
     if (!size) return;
+
+    // ── Zone visualizer short-circuit ──
+    // If any selected algo has customBrushes.showZones enabled, bypass
+    // the painterly pipeline entirely and render a color-coded zone map
+    // instead. Lets users tune shadow/mid/high/edge thresholds while
+    // seeing EXACTLY which pixels get which brush. Fast (single-pass
+    // CPU sample) so it's near-instant even on big images.
+    const vizCfg = hasZoneVizActive();
+    if (vizCfg) {
+      if (currentToken) currentToken.cancelled = true;
+      const vizData = renderZoneViz(vizCfg, interactive ? PREVIEW_MAX_INTERACTIVE : PREVIEW_MAX_FULL);
+      if (vizData) {
+        canvas.width = vizData.width;
+        canvas.height = vizData.height;
+        ctx.putImageData(vizData, 0, 0);
+        updateCanvasTransform();
+      }
+      state.processing = false;
+      if (!interactive) showProcessing(false);
+      return;
+    }
 
     // If a render is already in flight, cancel it. The async loop inside
     // DitherEngine.processAsync yields between pipeline steps / color
@@ -1138,6 +1401,130 @@
               <select data-algo="${sel.id}" data-param="${p.id}">${opts}</select>
             </div>
           `;
+        } else if (p.type === 'customBrushes') {
+          // Ensure the param has the full default shape (in case a preset
+          // or older state snapshot left gaps). Fills in missing slot fields
+          // without overwriting anything the user already set.
+          const def = p.default;
+          if (!sel.params[p.id] || typeof sel.params[p.id] !== 'object') {
+            sel.params[p.id] = JSON.parse(JSON.stringify(def));
+          } else {
+            const cur = sel.params[p.id];
+            for (const k of ['enabled','showZones','shadowHi','midHi','edgeEnabled','edgeThreshold','ditherBand']) {
+              if (cur[k] === undefined) cur[k] = def[k];
+            }
+            for (const slot of ['shadow','mid','high','edge']) {
+              if (!cur[slot] || typeof cur[slot] !== 'object') cur[slot] = { ...def[slot] };
+              else for (const kk of Object.keys(def[slot])) {
+                if (cur[slot][kk] === undefined) cur[slot][kk] = def[slot][kk];
+              }
+            }
+          }
+          const cb = sel.params[p.id];
+          const cbOpen = !!cb.enabled;
+          // Four slot cards — shadow/mid/high/edge. Each gets its own thumb
+          // button (opens picker) and a trio of micro-sliders.
+          function renderSlot(slotKey, label) {
+            const spec = cb[slotKey] || {};
+            const thumb = brushThumbDataURL(spec, 48);
+            const desc = describeBrushSpec(spec);
+            const swatch = CB_ZONE_COLORS[slotKey];
+            const sizeMul = spec.sizeMul != null ? spec.sizeMul : 1;
+            const angJit  = spec.angleJitter != null ? spec.angleJitter : 0.5;
+            const op      = spec.opacity != null ? spec.opacity : 1;
+            return `
+              <div class="cb-slot" data-slot="${slotKey}">
+                <div class="cb-slot-head">
+                  <span class="cb-slot-swatch" style="background:${swatch}"></span>
+                  <span class="cb-slot-title">${label}</span>
+                </div>
+                <button class="cb-slot-thumb" data-algo="${sel.id}" data-cb-slot="${slotKey}" title="Change brush">
+                  ${thumb ? `<img src="${thumb}" alt="">` : '<span class="cb-slot-empty">?</span>'}
+                </button>
+                <div class="cb-slot-desc" title="${desc}">${desc}</div>
+                <div class="cb-slot-minis">
+                  <label class="cb-mini">
+                    <span>Size×</span>
+                    <input type="range" class="cb-input" data-algo="${sel.id}" data-cb-path="${slotKey}.sizeMul"
+                      min="0.3" max="2.5" step="0.05" value="${sizeMul}">
+                    <span class="cb-mini-val">${(+sizeMul).toFixed(2)}</span>
+                  </label>
+                  <label class="cb-mini">
+                    <span>Jitter</span>
+                    <input type="range" class="cb-input" data-algo="${sel.id}" data-cb-path="${slotKey}.angleJitter"
+                      min="0" max="1" step="0.05" value="${angJit}">
+                    <span class="cb-mini-val">${(+angJit).toFixed(2)}</span>
+                  </label>
+                  <label class="cb-mini">
+                    <span>Opacity</span>
+                    <input type="range" class="cb-input" data-algo="${sel.id}" data-cb-path="${slotKey}.opacity"
+                      min="0.1" max="1" step="0.05" value="${op}">
+                    <span class="cb-mini-val">${(+op).toFixed(2)}</span>
+                  </label>
+                </div>
+              </div>
+            `;
+          }
+          html += `
+            <div class="param-group cb-panel" data-algo="${sel.id}">
+              <label class="slider-row cb-master">
+                <input type="checkbox" class="cb-input" data-algo="${sel.id}" data-cb-path="enabled" ${cbOpen ? 'checked' : ''}>
+                <span class="param-label cb-master-label">${p.label}</span>
+                <span class="cb-master-hint">${cbOpen ? 'Active — tonal brush routing' : 'Off (uses single brush)'}</span>
+              </label>
+              <div class="cb-body ${cbOpen ? '' : 'cb-disabled'}">
+                <div class="cb-thresholds">
+                  <div class="cb-row">
+                    <span class="param-label">Shadow ↔ Mid</span>
+                    <div class="slider-row">
+                      <input type="range" class="cb-input" data-algo="${sel.id}" data-cb-path="shadowHi"
+                        min="0" max="255" step="1" value="${cb.shadowHi}">
+                      <span class="param-value">${cb.shadowHi}</span>
+                    </div>
+                  </div>
+                  <div class="cb-row">
+                    <span class="param-label">Mid ↔ High</span>
+                    <div class="slider-row">
+                      <input type="range" class="cb-input" data-algo="${sel.id}" data-cb-path="midHi"
+                        min="0" max="255" step="1" value="${cb.midHi}">
+                      <span class="param-value">${cb.midHi}</span>
+                    </div>
+                  </div>
+                  <div class="cb-row">
+                    <span class="param-label">Zone Dither (blur transitions)</span>
+                    <div class="slider-row">
+                      <input type="range" class="cb-input" data-algo="${sel.id}" data-cb-path="ditherBand"
+                        min="0" max="80" step="1" value="${cb.ditherBand}">
+                      <span class="param-value">${cb.ditherBand}</span>
+                    </div>
+                  </div>
+                  <div class="cb-row cb-edge-row">
+                    <label class="slider-row">
+                      <input type="checkbox" class="cb-input" data-algo="${sel.id}" data-cb-path="edgeEnabled" ${cb.edgeEnabled ? 'checked' : ''}>
+                      <span class="param-label" style="margin:0 0 0 6px">Edge override</span>
+                    </label>
+                    <div class="slider-row ${cb.edgeEnabled ? '' : 'cb-dim'}">
+                      <input type="range" class="cb-input" data-algo="${sel.id}" data-cb-path="edgeThreshold"
+                        min="20" max="200" step="1" value="${cb.edgeThreshold}">
+                      <span class="param-value">${cb.edgeThreshold}</span>
+                    </div>
+                  </div>
+                  <div class="cb-row">
+                    <label class="slider-row">
+                      <input type="checkbox" class="cb-input" data-algo="${sel.id}" data-cb-path="showZones" ${cb.showZones ? 'checked' : ''}>
+                      <span class="param-label" style="margin:0 0 0 6px">Show zones (debug viz)</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="cb-slots">
+                  ${renderSlot('shadow', 'Shadow')}
+                  ${renderSlot('mid', 'Mid')}
+                  ${renderSlot('high', 'High')}
+                  ${renderSlot('edge', 'Edge')}
+                </div>
+              </div>
+            </div>
+          `;
         } else {
           html += `
             <div class="param-group">
@@ -1275,8 +1662,10 @@
         hi.addEventListener('input', updateDualRange);
       });
 
-      // Regular range slider events
-      section.querySelectorAll('input[type="range"]:not(.dual-range-lo):not(.dual-range-hi)').forEach(input => {
+      // Regular range slider events — exclude .cb-input so the custom-brush
+      // panel's nested paths don't double-fire (their values live under
+      // sel.params.customBrushes.*, reached via data-cb-path not data-param).
+      section.querySelectorAll('input[type="range"]:not(.dual-range-lo):not(.dual-range-hi):not(.cb-input)').forEach(input => {
         input.addEventListener('input', e => {
           const s = state.selectedAlgorithms.find(a => a.id === e.target.dataset.algo);
           if (s) s.params[e.target.dataset.param] = parseFloat(e.target.value);
@@ -1285,7 +1674,7 @@
         });
       });
 
-      section.querySelectorAll('input[type="checkbox"]').forEach(input => {
+      section.querySelectorAll('input[type="checkbox"]:not(.cb-input)').forEach(input => {
         input.addEventListener('change', e => {
           const s = state.selectedAlgorithms.find(a => a.id === e.target.dataset.algo);
           if (s) s.params[e.target.dataset.param] = e.target.checked;
@@ -1298,6 +1687,84 @@
           const s = state.selectedAlgorithms.find(a => a.id === e.target.dataset.algo);
           if (s) s.params[e.target.dataset.param] = e.target.value;
           scheduleProcess();
+        });
+      });
+
+      // ── Custom-brushes panel wiring ──
+      // Every input in the cb-panel uses data-cb-path to name a nested field
+      // under sel.params.customBrushes (e.g. "shadow.sizeMul"). One handler
+      // routes both ranges and checkboxes through setCustomBrushField().
+      section.querySelectorAll('.cb-input').forEach(input => {
+        const evt = input.type === 'checkbox' ? 'change' : 'input';
+        input.addEventListener(evt, e => {
+          const s = state.selectedAlgorithms.find(a => a.id === e.target.dataset.algo);
+          if (!s) return;
+          if (!s.params.customBrushes || typeof s.params.customBrushes !== 'object') return;
+          const cb = s.params.customBrushes;
+          const path = e.target.dataset.cbPath;
+          const raw = (input.type === 'checkbox') ? input.checked : parseFloat(input.value);
+          setCustomBrushField(cb, path, raw);
+
+          // Keep sibling readouts in sync without a full panel rebuild
+          // (full rebuild would blow away focus + slider drag state).
+          if (input.type === 'range') {
+            // cb-thresholds layout: .slider-row > input + .param-value
+            const pv = e.target.closest('.slider-row') && e.target.closest('.slider-row').querySelector('.param-value');
+            if (pv) pv.textContent = input.value;
+            // cb-mini layout: .cb-mini > input + .cb-mini-val
+            const mv = e.target.closest('.cb-mini') && e.target.closest('.cb-mini').querySelector('.cb-mini-val');
+            if (mv) mv.textContent = (+input.value).toFixed(2);
+          }
+          // Master enable → gray out body without a rebuild.
+          if (path === 'enabled') {
+            const body = e.target.closest('.cb-panel').querySelector('.cb-body');
+            const hint = e.target.closest('.cb-panel').querySelector('.cb-master-hint');
+            if (body) body.classList.toggle('cb-disabled', !input.checked);
+            if (hint) hint.textContent = input.checked ? 'Active — tonal brush routing' : 'Off (uses single brush)';
+          }
+          // Edge toggle → dim its slider.
+          if (path === 'edgeEnabled') {
+            const edgeRow = e.target.closest('.cb-edge-row');
+            const sr = edgeRow && edgeRow.querySelectorAll('.slider-row')[1];
+            if (sr) sr.classList.toggle('cb-dim', !input.checked);
+          }
+          scheduleProcess();
+        });
+      });
+
+      // Slot thumb clicks → open brush picker.
+      section.querySelectorAll('.cb-slot-thumb').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const algoId = btn.dataset.algo;
+          const slotKey = btn.dataset.cbSlot;
+          const s = state.selectedAlgorithms.find(a => a.id === algoId);
+          if (!s || !s.params.customBrushes) return;
+          openBrushPicker(s.params.customBrushes[slotKey], (newSpec) => {
+            // Preserve the slot's per-slot modifiers (sizeMul, angleJitter,
+            // opacity) when the user swaps brush shape — only the source
+            // fields change. This keeps the panel's mini-sliders useful
+            // across brush swaps.
+            const prev = s.params.customBrushes[slotKey] || {};
+            s.params.customBrushes[slotKey] = {
+              ...prev,
+              source: newSpec.source,
+              builtin: newSpec.builtin || '',
+              brushId: newSpec.brushId || ''
+            };
+            // Rebuild just this slot's thumb + description in place.
+            const slotEl = section.querySelector(`.cb-slot[data-slot="${slotKey}"]`);
+            if (slotEl) {
+              const thumbEl = slotEl.querySelector('.cb-slot-thumb');
+              const descEl = slotEl.querySelector('.cb-slot-desc');
+              const spec = s.params.customBrushes[slotKey];
+              const url = brushThumbDataURL(spec, 48);
+              thumbEl.innerHTML = url ? `<img src="${url}" alt="">` : '<span class="cb-slot-empty">?</span>';
+              const desc = describeBrushSpec(spec);
+              descEl.textContent = desc;
+              descEl.title = desc;
+            }
+            scheduleProcess();
+          });
         });
       });
 
@@ -1527,6 +1994,26 @@
       } else if (p.type === 'select') {
         const opts = p.options;
         sel.params[p.id] = opts[randomInt(0, opts.length - 1)].value;
+      } else if (p.type === 'customBrushes') {
+        // Dice only the numeric routing fields — brush specs (which point
+        // into the session library) and enabled-state are deliberately
+        // preserved so a chaotic reroll doesn't suddenly lose your
+        // carefully-picked brushes or flip the whole feature on/off.
+        const cb = sel.params[p.id] || (sel.params[p.id] = JSON.parse(JSON.stringify(p.default)));
+        const sh = randomInt(40, 130);
+        const mh = randomInt(Math.max(sh + 20, 140), 220);
+        cb.shadowHi = sh;
+        cb.midHi = mh;
+        cb.ditherBand = randomInt(0, 60);
+        cb.edgeThreshold = randomInt(40, 160);
+        // Also jitter each slot's modifier trio for variety without
+        // touching the underlying brush shape.
+        for (const slot of ['shadow','mid','high','edge']) {
+          if (!cb[slot] || typeof cb[slot] !== 'object') cb[slot] = { ...p.default[slot] };
+          cb[slot].sizeMul     = Math.round((0.5 + Math.random() * 1.8) * 20) / 20;
+          cb[slot].angleJitter = Math.round(Math.random() * 20) / 20;
+          cb[slot].opacity     = Math.round((0.5 + Math.random() * 0.5) * 20) / 20;
+        }
       } else {
         const cap = caps[p.id];
         const min = p.min;
@@ -3112,6 +3599,666 @@
     updateStrokeCount();
     runProcess(); // Re-render base image
   });
+
+  // ─────────────────────────────────────────────────────────────────
+  //  Custom-brush modals
+  // ─────────────────────────────────────────────────────────────────
+  //
+  //  openBrushPicker(currentSpec, onChoose)
+  //    Full-screen overlay with four tabs:
+  //      1. Built-in  — grid of PaintEngine library brushes.
+  //      2. Library   — drawn + sampled entries from this session.
+  //      3. Draw      — paint a brush shape freehand on a 256×256 pad.
+  //      4. Sample    — circle-select a region of the source image.
+  //    Calls onChoose({source, builtin, brushId}) with only the
+  //    source-selection fields — the caller preserves its own
+  //    sizeMul/angleJitter/opacity modifiers.
+  //
+  //  The draw & sample tabs build an alpha mask (Uint8Array, 96×96)
+  //  and push it into state.customBrushLibrary via saveCustomBrushToLibrary.
+  //  Once saved, the newly-created library entry is auto-selected so
+  //  the user doesn't have to click again to pick it.
+
+  // Shared modal-overlay scaffold. Returns { overlay, body, close }.
+  function _openModalScaffold(title, className) {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay cb-modal-overlay ' + (className || '');
+    const modal = document.createElement('div');
+    modal.className = 'modal cb-modal';
+    modal.innerHTML = `
+      <div class="modal-header">
+        <h2>${title}</h2>
+        <button class="modal-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body"></div>
+    `;
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    const body = modal.querySelector('.modal-body');
+    const closeBtn = modal.querySelector('.modal-close');
+    const close = () => { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+    closeBtn.addEventListener('click', close);
+    // Click outside modal panel closes.
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    // Esc closes.
+    const escHandler = e => { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', escHandler); } };
+    document.addEventListener('keydown', escHandler);
+    return { overlay, modal, body, close };
+  }
+
+  function openBrushPicker(currentSpec, onChoose) {
+    const { body, close } = _openModalScaffold('Choose Brush', 'cb-modal-picker');
+
+    // Tab state (kept local to this modal instance).
+    let activeTab = currentSpec && (currentSpec.source === 'drawn' || currentSpec.source === 'sampled')
+      ? 'library' : 'builtin';
+
+    function chooseAndClose(spec) {
+      try { onChoose(spec); } finally { close(); }
+    }
+
+    function renderBuiltinGrid() {
+      const count = (typeof PaintEngine !== 'undefined' && PaintEngine.getBrushMaskCount)
+        ? PaintEngine.getBrushMaskCount() : 0;
+      const names = (typeof PaintEngine !== 'undefined' && PaintEngine.getBrushNames)
+        ? PaintEngine.getBrushNames() : [];
+      let grid = '<div class="cb-picker-grid">';
+      for (let i = 0; i < count; i++) {
+        const url = PaintEngine.getBrushThumbnail ? PaintEngine.getBrushThumbnail(i, 64) : '';
+        const sel = (currentSpec && currentSpec.source === 'builtin' && parseInt(currentSpec.builtin, 10) === i) ? 'selected' : '';
+        grid += `
+          <button class="cb-picker-cell ${sel}" data-pick-builtin="${i}" title="${names[i] || ('Brush ' + i)}">
+            ${url ? `<img src="${url}" alt="">` : ''}
+            <span class="cb-picker-name">${names[i] || ('#' + i)}</span>
+          </button>
+        `;
+      }
+      grid += '</div>';
+      if (count === 0) grid = '<p class="cb-picker-empty">Built-in brushes not initialized yet.</p>';
+      return grid;
+    }
+
+    function renderLibraryGrid() {
+      const entries = Object.values(state.customBrushLibrary)
+        .sort((a, b) => b.createdAt - a.createdAt);
+      if (entries.length === 0) {
+        return `<p class="cb-picker-empty">
+          No custom brushes yet. Use the <b>Draw</b> or <b>Sample</b> tab to create one.
+        </p>`;
+      }
+      let grid = '<div class="cb-picker-grid">';
+      for (const e of entries) {
+        const sel = (currentSpec && currentSpec.brushId === e.id) ? 'selected' : '';
+        const badge = e.origin === 'drawn' ? '✎' : '◉';
+        grid += `
+          <div class="cb-picker-libcell ${sel}" data-pick-lib="${e.id}" data-origin="${e.origin}">
+            <button class="cb-picker-cell cb-picker-libthumb" data-pick-lib-btn="${e.id}" title="${e.name}">
+              <img src="${e.thumbDataURL}" alt="">
+              <span class="cb-picker-badge">${badge}</span>
+            </button>
+            <div class="cb-picker-libname">${e.name}</div>
+            <button class="cb-picker-libdel" data-pick-libdel="${e.id}" title="Delete">×</button>
+          </div>
+        `;
+      }
+      grid += '</div>';
+      return grid;
+    }
+
+    function renderContent() {
+      let html = `
+        <div class="cb-picker-tabs">
+          <button class="cb-picker-tab ${activeTab==='builtin'?'active':''}" data-tab="builtin">Built-in</button>
+          <button class="cb-picker-tab ${activeTab==='library'?'active':''}" data-tab="library">Library</button>
+          <button class="cb-picker-tab ${activeTab==='draw'?'active':''}" data-tab="draw">✎ Draw</button>
+          <button class="cb-picker-tab ${activeTab==='sample'?'active':''}" data-tab="sample">◉ Sample</button>
+        </div>
+        <div class="cb-picker-body">
+      `;
+      if (activeTab === 'builtin') html += renderBuiltinGrid();
+      else if (activeTab === 'library') html += renderLibraryGrid();
+      else if (activeTab === 'draw') html += `<div class="cb-picker-draw-slot"></div>`;
+      else if (activeTab === 'sample') html += `<div class="cb-picker-sample-slot"></div>`;
+      html += '</div>';
+      body.innerHTML = html;
+
+      // Tab switching.
+      body.querySelectorAll('.cb-picker-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+          activeTab = btn.dataset.tab;
+          renderContent();
+        });
+      });
+
+      if (activeTab === 'builtin') {
+        body.querySelectorAll('[data-pick-builtin]').forEach(cell => {
+          cell.addEventListener('click', () => {
+            chooseAndClose({ source: 'builtin', builtin: cell.dataset.pickBuiltin, brushId: '' });
+          });
+        });
+      } else if (activeTab === 'library') {
+        body.querySelectorAll('[data-pick-lib-btn]').forEach(cell => {
+          cell.addEventListener('click', e => {
+            const id = cell.dataset.pickLibBtn;
+            const entry = state.customBrushLibrary[id];
+            if (!entry) return;
+            chooseAndClose({ source: entry.origin, builtin: '', brushId: id });
+          });
+        });
+        body.querySelectorAll('[data-pick-libdel]').forEach(btn => {
+          btn.addEventListener('click', e => {
+            e.stopPropagation();
+            const id = btn.dataset.pickLibdel;
+            if (!confirm('Delete this brush? It will also be removed from any slot currently using it.')) return;
+            deleteCustomBrushFromLibrary(id);
+            renderContent();  // re-render grid
+            scheduleProcess();
+          });
+        });
+      } else if (activeTab === 'draw') {
+        renderDrawPane(body.querySelector('.cb-picker-draw-slot'), (mask, w, name) => {
+          const id = saveCustomBrushToLibrary({ origin: 'drawn', name: name || 'Drawn', mask, w });
+          chooseAndClose({ source: 'drawn', builtin: '', brushId: id });
+        });
+      } else if (activeTab === 'sample') {
+        renderSamplePane(body.querySelector('.cb-picker-sample-slot'), (mask, w, name) => {
+          const id = saveCustomBrushToLibrary({ origin: 'sampled', name: name || 'Sampled', mask, w });
+          chooseAndClose({ source: 'sampled', builtin: '', brushId: id });
+        });
+      }
+    }
+
+    renderContent();
+  }
+
+  // ───── Draw pane ─────
+  // Renders into the provided container. onCommit(mask, size, name) fires
+  // when the user clicks "Add to Library". The drawing canvas is an alpha
+  // accumulator: strokes layer into a Float32 buffer so overlap deepens
+  // opacity smoothly. On commit we trim, normalize, and downsample the
+  // buffer to a 96×96 mask.
+  function renderDrawPane(container, onCommit) {
+    const DRAW_SIZE = 256;   // editing resolution
+    const OUT_SIZE  = 96;    // stored resolution
+    container.innerHTML = `
+      <div class="cb-draw-top">
+        <div class="cb-draw-stage">
+          <canvas class="cb-draw-canvas" width="${DRAW_SIZE}" height="${DRAW_SIZE}"></canvas>
+        </div>
+        <div class="cb-draw-controls">
+          <label class="cb-mini">
+            <span>Brush radius</span>
+            <input type="range" class="cb-draw-radius" min="2" max="40" step="1" value="12">
+            <span class="cb-mini-val" data-val="radius">12</span>
+          </label>
+          <label class="cb-mini">
+            <span>Hardness</span>
+            <input type="range" class="cb-draw-hardness" min="0" max="1" step="0.05" value="0.3">
+            <span class="cb-mini-val" data-val="hardness">0.30</span>
+          </label>
+          <label class="cb-mini">
+            <span>Flow</span>
+            <input type="range" class="cb-draw-flow" min="0.05" max="1" step="0.05" value="0.4">
+            <span class="cb-mini-val" data-val="flow">0.40</span>
+          </label>
+          <label class="cb-mini cb-draw-vel">
+            <input type="checkbox" class="cb-draw-velocity" checked>
+            <span>Velocity → opacity (fast = lighter)</span>
+          </label>
+          <label class="cb-mini cb-draw-erase-wrap">
+            <input type="checkbox" class="cb-draw-erase">
+            <span>Erase mode</span>
+          </label>
+          <label class="cb-mini">
+            <span>Name</span>
+            <input type="text" class="cb-draw-name" value="Drawn" maxlength="24">
+          </label>
+          <div class="cb-draw-actions">
+            <button class="btn-secondary cb-draw-clear" type="button">Clear</button>
+            <button class="btn-primary cb-draw-save" type="button">Add to Library</button>
+          </div>
+          <p class="cb-hint">Tip: draw near the center. Edges get trimmed and everything gets scaled to a ${OUT_SIZE}×${OUT_SIZE} stamp.</p>
+        </div>
+      </div>
+      <div class="cb-draw-preview-row">
+        <span class="cb-draw-preview-label">Preview stamp:</span>
+        <canvas class="cb-draw-preview" width="${OUT_SIZE}" height="${OUT_SIZE}"></canvas>
+      </div>
+    `;
+
+    const canvas = container.querySelector('.cb-draw-canvas');
+    const ctx2 = canvas.getContext('2d');
+    // Alpha accumulator — we paint into this and re-blit to the visible
+    // canvas each stroke. Float so repeated overlap stacks smoothly.
+    const accum = new Float32Array(DRAW_SIZE * DRAW_SIZE);
+
+    let drawing = false;
+    let lastX = 0, lastY = 0, lastT = 0;
+
+    function drawBlob(x, y, radius, opacity, erase) {
+      const r = radius | 0;
+      const x0 = Math.max(0, (x - r) | 0), y0 = Math.max(0, (y - r) | 0);
+      const x1 = Math.min(DRAW_SIZE, (x + r + 1) | 0), y1 = Math.min(DRAW_SIZE, (y + r + 1) | 0);
+      const rSq = r * r;
+      const hardness = parseFloat(container.querySelector('.cb-draw-hardness').value);
+      const core = hardness;
+      for (let yy = y0; yy < y1; yy++) {
+        for (let xx = x0; xx < x1; xx++) {
+          const dx = xx - x, dy = yy - y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > rSq) continue;
+          const d = Math.sqrt(d2) / r; // 0..1
+          // Radial falloff with hardness plateau.
+          let f;
+          if (d < core) f = 1;
+          else f = 1 - (d - core) / (1 - core);
+          if (f <= 0) continue;
+          const add = f * opacity;
+          const i = yy * DRAW_SIZE + xx;
+          if (erase) accum[i] = Math.max(0, accum[i] - add);
+          else       accum[i] = Math.min(1, accum[i] + add);
+        }
+      }
+    }
+
+    function blitAccum() {
+      const img = ctx2.createImageData(DRAW_SIZE, DRAW_SIZE);
+      for (let i = 0; i < DRAW_SIZE * DRAW_SIZE; i++) {
+        const a = Math.round(accum[i] * 255);
+        const j = i * 4;
+        img.data[j]   = 255;
+        img.data[j+1] = 255;
+        img.data[j+2] = 255;
+        img.data[j+3] = a;
+      }
+      ctx2.clearRect(0, 0, DRAW_SIZE, DRAW_SIZE);
+      // Checkerboard background for alpha legibility.
+      const bg = ctx2.createImageData(DRAW_SIZE, DRAW_SIZE);
+      for (let y = 0; y < DRAW_SIZE; y++) for (let x = 0; x < DRAW_SIZE; x++) {
+        const v = ((x >> 3) + (y >> 3)) & 1 ? 32 : 22;
+        const j = (y * DRAW_SIZE + x) * 4;
+        bg.data[j] = v; bg.data[j+1] = v; bg.data[j+2] = v; bg.data[j+3] = 255;
+      }
+      ctx2.putImageData(bg, 0, 0);
+      // Now paint the accum on top.
+      const tmp = document.createElement('canvas');
+      tmp.width = DRAW_SIZE; tmp.height = DRAW_SIZE;
+      tmp.getContext('2d').putImageData(img, 0, 0);
+      ctx2.drawImage(tmp, 0, 0);
+      updatePreview();
+    }
+
+    function pointerPos(e) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (e.clientX - rect.left) * (DRAW_SIZE / rect.width),
+        y: (e.clientY - rect.top)  * (DRAW_SIZE / rect.height)
+      };
+    }
+
+    function handleDown(e) {
+      drawing = true;
+      canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
+      const p = pointerPos(e);
+      lastX = p.x; lastY = p.y; lastT = performance.now();
+      const r = parseFloat(container.querySelector('.cb-draw-radius').value);
+      const flow = parseFloat(container.querySelector('.cb-draw-flow').value);
+      const erase = container.querySelector('.cb-draw-erase').checked;
+      drawBlob(p.x, p.y, r, flow, erase);
+      blitAccum();
+      e.preventDefault();
+    }
+    function handleMove(e) {
+      if (!drawing) return;
+      const p = pointerPos(e);
+      const now = performance.now();
+      const dx = p.x - lastX, dy = p.y - lastY;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      const dt = Math.max(1, now - lastT);
+      const speed = dist / dt; // px per ms
+      const velEnabled = container.querySelector('.cb-draw-velocity').checked;
+      // At speed=0.3 px/ms (slow), opacityMul ~= 1. At speed=3 (fast), ~= 0.3.
+      const velMul = velEnabled ? Math.max(0.2, 1 / (1 + speed * 1.5)) : 1;
+      const r = parseFloat(container.querySelector('.cb-draw-radius').value);
+      const flow = parseFloat(container.querySelector('.cb-draw-flow').value) * velMul;
+      const erase = container.querySelector('.cb-draw-erase').checked;
+      // Interpolate blobs along the stroke — step ~= radius*0.25 keeps it smooth.
+      const step = Math.max(1, r * 0.25);
+      const steps = Math.max(1, Math.ceil(dist / step));
+      for (let s = 1; s <= steps; s++) {
+        const t = s / steps;
+        drawBlob(lastX + dx * t, lastY + dy * t, r, flow, erase);
+      }
+      lastX = p.x; lastY = p.y; lastT = now;
+      blitAccum();
+      e.preventDefault();
+    }
+    function handleUp(e) {
+      drawing = false;
+      try { canvas.releasePointerCapture && canvas.releasePointerCapture(e.pointerId); } catch(_) {}
+    }
+    canvas.style.touchAction = 'none';
+    canvas.addEventListener('pointerdown', handleDown);
+    canvas.addEventListener('pointermove', handleMove);
+    canvas.addEventListener('pointerup', handleUp);
+    canvas.addEventListener('pointercancel', handleUp);
+    canvas.addEventListener('pointerleave', handleUp);
+
+    // Slider live-value readouts
+    container.querySelectorAll('.cb-draw-controls input[type="range"]').forEach(inp => {
+      inp.addEventListener('input', e => {
+        const mv = e.target.closest('.cb-mini').querySelector('.cb-mini-val');
+        if (mv) mv.textContent = (+e.target.value).toFixed(inp.step.includes('.') ? 2 : 0);
+      });
+    });
+
+    container.querySelector('.cb-draw-clear').addEventListener('click', () => {
+      for (let i = 0; i < accum.length; i++) accum[i] = 0;
+      blitAccum();
+    });
+
+    // Preview: trim + scale to OUT_SIZE × OUT_SIZE, show live.
+    const previewCanvas = container.querySelector('.cb-draw-preview');
+    const pctx = previewCanvas.getContext('2d');
+    function buildMaskFromAccum() {
+      // Find bounding box of nonzero pixels
+      let minX = DRAW_SIZE, minY = DRAW_SIZE, maxX = -1, maxY = -1;
+      for (let y = 0; y < DRAW_SIZE; y++) for (let x = 0; x < DRAW_SIZE; x++) {
+        if (accum[y * DRAW_SIZE + x] > 0.02) {
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
+      }
+      if (maxX < 0) return null;
+      const w = maxX - minX + 1, h = maxY - minY + 1;
+      const side = Math.max(w, h);
+      // Center the bbox in a square the size of the longest side + small padding.
+      const pad = Math.max(2, (side * 0.05) | 0);
+      const sq = side + pad * 2;
+      const ox = minX - ((sq - w) >> 1);
+      const oy = minY - ((sq - h) >> 1);
+      // Scale sq → OUT_SIZE nearest-neighbor. Use bilinear for smoother results.
+      const mask = new Uint8Array(OUT_SIZE * OUT_SIZE);
+      for (let y = 0; y < OUT_SIZE; y++) for (let x = 0; x < OUT_SIZE; x++) {
+        const sx = ox + x * sq / OUT_SIZE;
+        const sy = oy + y * sq / OUT_SIZE;
+        const xi = Math.max(0, Math.min(DRAW_SIZE - 1, sx | 0));
+        const yi = Math.max(0, Math.min(DRAW_SIZE - 1, sy | 0));
+        const xf = sx - xi, yf = sy - yi;
+        const i00 = yi * DRAW_SIZE + xi;
+        const i10 = yi * DRAW_SIZE + Math.min(DRAW_SIZE - 1, xi + 1);
+        const i01 = Math.min(DRAW_SIZE - 1, yi + 1) * DRAW_SIZE + xi;
+        const i11 = Math.min(DRAW_SIZE - 1, yi + 1) * DRAW_SIZE + Math.min(DRAW_SIZE - 1, xi + 1);
+        const a = accum[i00] * (1 - xf) * (1 - yf) +
+                  accum[i10] * xf       * (1 - yf) +
+                  accum[i01] * (1 - xf) * yf +
+                  accum[i11] * xf       * yf;
+        mask[y * OUT_SIZE + x] = Math.round(Math.min(1, a) * 255);
+      }
+      return mask;
+    }
+    function updatePreview() {
+      const mask = buildMaskFromAccum();
+      const img = pctx.createImageData(OUT_SIZE, OUT_SIZE);
+      // Checkerboard bg
+      for (let y = 0; y < OUT_SIZE; y++) for (let x = 0; x < OUT_SIZE; x++) {
+        const v = ((x >> 2) + (y >> 2)) & 1 ? 32 : 22;
+        const j = (y * OUT_SIZE + x) * 4;
+        img.data[j] = v; img.data[j+1] = v; img.data[j+2] = v; img.data[j+3] = 255;
+      }
+      if (mask) {
+        // Composite stamp over bg (white alpha over dark checker)
+        for (let i = 0; i < OUT_SIZE * OUT_SIZE; i++) {
+          const a = mask[i] / 255;
+          const j = i * 4;
+          img.data[j]   = Math.round(img.data[j]   * (1 - a) + 255 * a);
+          img.data[j+1] = Math.round(img.data[j+1] * (1 - a) + 255 * a);
+          img.data[j+2] = Math.round(img.data[j+2] * (1 - a) + 255 * a);
+        }
+      }
+      pctx.putImageData(img, 0, 0);
+    }
+
+    // Initial empty paint so the checker bg shows
+    blitAccum();
+
+    container.querySelector('.cb-draw-save').addEventListener('click', () => {
+      const mask = buildMaskFromAccum();
+      if (!mask) { alert('Draw something first!'); return; }
+      const name = (container.querySelector('.cb-draw-name').value || 'Drawn').slice(0, 24);
+      onCommit(mask, OUT_SIZE, name);
+    });
+  }
+
+  // ───── Sample pane ─────
+  // Shows a downsampled view of the current source image. User drags a
+  // circular selector; radius is a slider. On commit we read the pixels
+  // from the circle, convert to a luminance mask (dark-ink or light-ink
+  // mode), then scale to OUT_SIZE × OUT_SIZE. This lets users turn any
+  // interesting region of a photo — a crackle, a scrape, a cloud edge —
+  // into a painterly stamp without leaving the app.
+  function renderSamplePane(container, onCommit) {
+    const VIEW_MAX = 380;
+    const OUT_SIZE = 96;
+    const srcSize = DitherEngine.getSourceSize && DitherEngine.getSourceSize();
+    if (!srcSize) {
+      container.innerHTML = `<p class="cb-picker-empty">Load an image first to sample brushes from it.</p>`;
+      return;
+    }
+    // Get a downsampled RGBA preview we can show + click on.
+    const preview = DitherEngine.getDownsampled(VIEW_MAX);
+    const viewW = preview.width, viewH = preview.height;
+
+    container.innerHTML = `
+      <div class="cb-sample-top">
+        <div class="cb-sample-stage" style="width:${viewW}px;height:${viewH}px">
+          <canvas class="cb-sample-canvas" width="${viewW}" height="${viewH}"></canvas>
+          <canvas class="cb-sample-overlay" width="${viewW}" height="${viewH}"></canvas>
+        </div>
+        <div class="cb-sample-controls">
+          <label class="cb-mini">
+            <span>Radius</span>
+            <input type="range" class="cb-sample-radius" min="8" max="${Math.min(viewW, viewH) >> 1}" step="1" value="32">
+            <span class="cb-mini-val" data-val="radius">32</span>
+          </label>
+          <label class="cb-mini">
+            <span>Invert</span>
+            <input type="checkbox" class="cb-sample-invert">
+            <span class="cb-mini-hint">Dark → ink</span>
+          </label>
+          <label class="cb-mini">
+            <span>Threshold</span>
+            <input type="range" class="cb-sample-threshold" min="0" max="255" step="1" value="140">
+            <span class="cb-mini-val" data-val="threshold">140</span>
+          </label>
+          <label class="cb-mini">
+            <span>Softness</span>
+            <input type="range" class="cb-sample-softness" min="0" max="1" step="0.05" value="0.5">
+            <span class="cb-mini-val" data-val="softness">0.50</span>
+          </label>
+          <label class="cb-mini">
+            <span>Name</span>
+            <input type="text" class="cb-sample-name" value="Sampled" maxlength="24">
+          </label>
+          <div class="cb-draw-actions">
+            <button class="btn-primary cb-sample-save" type="button">Add to Library</button>
+          </div>
+          <p class="cb-hint">Drag the circle. Threshold/softness build the alpha; invert if your image is light-on-dark.</p>
+        </div>
+      </div>
+      <div class="cb-draw-preview-row">
+        <span class="cb-draw-preview-label">Preview stamp:</span>
+        <canvas class="cb-sample-preview" width="${OUT_SIZE}" height="${OUT_SIZE}"></canvas>
+      </div>
+    `;
+
+    const canvas = container.querySelector('.cb-sample-canvas');
+    const overlay = container.querySelector('.cb-sample-overlay');
+    canvas.getContext('2d').putImageData(preview, 0, 0);
+    const octx = overlay.getContext('2d');
+
+    let cx = viewW / 2, cy = viewH / 2;
+    let dragging = false;
+
+    function drawOverlay() {
+      const r = parseInt(container.querySelector('.cb-sample-radius').value, 10);
+      octx.clearRect(0, 0, viewW, viewH);
+      // Dim outside the circle
+      octx.fillStyle = 'rgba(0,0,0,0.45)';
+      octx.fillRect(0, 0, viewW, viewH);
+      octx.save();
+      octx.globalCompositeOperation = 'destination-out';
+      octx.beginPath();
+      octx.arc(cx, cy, r, 0, Math.PI * 2);
+      octx.fill();
+      octx.restore();
+      // Draw circle border
+      octx.strokeStyle = '#a78bfa';
+      octx.lineWidth = 2;
+      octx.beginPath();
+      octx.arc(cx, cy, r, 0, Math.PI * 2);
+      octx.stroke();
+      // Crosshair
+      octx.strokeStyle = 'rgba(167, 139, 250, 0.8)';
+      octx.lineWidth = 1;
+      octx.beginPath();
+      octx.moveTo(cx - 6, cy); octx.lineTo(cx + 6, cy);
+      octx.moveTo(cx, cy - 6); octx.lineTo(cx, cy + 6);
+      octx.stroke();
+      updatePreview();
+    }
+
+    function posFrom(e) {
+      const rect = overlay.getBoundingClientRect();
+      return {
+        x: (e.clientX - rect.left) * (viewW / rect.width),
+        y: (e.clientY - rect.top)  * (viewH / rect.height)
+      };
+    }
+    overlay.style.touchAction = 'none';
+    overlay.style.cursor = 'move';
+    overlay.addEventListener('pointerdown', e => {
+      dragging = true;
+      overlay.setPointerCapture && overlay.setPointerCapture(e.pointerId);
+      const p = posFrom(e);
+      cx = p.x; cy = p.y;
+      drawOverlay();
+      e.preventDefault();
+    });
+    overlay.addEventListener('pointermove', e => {
+      if (!dragging) return;
+      const p = posFrom(e);
+      cx = p.x; cy = p.y;
+      drawOverlay();
+      e.preventDefault();
+    });
+    overlay.addEventListener('pointerup', e => {
+      dragging = false;
+      try { overlay.releasePointerCapture && overlay.releasePointerCapture(e.pointerId); } catch(_){}
+    });
+    overlay.addEventListener('pointercancel', () => dragging = false);
+    overlay.addEventListener('pointerleave', () => dragging = false);
+
+    container.querySelectorAll('.cb-sample-controls input[type="range"]').forEach(inp => {
+      inp.addEventListener('input', e => {
+        const mv = e.target.closest('.cb-mini').querySelector('.cb-mini-val');
+        if (mv) mv.textContent = (+e.target.value).toFixed(inp.step.includes('.') ? 2 : 0);
+        drawOverlay();
+      });
+    });
+    container.querySelector('.cb-sample-invert').addEventListener('change', drawOverlay);
+
+    const previewCanvas = container.querySelector('.cb-sample-preview');
+    const pctx = previewCanvas.getContext('2d');
+    function buildMaskFromSample() {
+      const r = parseInt(container.querySelector('.cb-sample-radius').value, 10);
+      const thr = parseInt(container.querySelector('.cb-sample-threshold').value, 10);
+      const soft = parseFloat(container.querySelector('.cb-sample-softness').value);
+      const inv = container.querySelector('.cb-sample-invert').checked;
+      // Read the circle patch from the preview image.
+      const box = 2 * r;
+      const bx = Math.max(0, (cx - r) | 0);
+      const by = Math.max(0, (cy - r) | 0);
+      const bw = Math.min(viewW - bx, box);
+      const bh = Math.min(viewH - by, box);
+      if (bw <= 0 || bh <= 0) return null;
+      // Build mask in box-local space, then scale to OUT_SIZE.
+      const local = new Uint8Array(box * box);
+      const px = preview.data;
+      // Soft edge at the circle boundary
+      const softPx = Math.max(0.5, r * (soft * 0.5 + 0.02));
+      for (let yy = 0; yy < box; yy++) {
+        for (let xx = 0; xx < box; xx++) {
+          const gx = bx + xx - (bx - (cx - r)); // patch coord
+          // Actually, cleaner: sample at (cx - r + xx, cy - r + yy)
+          const sx = (cx - r + xx) | 0;
+          const sy = (cy - r + yy) | 0;
+          if (sx < 0 || sx >= viewW || sy < 0 || sy >= viewH) continue;
+          const dx = xx - r, dy = yy - r;
+          const dist = Math.sqrt(dx*dx + dy*dy);
+          if (dist > r) continue;
+          const edgeA = Math.max(0, Math.min(1, (r - dist) / softPx));
+          const j = (sy * viewW + sx) * 4;
+          const lum = (px[j] * 0.2126 + px[j+1] * 0.7152 + px[j+2] * 0.0722);
+          // Two-sided soft threshold: farther from threshold = more opaque.
+          const lumDepth = inv ? (lum - thr) / 128 : (thr - lum) / 128;
+          let a = Math.max(0, Math.min(1, 0.5 + lumDepth));
+          // Soften the curve
+          a = Math.pow(a, 1 / (1 + soft * 2));
+          local[yy * box + xx] = Math.round(Math.min(1, a * edgeA) * 255);
+        }
+      }
+      // Scale to OUT_SIZE with bilinear
+      const mask = new Uint8Array(OUT_SIZE * OUT_SIZE);
+      for (let y = 0; y < OUT_SIZE; y++) for (let x = 0; x < OUT_SIZE; x++) {
+        const sx = x * box / OUT_SIZE;
+        const sy = y * box / OUT_SIZE;
+        const xi = Math.max(0, Math.min(box - 1, sx | 0));
+        const yi = Math.max(0, Math.min(box - 1, sy | 0));
+        const xf = sx - xi, yf = sy - yi;
+        const i00 = yi * box + xi;
+        const i10 = yi * box + Math.min(box - 1, xi + 1);
+        const i01 = Math.min(box - 1, yi + 1) * box + xi;
+        const i11 = Math.min(box - 1, yi + 1) * box + Math.min(box - 1, xi + 1);
+        const a = local[i00] * (1 - xf) * (1 - yf) +
+                  local[i10] * xf       * (1 - yf) +
+                  local[i01] * (1 - xf) * yf +
+                  local[i11] * xf       * yf;
+        mask[y * OUT_SIZE + x] = Math.round(a);
+      }
+      return mask;
+    }
+    function updatePreview() {
+      const mask = buildMaskFromSample();
+      const img = pctx.createImageData(OUT_SIZE, OUT_SIZE);
+      for (let y = 0; y < OUT_SIZE; y++) for (let x = 0; x < OUT_SIZE; x++) {
+        const v = ((x >> 2) + (y >> 2)) & 1 ? 32 : 22;
+        const j = (y * OUT_SIZE + x) * 4;
+        img.data[j] = v; img.data[j+1] = v; img.data[j+2] = v; img.data[j+3] = 255;
+      }
+      if (mask) {
+        for (let i = 0; i < OUT_SIZE * OUT_SIZE; i++) {
+          const a = mask[i] / 255;
+          const j = i * 4;
+          img.data[j]   = Math.round(img.data[j]   * (1 - a) + 255 * a);
+          img.data[j+1] = Math.round(img.data[j+1] * (1 - a) + 255 * a);
+          img.data[j+2] = Math.round(img.data[j+2] * (1 - a) + 255 * a);
+        }
+      }
+      pctx.putImageData(img, 0, 0);
+    }
+
+    drawOverlay();
+
+    container.querySelector('.cb-sample-save').addEventListener('click', () => {
+      const mask = buildMaskFromSample();
+      if (!mask) { alert('Pick a region first!'); return; }
+      const name = (container.querySelector('.cb-sample-name').value || 'Sampled').slice(0, 24);
+      onCommit(mask, OUT_SIZE, name);
+    });
+  }
 
   // ── Init ──
   buildAlgorithmList();

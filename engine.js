@@ -1017,6 +1017,9 @@ const DitherEngine = (() => {
     loadImage, getSourceSize, bake, bakeImageData, process, processAsync,
     exportFullSize, exportWithOptions, exportImageData,
     hexToRgb, rgbToHex, clampByte, blendPixel,
-    getPalettePresets, getPalette, extractPalette, medianCut, nearestColor
+    getPalettePresets, getPalette, extractPalette, medianCut, nearestColor,
+    // Exposed so app-side features (e.g. zone visualizer) can sample the
+    // source at a preview-matched resolution without redoing the scale.
+    getDownsampled
   };
 })();

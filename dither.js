@@ -1432,6 +1432,25 @@ const DitherAlgorithms = (() => {
       {value:'8',label:'Charcoal'},
       {value:'9',label:'Fan'}
     ],default:'default'},
+    // — CUSTOM BRUSH mode —
+    // When enabled, the algorithm dispatches different brushes per
+    // tonal zone (shadow/mid/highlight) + an edge-override brush,
+    // based on local luminance and Sobel edge magnitude at each
+    // stroke position. Each zone picks its own brush mask (built-in
+    // from PaintEngine, a user-drawn stamp, or a source-image patch)
+    // with independent size-multiplier, angle-jitter, and opacity.
+    // buildPipeline() in app.js pre-resolves the brush specs into
+    // `_resolvedMask*` fields on this object before handing it off.
+    {id:'customBrushes',label:'Custom Brushes',type:'customBrushes',default: {
+      enabled: false,
+      shadowHi: 85, midHi: 170,
+      edgeEnabled: true, edgeThreshold: 80,
+      ditherBand: 30,
+      shadow: { source:'builtin', builtin:'1', brushId:'', sizeMul:1.4, angleJitter:0.3, opacity:1.0 },
+      mid:    { source:'builtin', builtin:'7', brushId:'', sizeMul:1.0, angleJitter:0.5, opacity:0.95 },
+      high:   { source:'builtin', builtin:'5', brushId:'', sizeMul:0.7, angleJitter:0.6, opacity:0.85 },
+      edge:   { source:'builtin', builtin:'6', brushId:'', sizeMul:0.9, angleJitter:0.1, opacity:1.0 }
+    }},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     // Sync drain: runs the generator to completion with no yields. Zero
@@ -1515,6 +1534,35 @@ const DitherAlgorithms = (() => {
         if (b) { bMask = b.mask; bSize = b.size; }
       }
     }
+
+    // — CUSTOM BRUSH dispatch config —
+    // Per-stroke brush selection: look up luminance + Sobel edge at each
+    // stroke origin, route to one of four brush slots (shadow/mid/high/
+    // edge-override). Each slot carries its own mask + size + sizeMul +
+    // opacity + angleJitter so tonal regions paint with different
+    // character. app.js resolves the brush specs into `_resolvedMask*`
+    // fields before calling; if resolution failed (brush missing), the
+    // slot falls back to the default bMask/bSize so the stroke still
+    // paints instead of vanishing.
+    const cb = p.customBrushes || null;
+    const cbEnabled = !!(cb && cb.enabled);
+    const cbShadowHi  = (cb && cb.shadowHi  != null) ? cb.shadowHi  : 85;
+    const cbMidHi     = (cb && cb.midHi     != null) ? cb.midHi     : 170;
+    const cbEdgeEn    = !!(cb && cb.edgeEnabled);
+    const cbEdgeThr   = (cb && cb.edgeThreshold != null) ? cb.edgeThreshold : 80;
+    const cbDither    = (cb && cb.ditherBand != null) ? cb.ditherBand : 30;
+    function _slotMask(name) {
+      const r = cb && cb['_resolvedMask' + name];
+      return r && r.mask ? { m: r.mask, s: r.size } : { m: bMask, s: bSize };
+    }
+    const cbShadowMI = cbEnabled ? _slotMask('Shadow') : { m: bMask, s: bSize };
+    const cbMidMI    = cbEnabled ? _slotMask('Mid')    : { m: bMask, s: bSize };
+    const cbHighMI   = cbEnabled ? _slotMask('High')   : { m: bMask, s: bSize };
+    const cbEdgeMI   = cbEnabled ? _slotMask('Edge')   : { m: bMask, s: bSize };
+    const cbShadow = cb && cb.shadow;
+    const cbMid    = cb && cb.mid;
+    const cbHigh   = cb && cb.high;
+    const cbEdge   = cb && cb.edge;
 
     // Legacy blend mode keeps the old alpha-blend path (documented as a
     // non-default fallback for users who want the smooth feel).
@@ -1624,7 +1672,42 @@ const DitherAlgorithms = (() => {
           if (sh(x, y, 2) > 0.3 + target * Math.abs(lsBias) * 0.7) continue;
         }
 
-        const ang = eAng + Math.PI/2 + (sh(x, y, 3) - 0.5) * angleJitter + layerAng;
+        // — CUSTOM BRUSH: per-stroke slot pick —
+        // Edge override wins first (so sharp edges get their own brush even
+        // in dark regions). Then boundary-dither the luminance to avoid
+        // visible zone seams — a dithered ldith within cbDither px of a
+        // zone boundary picks either side probabilistically, blending.
+        let currMask = bMask, currSize = bSize;
+        let slotSizeMul = 1, slotOpacity = 1, slotAngJit = 0;
+        if (cbEnabled) {
+          const lumByte = Math.round(lum * 255);
+          if (cbEdgeEn && eMag >= cbEdgeThr) {
+            currMask = cbEdgeMI.m; currSize = cbEdgeMI.s;
+            if (cbEdge) {
+              slotSizeMul = cbEdge.sizeMul || 1;
+              slotOpacity = (cbEdge.opacity != null) ? cbEdge.opacity : 1;
+              slotAngJit  = cbEdge.angleJitter || 0;
+            }
+          } else {
+            const hv = sh(x, y, 999);
+            const ldith = lumByte + (cbDither > 0 ? (hv - 0.5) * cbDither * 2 : 0);
+            let spec;
+            if (ldith < cbShadowHi) {
+              currMask = cbShadowMI.m; currSize = cbShadowMI.s; spec = cbShadow;
+            } else if (ldith < cbMidHi) {
+              currMask = cbMidMI.m;    currSize = cbMidMI.s;    spec = cbMid;
+            } else {
+              currMask = cbHighMI.m;   currSize = cbHighMI.s;   spec = cbHigh;
+            }
+            if (spec) {
+              slotSizeMul = spec.sizeMul || 1;
+              slotOpacity = (spec.opacity != null) ? spec.opacity : 1;
+              slotAngJit  = spec.angleJitter || 0;
+            }
+          }
+        }
+
+        const ang = eAng + Math.PI/2 + (sh(x, y, 3) - 0.5) * (angleJitter + slotAngJit) + layerAng;
         const dx = Math.cos(ang), dy = Math.sin(ang);
 
         // Detail-aware knife size: in smooth regions, make strokes bigger
@@ -1636,7 +1719,7 @@ const DitherAlgorithms = (() => {
         }
 
         const sizeMul = 1 + (sizeByLight > 0 ? lum : (1 - lum)) * Math.abs(sizeByLight) * 1.8;
-        const knifeW = Math.max(1.5, p.size * sizeMul * detailSizeMul);
+        const knifeW = Math.max(1.5, p.size * sizeMul * detailSizeMul * slotSizeMul);
 
         const lenBase = p.smear * (0.5 + sh(x, y, 4) * 0.5) * detailSizeMul;
         const realSmearLen = lenBase * (1 + edgeN * lengthByEdge * 2.5);
@@ -1661,7 +1744,7 @@ const DitherAlgorithms = (() => {
         const originX = x, originY = y;
 
         // Brush-stamp inner loop
-        if (bMask && bSize > 0) {
+        if (currMask && currSize > 0) {
           // HARD CAP on stampSz — stamp footprint is stampSz^2 per t-step, so
           // letting detail-aware sizing push knifeW up to ~80 means 40x40=1600
           // inner ops per stamp × ~150 smear steps = 240k per stroke. With
@@ -1670,7 +1753,7 @@ const DitherAlgorithms = (() => {
           // quadratic explosion that was freezing the page.
           const stampSz = Math.min(10, Math.max(1, knifeW * 0.5));
           const invStamp = 1 / (2 * stampSz);
-          const halfMask = (bSize - 1) / 2;
+          const halfMask = (currSize - 1) / 2;
           for (let t = 0; t < smearLen; t++) {
             const fx = Math.round(x + dx*t), fy = Math.round(y + dy*t);
             if (fx < 0 || fx >= w || fy < 0 || fy >= h) break;
@@ -1699,12 +1782,12 @@ const DitherAlgorithms = (() => {
                 if (wx2 < 0 || wx2 >= w) continue;
                 const lxr =  bx * dx + by * dy;
                 const lyr = -bx * dy + by * dx;
-                const mx = Math.round(halfMask + lxr * invStamp * bSize);
-                const my = Math.round(halfMask + lyr * invStamp * bSize);
-                if (mx < 0 || mx >= bSize || my < 0 || my >= bSize) continue;
-                const maskV = bMask[my * bSize + mx];
+                const mx = Math.round(halfMask + lxr * invStamp * currSize);
+                const my = Math.round(halfMask + lyr * invStamp * currSize);
+                if (mx < 0 || mx >= currSize || my < 0 || my >= currSize) continue;
+                const maskV = currMask[my * currSize + mx];
                 if (maskV < 0.01) continue;
-                const prob = Math.min(1, maskV * decay * pressure * coverageDensity);
+                const prob = Math.min(1, maskV * decay * pressure * coverageDensity * slotOpacity);
                 if (sh(wx2, wy2, 10 + ((t|0) & 3)) > prob) continue;
                 const jx = sampleJitter > 0 ? (sh(wx2, wy2, 20) - 0.5) * sampleJitter * 2 : 0;
                 const jy = sampleJitter > 0 ? (sh(wx2, wy2, 21) - 0.5) * sampleJitter * 2 : 0;
@@ -1738,7 +1821,7 @@ const DitherAlgorithms = (() => {
               const wy2 = Math.round(fy + dx*ww);
               if (wx2 < 0 || wx2 >= w || wy2 < 0 || wy2 >= h) continue;
               const edgeFalloff = 1 - Math.abs(ww) / Math.max(1, halfKnife);
-              const prob = Math.min(1, edgeFalloff * decay * pressure * coverageDensity);
+              const prob = Math.min(1, edgeFalloff * decay * pressure * coverageDensity * slotOpacity);
               if (sh(wx2, wy2, 10 + ((t|0) & 3)) > prob) continue;
               const jx = sampleJitter > 0 ? (sh(wx2, wy2, 20) - 0.5) * sampleJitter * 2 : 0;
               const jy = sampleJitter > 0 ? (sh(wx2, wy2, 21) - 0.5) * sampleJitter * 2 : 0;
@@ -5155,6 +5238,19 @@ const DitherAlgorithms = (() => {
       {value:'8',label:'Charcoal'},
       {value:'9',label:'Fan'}
     ],default:'default'},
+    // — CUSTOM BRUSH mode (same as palette-knife) —
+    // Dispatches per-dab brush choice by local luminance + edge magnitude.
+    // See palette-knife's customBrushes comment for the full model.
+    {id:'customBrushes',label:'Custom Brushes',type:'customBrushes',default: {
+      enabled: false,
+      shadowHi: 85, midHi: 170,
+      edgeEnabled: true, edgeThreshold: 80,
+      ditherBand: 30,
+      shadow: { source:'builtin', builtin:'1', brushId:'', sizeMul:1.4, angleJitter:0.2, opacity:1.0 },
+      mid:    { source:'builtin', builtin:'0', brushId:'', sizeMul:1.0, angleJitter:0.5, opacity:0.9 },
+      high:   { source:'builtin', builtin:'5', brushId:'', sizeMul:0.6, angleJitter:0.8, opacity:0.8 },
+      edge:   { source:'builtin', builtin:'6', brushId:'', sizeMul:1.1, angleJitter:0.1, opacity:1.0 }
+    }},
     {id:'bgTone',label:'Background Tone',min:0,max:255,step:1,default:255},
     {id:'softness',label:'Dab Softness',min:0,max:1,step:.05,default:.4},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
@@ -5285,6 +5381,30 @@ const DitherAlgorithms = (() => {
       }
     }
 
+    // — CUSTOM BRUSH dispatch config (mirrors palette-knife) —
+    // Per-dab brush selection by local lum + edge. Each slot resolves
+    // to a mask + size + sizeMul + opacity + angleJitter. app.js
+    // attaches `_resolvedMask*` fields before calling.
+    const cb = p.customBrushes || null;
+    const cbEnabled = !!(cb && cb.enabled);
+    const cbShadowHi  = (cb && cb.shadowHi  != null) ? cb.shadowHi  : 85;
+    const cbMidHi     = (cb && cb.midHi     != null) ? cb.midHi     : 170;
+    const cbEdgeEn    = !!(cb && cb.edgeEnabled);
+    const cbEdgeThr   = (cb && cb.edgeThreshold != null) ? cb.edgeThreshold : 80;
+    const cbDither    = (cb && cb.ditherBand != null) ? cb.ditherBand : 30;
+    function _slotMaskI(name) {
+      const r = cb && cb['_resolvedMask' + name];
+      return r && r.mask ? { m: r.mask, s: r.size } : { m: bMask, s: bSize };
+    }
+    const cbShadowMI = cbEnabled ? _slotMaskI('Shadow') : { m: bMask, s: bSize };
+    const cbMidMI    = cbEnabled ? _slotMaskI('Mid')    : { m: bMask, s: bSize };
+    const cbHighMI   = cbEnabled ? _slotMaskI('High')   : { m: bMask, s: bSize };
+    const cbEdgeMI   = cbEnabled ? _slotMaskI('Edge')   : { m: bMask, s: bSize };
+    const cbShadow = cb && cb.shadow;
+    const cbMid    = cb && cb.mid;
+    const cbHigh   = cb && cb.high;
+    const cbEdge   = cb && cb.edge;
+
     // Legacy blend path kept for the 'blend' dab style.
     if (dabStyle === 'blend') {
       return _impressionismBlend(px, w, h, p, { bMask, bSize });
@@ -5360,9 +5480,43 @@ const DitherAlgorithms = (() => {
       // Base stroke direction (perpendicular to gradient) — precomputed
       const cIdx = Math.min(h-2, Math.max(1, y)) * w + Math.min(w-2, Math.max(1, x));
       const eMag = edgeMag[cIdx], eAng = edgeAng[cIdx];
+
+      // — CUSTOM BRUSH: per-dab slot pick —
+      // Edge priority first (sharp features get their own dab shape).
+      // Then boundary-dither luminance for smooth zone transitions.
+      let currMask = bMask, currSize = bSize;
+      let slotSizeMul = 1, slotOpacity = 1, slotAngJit = 0;
+      if (cbEnabled) {
+        if (cbEdgeEn && eMag >= cbEdgeThr) {
+          currMask = cbEdgeMI.m; currSize = cbEdgeMI.s;
+          if (cbEdge) {
+            slotSizeMul = cbEdge.sizeMul || 1;
+            slotOpacity = (cbEdge.opacity != null) ? cbEdge.opacity : 1;
+            slotAngJit  = cbEdge.angleJitter || 0;
+          }
+        } else {
+          const lumByte = srcVal;
+          const hv = sh(i, 0, 998);
+          const ldith = lumByte + (cbDither > 0 ? (hv - 0.5) * cbDither * 2 : 0);
+          let spec;
+          if (ldith < cbShadowHi) {
+            currMask = cbShadowMI.m; currSize = cbShadowMI.s; spec = cbShadow;
+          } else if (ldith < cbMidHi) {
+            currMask = cbMidMI.m;    currSize = cbMidMI.s;    spec = cbMid;
+          } else {
+            currMask = cbHighMI.m;   currSize = cbHighMI.s;   spec = cbHigh;
+          }
+          if (spec) {
+            slotSizeMul = spec.sizeMul || 1;
+            slotOpacity = (spec.opacity != null) ? spec.opacity : 1;
+            slotAngJit  = spec.angleJitter || 0;
+          }
+        }
+      }
+
       let dirAng = eMag > 5 ? eAng + Math.PI / 2 : sh(i, 0, 106) * Math.PI * 2;
       dirAng = dirAng * p.flowStrength + (sh(i, 0, 107) * Math.PI * 2) * (1 - p.flowStrength);
-      if (angleJitter > 0) dirAng += (sh(i, 0, 108) - 0.5) * angleJitter * Math.PI;
+      if (angleJitter + slotAngJit > 0) dirAng += (sh(i, 0, 108) - 0.5) * (angleJitter + slotAngJit) * Math.PI;
 
       // Illusion modulation (unchanged)
       let ox = 0, oy = 0;
@@ -5384,11 +5538,12 @@ const DitherAlgorithms = (() => {
         detailSizeMul = 1 + smoothFactor * sizeByDetail * 3.0; // up to 4x in skies
       }
 
-      // Dab size + length modulation
+      // Dab size + length modulation (slotSizeMul lets each tonal zone
+      // paint with a different dab scale — big shadows, tiny highlights)
       const lenMul = 1 + (1 - srcVal/255) * p.lumModulation * 0.4;
-      let len = p.dabLen * lenMul * detailSizeMul;
+      let len = p.dabLen * lenMul * detailSizeMul * slotSizeMul;
       if (lengthJitter > 0) len *= (1 + (sh(i, 0, 109) - 0.5) * lengthJitter * 1.5);
-      let width = p.dabWidth * detailSizeMul;
+      let width = p.dabWidth * detailSizeMul * slotSizeMul;
       if (sizeJitter > 0) width *= (1 + (sh(i, 0, 110) - 0.5) * sizeJitter * 1.5);
       width = Math.max(0.5, width);
       len   = Math.max(1, len);
@@ -5425,7 +5580,9 @@ const DitherAlgorithms = (() => {
 
       // Main rasterize loop — use `stamp()` helper for both brush-mask and
       // built-in ellipse paths. Unified so wet-paint effects apply uniformly.
-      const useMask = (bMask && bSize > 0);
+      // (currMask/currSize may differ from bMask/bSize when custom-brush
+      // mode is active; per-dab they're picked by tonal zone.)
+      const useMask = (currMask && currSize > 0);
       const halfLenReal = len / 2;
       for (let ty = -bboxR; ty <= bboxR; ty++) for (let tx = -bboxR; tx <= bboxR; tx++) {
         const lx = tx * cosA + ty * sinA;    // along stroke
@@ -5441,11 +5598,11 @@ const DitherAlgorithms = (() => {
           if (dn < -1 || dn > 1 + streakLen/len || Math.abs(dw) > 1) continue;
           // Map dn∈[-1,1] to mask x; dn>1 falls into streak tail
           const inDab = (dn >= -1 && dn <= 1);
-          const mx = inDab ? Math.round((dn + 1) * 0.5 * (bSize - 1))
-                           : (bSize - 1);
-          const my = Math.round((dw + 1) * 0.5 * (bSize - 1));
-          if (mx < 0 || mx >= bSize || my < 0 || my >= bSize) continue;
-          maskV = bMask[my * bSize + mx];
+          const mx = inDab ? Math.round((dn + 1) * 0.5 * (currSize - 1))
+                           : (currSize - 1);
+          const my = Math.round((dw + 1) * 0.5 * (currSize - 1));
+          if (mx < 0 || mx >= currSize || my < 0 || my >= currSize) continue;
+          maskV = currMask[my * currSize + mx];
           if (!inDab) {
             // Streak falloff — exponentially decaying tail beyond dab
             const streakT = (dn - 1) / Math.max(1e-6, streakLen / len);
@@ -5482,8 +5639,8 @@ const DitherAlgorithms = (() => {
           if (sh(pxx, pyy, 30) < Math.min(1, e2mag / 120) * edgeBreak) continue;
         }
 
-        // Dithered coverage threshold
-        const prob = Math.min(1, maskV * opacMul * coverageDensity);
+        // Dithered coverage threshold (slotOpacity from custom-brush slot)
+        const prob = Math.min(1, maskV * opacMul * coverageDensity * slotOpacity);
         if (sh(pxx, pyy, 31 + (i & 7)) > prob) continue;
 
         // — Sample origin: drift from dab center towards pixel, plus impurities
