@@ -78,25 +78,36 @@ const DitherAlgorithms = (() => {
     return { mag, ang };
   }
 
-  // Painterly underpainting base. Replaces the older blocky posterized
-  // mosaic with a two-pass "wash + loose strokes" base:
-  //   1. Tonal wash  — downsample the source, bilinear-upsample it back.
-  //      Yields smooth soft gradients that echo the image's broad light/
-  //      shadow structure, no visible block edges.
-  //   2. Loose strokes — scatter oriented elongated elliptical dabs across
-  //      the canvas, each sampling source color at its origin. Strokes
-  //      follow the local edge tangent (perpendicular to the gradient)
-  //      with some angle jitter, so they read as brushwork that FOLLOWS
-  //      the image's forms instead of arbitrary random marks.
+  // Painterly underpainting base. Two-pass "wash + loose strokes" that
+  // reads as paint laid down with a broad wet brush. Both passes use
+  // HASH-THRESHOLD DITHER instead of smooth interpolation/alpha-blending,
+  // so the underpaint matches the rest of the renderer's crisp pixel-
+  // stamped aesthetic (visible speckle / noise texture) rather than
+  // being the one smooth layer in an otherwise dithered image.
+  //
+  //   1. Tonal wash — downsample the source, then write each output pixel
+  //      as a hash-thresholded SAMPLE from the 2x2 base-grid neighborhood
+  //      (probabilistic bilinear), not a smooth weighted average. Result:
+  //      stippled gradients that echo image tone but show pixel texture.
+  //   2. Loose strokes — scatter oriented elongated elliptical dabs whose
+  //      coverage is a hash-thresholded probability, not an alpha blend.
+  //      Strokes follow the local edge tangent (perpendicular to the
+  //      gradient) with jitter so they flow AROUND shapes, not across.
   //
   // Writes into `o` (Uint8ClampedArray w*h). `edgeAng` (Float32Array from
   // sobelField) must be precomputed so strokes can orient along it. `sh`
   // is the caller's spatial-hash function for deterministic scatter.
   // `block` is the caller's underpaintBlock (8..40) — controls both wash
-  // smoothness and stroke size.
+  // block size and stroke size.
   function painterlyUnderpaint(o, px, w, h, block, sh, edgeAng) {
-    // ── Pass 1: smooth tonal wash (downsample → bilinear upsample) ──
-    // baseScale controls wash softness. Larger = softer, more abstract.
+    // ── Pass 1: tonal wash with NOISE DITHER ──
+    // Downsample the source into a coarse grid of block-averages, then
+    // bilinear-upsample back — but add strong hash noise before writing.
+    // Pure bilinear would give a smooth gradient (the OLD behavior the
+    // user flagged as "not dithered"). The noise here is big enough
+    // (±NOISE_AMP) to be clearly visible as speckled texture, which
+    // matches the main renderer's hash-stamped aesthetic so the
+    // underpaint no longer reads as the one smooth layer.
     const baseScale = Math.max(4, Math.round(block * 0.9));
     const bW = Math.max(2, Math.ceil(w / baseScale));
     const bH = Math.max(2, Math.ceil(h / baseScale));
@@ -113,9 +124,12 @@ const DitherAlgorithms = (() => {
         base[by * bW + bx] = cnt ? Math.round(sum / cnt) : 0;
       }
     }
-    // Bilinear upsample into `o`. Divisor protected against w/h = 1.
     const wDenom = (w - 1) || 1, hDenom = (h - 1) || 1;
     const bWm1 = bW - 1, bHm1 = bH - 1;
+    // Noise amplitude: ±36/255 gives readable speckle without destroying
+    // the underlying gradient. Scales the wash's tonal range by about
+    // 28% so a smooth mid-gray neighborhood looks stippled, not flat.
+    const NOISE_AMP = 36;
     for (let y = 0; y < h; y++) {
       const fy = (y * bHm1) / hDenom;
       const iy0 = Math.floor(fy), iy1 = Math.min(bHm1, iy0 + 1);
@@ -129,13 +143,18 @@ const DitherAlgorithms = (() => {
         const v01 = base[row1 + ix0], v11 = base[row1 + ix1];
         const v0 = v00 + (v10 - v00) * tx;
         const v1 = v01 + (v11 - v01) * tx;
-        o[y * w + x] = Math.round(v0 + (v1 - v0) * ty);
+        const smooth = v0 + (v1 - v0) * ty;
+        const noise = (sh(x, y, 605) - 0.5) * NOISE_AMP * 2;
+        const val = smooth + noise;
+        o[y * w + x] = val < 0 ? 0 : (val > 255 ? 255 : Math.round(val));
       }
     }
 
-    // ── Pass 2: scatter loose oriented strokes sampling source color ──
-    // Stroke count scales so coverage density is roughly constant across
-    // image sizes — ~1 stroke per (strokeL × strokeW × 0.45) footprint.
+    // ── Pass 2: dithered oriented strokes ──
+    // Elliptical stroke footprint, but instead of alpha-blending the source
+    // color by a soft weight we threshold the weight against a spatial
+    // hash → hard pixel-sample at probability weight, keep underpaint
+    // otherwise. Matches the main renderer's dithered stamp behavior.
     const strokeW = Math.max(5, Math.round(block * 1.0));
     const strokeL = Math.max(14, Math.round(block * 2.6));
     const totalStrokes = Math.max(30, Math.round((w * h) / (strokeW * strokeL * 0.45)));
@@ -144,8 +163,6 @@ const DitherAlgorithms = (() => {
       const cy = Math.floor(sh(i, 0, 701) * h);
       const sampleIdx = cy * w + cx;
       const sampleVal = px[sampleIdx];
-      // Orient along edge tangent (perpendicular to gradient) with jitter
-      // so strokes flow around shapes rather than cutting across them.
       const eIdx = Math.min(h - 2, Math.max(1, cy)) * w + Math.min(w - 2, Math.max(1, cx));
       const ang = edgeAng[eIdx] + Math.PI * 0.5 + (sh(i, 0, 702) - 0.5) * 0.8;
       const ca = Math.cos(ang), sa = Math.sin(ang);
@@ -160,15 +177,17 @@ const DitherAlgorithms = (() => {
       for (let yy = boxMinY; yy <= boxMaxY; yy++) {
         for (let xx = boxMinX; xx <= boxMaxX; xx++) {
           const dx = xx - cx, dy = yy - cy;
-          // Rotate into stroke-local axis
           const t = dx * ca + dy * sa;
           const u = -dx * sa + dy * ca;
           const r2 = (t * t) / rLen2 + (u * u) / rWid2;
           if (r2 > 1) continue;
-          // Soft radial falloff → stroke edges blend with wash naturally
-          const weight = (1 - r2) * 0.82;
-          const oi = yy * w + xx;
-          o[oi] = Math.round(o[oi] * (1 - weight) + sampleVal * weight);
+          // Hash-threshold: probability of painting = soft falloff weight.
+          // Replaces the earlier alpha blend so the stroke reads as dense
+          // specks near the stroke core and sparse specks at the edges —
+          // same dithered texture as the main stamps.
+          const weight = (1 - r2);
+          if (sh(xx, yy, 705) > weight) continue;
+          o[yy * w + xx] = sampleVal;
         }
       }
     }
@@ -1848,9 +1867,14 @@ const DitherAlgorithms = (() => {
         const sizeMul = 1 + (sizeByLight > 0 ? lum : (1 - lum)) * Math.abs(sizeByLight) * 1.8;
         // Canvas-scale the raw knife width/smear so brush footprint is a
         // consistent fraction of the canvas rather than a fixed pixel size.
+        // slotSizeMul applies to BOTH width and length so a big shadow brush
+        // paints thick AND long strokes (matching the slot preview character)
+        // and a small highlight brush paints thin AND short strokes — without
+        // this the slot's "size" only changed thickness, which barely reads
+        // visually because source-pixel color dominates over stamp shape.
         const knifeW = Math.max(1.5, p.size * canvasScale * sizeMul * detailSizeMul * slotSizeMul);
 
-        const lenBase = p.smear * canvasScale * (0.5 + sh(x, y, 4) * 0.5) * detailSizeMul;
+        const lenBase = p.smear * canvasScale * (0.5 + sh(x, y, 4) * 0.5) * detailSizeMul * slotSizeMul;
         const realSmearLen = lenBase * (1 + edgeN * lengthByEdge * 2.5);
         // WET STREAK extends the smear with a decaying tail — long painterly
         // drag from a loaded brush.
@@ -1922,7 +1946,15 @@ const DitherAlgorithms = (() => {
                 if (mx < 0 || mx >= currSize || my < 0 || my >= currSize) continue;
                 const maskV = currMask[my * currSize + mx];
                 if (maskV < 0.01) continue;
-                const prob = Math.min(1, maskV * decay * pressure * coverageDensity * slotOpacity);
+                // Keep slotOpacity OUT of `prob` — if we multiplied it into
+                // prob, low-opacity slots would just paint sparser (still
+                // hard-overwriting where they DO paint), which reads as
+                // "mottled source image" not "translucent brush." Instead
+                // apply slotOpacity as an alpha-blend against the existing
+                // canvas (underpaint / earlier stroke) after we decide to
+                // stamp — that way a 0.3-opacity highlight brush actually
+                // LOOKS 30% transparent over the underpaint.
+                const prob = Math.min(1, maskV * decay * pressure * coverageDensity);
                 if (sh(wx2, wy2, 10 + ((t|0) & 3)) > prob) continue;
                 const jx = sampleJitter > 0 ? (sh(wx2, wy2, 20) - 0.5) * sampleJitter * 2 : 0;
                 const jy = sampleJitter > 0 ? (sh(wx2, wy2, 21) - 0.5) * sampleJitter * 2 : 0;
@@ -1930,7 +1962,13 @@ const DitherAlgorithms = (() => {
                 const vy = varietyRadius > 0 ? (sh(wx2, wy2, 51 + (t & 3)) - 0.5) * varietyRadius * 2 : 0;
                 const sXi = Math.max(0, Math.min(w-1, Math.round(sOrigX + jx + vx)));
                 const sYi = Math.max(0, Math.min(h-1, Math.round(sOrigY + jy + vy)));
-                o[wy2 * w + wx2] = clamp(px[sYi * w + sXi]);
+                const src = clamp(px[sYi * w + sXi]);
+                const oi = wy2 * w + wx2;
+                if (slotOpacity >= 0.999) {
+                  o[oi] = src;
+                } else {
+                  o[oi] = Math.round(src * slotOpacity + o[oi] * (1 - slotOpacity));
+                }
               }
             }
           }
@@ -5793,8 +5831,11 @@ const DitherAlgorithms = (() => {
           if (sh(pxx, pyy, 30) < Math.min(1, e2mag / 120) * edgeBreak) continue;
         }
 
-        // Dithered coverage threshold (slotOpacity from custom-brush slot)
-        const prob = Math.min(1, maskV * opacMul * coverageDensity * slotOpacity);
+        // Dithered coverage threshold. slotOpacity is NOT mixed into prob
+        // anymore — see the post-sample alpha-blend below. Multiplying it
+        // into prob made low-opacity slots just paint "sparser source
+        // pixels," which reads as mottling rather than translucency.
+        const prob = Math.min(1, maskV * opacMul * coverageDensity);
         if (sh(pxx, pyy, 31 + (i & 7)) > prob) continue;
 
         // — Sample origin: drift from dab center towards pixel, plus impurities
@@ -5817,8 +5858,17 @@ const DitherAlgorithms = (() => {
 
         const sXi = Math.max(0, Math.min(w-1, Math.round(sOx + jx + vx)));
         const sYi = Math.max(0, Math.min(h-1, Math.round(sOy + jy + vy)));
-        // HARD write — no blending.
-        o[pyy * w + pxx] = clamp(px[sYi * w + sXi]);
+        // Apply slotOpacity as a true alpha-blend against the canvas
+        // underneath (underpaint or earlier dab) so low-opacity slots
+        // actually look translucent. slotOpacity === 1 takes the hard-
+        // overwrite fast path so default behavior is unchanged.
+        const srcV = clamp(px[sYi * w + sXi]);
+        const oi = pyy * w + pxx;
+        if (slotOpacity >= 0.999) {
+          o[oi] = srcV;
+        } else {
+          o[oi] = Math.round(srcV * slotOpacity + o[oi] * (1 - slotOpacity));
+        }
       }
     }
 
