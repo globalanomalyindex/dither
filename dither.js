@@ -1464,12 +1464,33 @@ const DitherAlgorithms = (() => {
   // layers. Checks signal.cancelled at each yield point and calls onProgress
   // with a snapshot of the in-progress canvas so the UI can paint block-by-
   // block progress instead of freezing. Same output as apply().
+  //
+  // signal.interactive === true marks this as a preview-tier render —
+  // _gen uses lighter knobs (smaller stamp cap, coarser stride, shorter
+  // smear) so slider drag feels instant. The final render (interactive=
+  // false) keeps full quality.
   async applyAsync(px, w, h, p, ctx) {
     const signal = (ctx && ctx.signal) || { cancelled: false };
     const onProgress = (ctx && ctx.onProgress) || null;
-    const gen = this._gen(px, w, h, p);
+    const preview = !!signal.interactive;
+    const gen = this._gen(px, w, h, p, preview);
     let r = gen.next();
     let lastProg = 0;
+    // In PREVIEW mode the algorithm is already sized down to finish in
+    // ~100-300ms of pure compute. Doing a setTimeout(0) yield after every
+    // stroke chunk (40 strokes) adds 4ms × ~50 chunks = ~200ms of deadweight
+    // that dwarfs the actual work. Worse, browsers clamp nested setTimeout
+    // to 4ms minimum, so the overhead compounds. Skip the yields entirely
+    // in preview — cooperative cancellation isn't worth the cost because
+    // the whole render finishes fast enough to feel instant. Final renders
+    // keep the yields so onProgress paints block-by-block.
+    if (preview) {
+      while (!r.done) {
+        if (signal.cancelled) { try { gen.return(); } catch(_){} return r.value || new Uint8ClampedArray(w*h); }
+        r = gen.next();
+      }
+      return r.value;
+    }
     while (!r.done) {
       if (signal.cancelled) { try { gen.return(); } catch(_){} return r.value || new Uint8ClampedArray(w*h); }
       const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
@@ -1482,8 +1503,9 @@ const DitherAlgorithms = (() => {
     }
     return r.value;
   },
-  *_gen(px, w, h, p) {
+  *_gen(px, w, h, p, preview) {
     const o = new Uint8ClampedArray(w*h);
+    const PREVIEW = !!preview;
 
     const strokeStyle = p.strokeStyle || 'pixel';
     const intensity     = (p.intensity     != null) ? p.intensity     : 1;
@@ -1625,7 +1647,23 @@ const DitherAlgorithms = (() => {
     const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0;
     const detail = needDetail ? detailField(px, w, h, 8) : null;
 
-    const baseSp = Math.max(2, Math.round(p.size * 0.8));
+    // Stride between strokes. PREVIEW widens stride (~1.5×) so the preview
+    // runs on roughly half as many strokes — quality drops slightly but
+    // the user can still read stroke direction + color while dragging.
+    const baseSp = PREVIEW
+      ? Math.max(3, Math.round(p.size * 0.8 * 1.5))
+      : Math.max(2, Math.round(p.size * 0.8));
+
+    // Stamp-pixel budget cap. Brush-shape mode does a (2*stampSz+1)^2 inner
+    // loop PER smear step, so this is the single biggest knob for preview
+    // speed. 10 = 441 ops/step (final quality). 4 = 81 ops/step (~5.4×
+    // faster, still enough detail to convey brush character).
+    const STAMP_CAP = PREVIEW ? 4 : 10;
+
+    // Cap smearLen for preview so long wet-streak strokes don't balloon
+    // the t-loop while dragging. Max of 8 steps is still enough to show
+    // directionality. Final render ignores this cap.
+    const SMEAR_CAP = PREVIEW ? 8 : Infinity;
 
     // Chunk cadence for cooperative yielding: `yield o` lets applyAsync
     // pause the event loop + paint progress. Yield STROKE-based (not row-
@@ -1727,6 +1765,10 @@ const DitherAlgorithms = (() => {
         // drag from a loaded brush.
         const streakExt = wetStreak > 0 ? realSmearLen * wetStreak * 1.5 : 0;
         const smearLen = realSmearLen + streakExt;
+        // Preview-tier cap: long wet-streak strokes would multiply the t-loop
+        // cost (and its inner 2D stamp). In preview mode we cap at 8 steps
+        // per stroke — enough to read direction without melting responsiveness.
+        const effSmearLen = PREVIEW ? Math.min(smearLen, SMEAR_CAP) : smearLen;
 
         const jitterMul = pressureJit > 0 ? (1 + (sh(x, y, 5) - 0.5) * pressureJit) : 1;
         const edgeBoost = pressureByEdge > 0 ? (1 + edgeN * pressureByEdge * 2) : 1;
@@ -1745,16 +1787,15 @@ const DitherAlgorithms = (() => {
 
         // Brush-stamp inner loop
         if (currMask && currSize > 0) {
-          // HARD CAP on stampSz — stamp footprint is stampSz^2 per t-step, so
-          // letting detail-aware sizing push knifeW up to ~80 means 40x40=1600
-          // inner ops per stamp × ~150 smear steps = 240k per stroke. With
-          // ~2000 strokes that's 500M ops — tens of seconds. Capping stampSz
-          // at 10 keeps the brush visually meaningful while killing the
-          // quadratic explosion that was freezing the page.
-          const stampSz = Math.min(10, Math.max(1, knifeW * 0.5));
+          // HARD CAP on stampSz — stamp footprint is (2*stampSz+1)^2 per t-
+          // step, so this is the quadratic knob. STAMP_CAP is 10 for final
+          // quality (441 ops/step) and 4 for preview (81 ops/step, ~5.4×
+          // cheaper). Without this cap, detail-aware sizing at final tier
+          // can push knifeW past 80 and freeze the page.
+          const stampSz = Math.min(STAMP_CAP, Math.max(1, knifeW * 0.5));
           const invStamp = 1 / (2 * stampSz);
           const halfMask = (currSize - 1) / 2;
-          for (let t = 0; t < smearLen; t++) {
+          for (let t = 0; t < effSmearLen; t++) {
             const fx = Math.round(x + dx*t), fy = Math.round(y + dy*t);
             if (fx < 0 || fx >= w || fy < 0 || fy >= h) break;
             // Decay: during real smear it linearly fades; in streak-tail it
@@ -1774,11 +1815,14 @@ const DitherAlgorithms = (() => {
               sOrigY -= dy * smudgeDrag * Math.min(1, dragT);
             }
 
+            // fx/fy are already integer-valued (Math.round above), so
+            // (fx + bx) and (fy + by) are integers too — skip redundant
+            // Math.round inside the hot inner loop.
             for (let by = -stampSz; by <= stampSz; by++) {
-              const wy2 = Math.round(fy + by);
+              const wy2 = fy + by;
               if (wy2 < 0 || wy2 >= h) continue;
               for (let bx = -stampSz; bx <= stampSz; bx++) {
-                const wx2 = Math.round(fx + bx);
+                const wx2 = fx + bx;
                 if (wx2 < 0 || wx2 >= w) continue;
                 const lxr =  bx * dx + by * dy;
                 const lyr = -bx * dy + by * dx;
@@ -1802,7 +1846,7 @@ const DitherAlgorithms = (() => {
         } else {
           // Built-in knife edge — a narrow perpendicular strip
           const halfKnife = Math.max(1, knifeW / 3);
-          for (let t = 0; t < smearLen; t++) {
+          for (let t = 0; t < effSmearLen; t++) {
             const fx = Math.round(x + dx*t), fy = Math.round(y + dy*t);
             if (fx < 0 || fx >= w || fy < 0 || fy >= h) break;
             const inReal = t < realSmearLen;
@@ -5263,9 +5307,23 @@ const DitherAlgorithms = (() => {
   async applyAsync(px, w, h, p, ctx) {
     const signal = (ctx && ctx.signal) || { cancelled: false };
     const onProgress = (ctx && ctx.onProgress) || null;
-    const gen = this._gen(px, w, h, p);
+    const preview = !!signal.interactive;
+    const gen = this._gen(px, w, h, p, preview);
     let r = gen.next();
     let lastProg = 0;
+    // PREVIEW mode: skip setTimeout(0) yields entirely. The preview tier is
+    // downsampled + has tighter internal caps (BBOX_CAP, fewer dabs) so it
+    // finishes in ~100-300ms of pure compute. setTimeout(0) × 150 chunks
+    // would add 600ms+ of deadweight in Chrome (4ms minimum per nested
+    // timer) — more than the work itself. See palette-knife for matching
+    // rationale.
+    if (preview) {
+      while (!r.done) {
+        if (signal.cancelled) { try { gen.return(); } catch(_){} return r.value || new Uint8ClampedArray(w*h); }
+        r = gen.next();
+      }
+      return r.value;
+    }
     while (!r.done) {
       if (signal.cancelled) { try { gen.return(); } catch(_){} return r.value || new Uint8ClampedArray(w*h); }
       const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
@@ -5278,8 +5336,9 @@ const DitherAlgorithms = (() => {
     }
     return r.value;
   },
-  *_gen(px, w, h, p) {
+  *_gen(px, w, h, p, preview) {
     const o = new Uint8ClampedArray(w*h);
+    const PREVIEW = !!preview;
     const bgTone = (p.bgTone != null) ? p.bgTone : 255;
     const canvasStart = p.canvasStart || 'underpaint';
     const dabStyle = p.dabStyle || 'pixel';
@@ -5428,6 +5487,14 @@ const DitherAlgorithms = (() => {
       totalDabs = Math.round(totalDabs * (1 - detailAware * 0.15));
     }
 
+    // Preview-tier: roughly halve dab count so drag-interactive re-renders
+    // stay snappy. Quality gap vs final is small — the image still reads
+    // painterly, user can evaluate direction + color.
+    if (PREVIEW) totalDabs = Math.round(totalDabs * 0.55);
+    // Preview bbox radius cap — bbox footprint is bboxR² per dab, so this
+    // is the bigger lever than dab count for brush-shape mode.
+    const BBOX_CAP = PREVIEW ? 14 : 25;
+
     // Chunk cadence for cooperative yielding — yield every N dabs so
     // applyAsync can paint progress + respond to cancellation. Sync drain
     // ignores these yields, so zero perf cost in the sync path.
@@ -5574,9 +5641,8 @@ const DitherAlgorithms = (() => {
       // HARD CAP on bbox radius — the dab rasterize loop iterates bboxR²
       // pixels PER DAB. Detail-aware sizing can push halfLen past 100,
       // which explodes to 40k+ iterations per dab × 4000 dabs = freeze.
-      // Capping at 25 keeps dabs visually large enough without the
-      // quadratic blowup; users who want huge dabs can raise dabLen.
-      const bboxR = Math.min(25, Math.ceil(Math.max(halfLen, halfW)) + 1);
+      // BBOX_CAP is 25 for final, 14 for preview (~3× cheaper/dab).
+      const bboxR = Math.min(BBOX_CAP, Math.ceil(Math.max(halfLen, halfW)) + 1);
 
       // Main rasterize loop — use `stamp()` helper for both brush-mask and
       // built-in ellipse paths. Unified so wet-paint effects apply uniformly.

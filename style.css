@@ -875,6 +875,10 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
    up extra work while the engine is busy. Appears instantly for any render
    but only fades in a visible plate + label after 90ms so fast renders
    stay silent. */
+/* Processing overlay — only ever rendered by JS AFTER a 450ms delay-threshold,
+   so no visibility gating needed in CSS. When it appears, it's already
+   earned its screen time (real long-running work). A short entry fade
+   keeps it from popping in harshly. */
 .processing-overlay {
   position: absolute;
   inset: 0;
@@ -883,15 +887,17 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
   align-items: center;
   justify-content: center;
   gap: 10px;
-  background: rgba(8,8,12,0);
+  background: rgba(8,8,12,0.55);
+  backdrop-filter: blur(2px) saturate(140%);
+  -webkit-backdrop-filter: blur(2px) saturate(140%);
   z-index: 12;
   pointer-events: auto;
   cursor: progress;
-  animation: processing-fade 220ms ease-out 90ms forwards;
+  animation: processing-enter 140ms ease-out;
 }
 
-@keyframes processing-fade {
-  to { background: rgba(8,8,12,0.55); backdrop-filter: blur(2px) saturate(140%); -webkit-backdrop-filter: blur(2px) saturate(140%); }
+@keyframes processing-enter {
+  from { background: rgba(8,8,12,0); backdrop-filter: blur(0px) saturate(100%); -webkit-backdrop-filter: blur(0px) saturate(100%); }
 }
 
 .processing-spinner {
@@ -902,13 +908,8 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
   border-right-color: var(--gold);
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
-  opacity: 0;
-  animation-delay: 90ms;
-  animation-fill-mode: forwards;
   box-shadow: 0 0 22px var(--fun-glow);
 }
-.processing-overlay .processing-spinner { animation: spin 0.7s linear infinite, processing-show 220ms ease-out 90ms forwards; }
-@keyframes processing-show { to { opacity: 1; } }
 
 .processing-label {
   font-size: 11px;
@@ -916,8 +917,6 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
   letter-spacing: 0.22em;
   text-transform: uppercase;
   color: var(--text-dim);
-  opacity: 0;
-  animation: processing-show 220ms ease-out 90ms forwards;
   text-shadow: 0 1px 2px rgba(0,0,0,0.5);
 }
 
@@ -1514,9 +1513,26 @@ body.processing #btn-apply-algorithm {
   margin-top: 10px;
   transition: opacity 150ms;
 }
+/* When the master toggle is off we still want the user to SEE which brushes
+   are mapped to each tonal zone (shadow/mid/high/edge) — the panel works
+   like an at-a-glance assignment map even when inactive. Disable interaction
+   on the controls but keep thumbnails + labels at full opacity. The slot
+   bodies get a subtle dim so the off-state still reads visually distinct. */
 .cb-body.cb-disabled {
-  opacity: 0.38;
   pointer-events: none;
+}
+.cb-body.cb-disabled .cb-slot {
+  opacity: 0.82;
+  filter: saturate(0.75);
+}
+.cb-body.cb-disabled .cb-slot-thumb,
+.cb-body.cb-disabled .cb-slot-thumb img {
+  opacity: 1;
+  filter: none;
+}
+.cb-body.cb-disabled .cb-thresholds,
+.cb-body.cb-disabled .cb-slot-minis {
+  opacity: 0.55;
 }
 .cb-thresholds {
   display: flex;

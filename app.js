@@ -721,30 +721,61 @@
   }
 
   // Processing overlay: blocks pointer events on the canvas and "heavy"
-  // UI buttons while rendering is in flight. Hidden by default for fast
-  // renders — CSS delays the visible plate by 180ms so snappy operations
-  // stay silent; slow ones get a clear "Processing…" indicator so users
-  // don't spam-click or force-reload in frustration.
+  // UI buttons while rendering is in flight.
+  //
+  // Visibility policy: the overlay is only CREATED after a delay threshold
+  // (PROCESSING_OVERLAY_DELAY_MS). Renders that finish before the threshold
+  // never instantiate the overlay at all — no DOM churn, no cursor flash,
+  // no animation-for-the-sake-of-it. Only genuinely long-running operations
+  // produce a visible spinner, and it stays on screen only for the actual
+  // working portion of the render.
+  //
+  // body.processing is applied instantly (for disabling bake/apply buttons
+  // during any render) and cleared the moment work completes.
+  const PROCESSING_OVERLAY_DELAY_MS = 450;
+  let _processingOverlayTimer = null;
+  let _processingOverlayLabel = null;
   function showProcessing(show, label) {
+    // Always clear any pending delayed-show timer when state changes.
+    if (_processingOverlayTimer) {
+      clearTimeout(_processingOverlayTimer);
+      _processingOverlayTimer = null;
+    }
+
     let ov = canvasWrapper.querySelector('.processing-overlay');
     if (show) {
       document.body.classList.add('processing');
-      if (!ov) {
+      _processingOverlayLabel = label || null;
+      if (ov) {
+        // Overlay already up (unusual — long-running work doing sub-phases).
+        // Update its label in place.
+        if (label) {
+          const l = ov.querySelector('.processing-label');
+          if (l) l.textContent = label;
+        }
+        return;
+      }
+      // Defer actual DOM creation. If the render completes before the timer
+      // fires, showProcessing(false) cancels it and no overlay ever exists.
+      _processingOverlayTimer = setTimeout(() => {
+        _processingOverlayTimer = null;
+        // Guard: state may have flipped between timer fire and now.
+        if (!state.processing) return;
+        ov = canvasWrapper.querySelector('.processing-overlay');
+        if (ov) return;
         ov = document.createElement('div');
         ov.className = 'processing-overlay';
         ov.innerHTML =
           '<div class="processing-spinner"></div>' +
-          '<div class="processing-label">' + (label || 'Processing\u2026') + '</div>';
+          '<div class="processing-label">' + (_processingOverlayLabel || 'Processing\u2026') + '</div>';
         // Swallow clicks so spam doesn't queue up more work
         ov.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); });
         ov.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); });
         canvasWrapper.appendChild(ov);
-      } else if (label) {
-        const l = ov.querySelector('.processing-label');
-        if (l) l.textContent = label;
-      }
+      }, PROCESSING_OVERLAY_DELAY_MS);
     } else {
       document.body.classList.remove('processing');
+      _processingOverlayLabel = null;
       if (ov) ov.remove();
     }
   }
