@@ -164,34 +164,48 @@ const DitherAlgorithms = (() => {
     // otherwise. Matches the main renderer's dithered stamp behavior.
     const strokeW = Math.max(5, Math.round(block * 1.0));
     const strokeL = Math.max(14, Math.round(block * 2.6));
-    const totalStrokes = Math.max(30, Math.round((w * h) / (strokeW * strokeL * 0.45)));
+    const baseStrokes = Math.max(30, Math.round((w * h) / (strokeW * strokeL * 0.45)));
     const useMask = !!(bMask && bSize > 1);
 
-    // Detail-aware sizing. Big strokes in smooth areas (sky, walls), small
-    // strokes in busy areas (faces, foliage). detailField returns local
-    // luminance stddev — ~0 in flat regions, 40-60 in textured regions.
-    // We normalize against an estimated high-water mark from a coarse
-    // percentile so the response adapts to image character (a low-contrast
-    // photo still gets size variation, not all-big-strokes).
+    // Detail field — local luminance stddev per pixel. Used for TWO things:
+    // (a) stroke SIZE: bigger in flat areas, smaller in busy areas.
+    // (b) stroke DENSITY: fewer in flat areas, more in busy areas.
+    // Both responses inverted against the same per-image soft ceiling so
+    // the effect adapts to image character (a flat photo still sees the
+    // full range of variation instead of being all-flat).
     const df = detailField(px, w, h, 8);
-    // Sample df at a stride to estimate a soft "high detail" threshold.
     let _dmax = 1;
     const _stride = Math.max(1, ((w * h) / 2048) | 0);
     for (let i = 0; i < df.length; i += _stride) if (df[i] > _dmax) _dmax = df[i];
-    const dNorm = 1 / Math.max(8, _dmax * 0.6); // soft ceiling
+    const dNorm = 1 / Math.max(8, _dmax * 0.6);
 
-    for (let i = 0; i < totalStrokes; i++) {
+    // Over-scatter candidates, then reject by detail. Keep probability is
+    // 0.28 in dead-flat regions → 1.0 in max-detail regions, so a 2.2×
+    // candidate pool resolves to ~0.62× baseStrokes in flat areas and
+    // ~2.2× baseStrokes in detailed areas. That's the "few sweeping
+    // strokes in the sky / many tight dabs on the face" painterly read.
+    // Combined with the size multiplier below (flat → 1.55×, busy → 0.55×),
+    // total covered area stays roughly balanced with flat regions still
+    // reading as confident washes.
+    const OVERSAMPLE = 2.2;
+    const candidates = Math.round(baseStrokes * OVERSAMPLE);
+    const KEEP_MIN = 0.28, KEEP_RANGE = 0.72;
+
+    for (let i = 0; i < candidates; i++) {
       const cx = Math.floor(sh(i, 0, 700) * w);
       const cy = Math.floor(sh(i, 0, 701) * h);
       const sampleIdx = cy * w + cx;
+      // Detail at candidate center. Used for both density rejection and
+      // stroke size. Sampling once keeps the two responses in lockstep —
+      // a flat region gets both bigger strokes AND fewer of them.
+      const d01 = Math.min(1, df[sampleIdx] * dNorm);
+      const keepP = KEEP_MIN + KEEP_RANGE * d01;
+      if (sh(i, 0, 706) > keepP) continue;
       const sampleVal = px[sampleIdx];
       const eIdx = Math.min(h - 2, Math.max(1, cy)) * w + Math.min(w - 2, Math.max(1, cx));
       const ang = edgeAng[eIdx] + Math.PI * 0.5 + (sh(i, 0, 702) - 0.5) * 0.8;
       const ca = Math.cos(ang), sa = Math.sin(ang);
       // Detail-based size multiplier: smooth → 1.55×, very busy → 0.55×.
-      // Gives the classic painterly read of "broad washes in the sky,
-      // tight dabs on the face" without the user having to tune it.
-      const d01 = Math.min(1, df[sampleIdx] * dNorm);
       const sizeMul = 1.55 - d01 * 1.0;
       const rLen = strokeL * 0.5 * (0.65 + sh(i, 0, 703) * 0.75) * sizeMul;
       const rWid = strokeW * 0.5 * (0.55 + sh(i, 0, 704) * 0.55) * sizeMul;
