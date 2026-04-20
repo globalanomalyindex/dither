@@ -1593,7 +1593,8 @@ const DitherAlgorithms = (() => {
     {id:'underpaintBlock',label:'Underpaint Stroke Scale',min:4,max:40,step:1,default:14},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
-    {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.8},
+    {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.8,
+     hint:'bigger strokes in flat areas, smaller on features'},
     {id:'skipSmoothAreas',label:'Skip Smooth Areas',min:0,max:1,step:.05,default:.4},
     // formFollow: bipolar aesthetic slider.
     //   +1 → strokes track image gradients tightly (clean curves along
@@ -1860,7 +1861,11 @@ const DitherAlgorithms = (() => {
     // loop PER smear step, so this is the single biggest knob for preview
     // speed. 10 = 441 ops/step (final quality). 4 = 81 ops/step (~5.4×
     // faster, still enough detail to convey brush character).
-    const STAMP_CAP = PREVIEW ? 4 : 10;
+    // Final cap raised 10 → 18 so sizeByDetail can visibly grow strokes in
+    // smooth regions. With default knifeW ~9 and smoothFactor*3 multiplier
+    // reaching ~36, a cap of 10 (max stamp footprint 21×21) was hiding
+    // most of the user-visible range of the slider.
+    const STAMP_CAP = PREVIEW ? 4 : 18;
 
     // Cap smearLen for preview so long wet-streak strokes don't balloon
     // the t-loop while dragging. Max of 8 steps is still enough to show
@@ -5522,7 +5527,8 @@ const DitherAlgorithms = (() => {
     {id:'underpaintBlock',label:'Underpaint Stroke Scale',min:4,max:40,step:1,default:14},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
-    {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.7},
+    {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.7,
+     hint:'bigger dabs in flat areas, smaller on features'},
     {id:'skipSmoothAreas',label:'Skip Smooth Areas',min:0,max:1,step:.05,default:.5},
     // See palette-knife formFollow comment — same semantics here.
     {id:'formFollow',label:'Angular ↔ Form-Follow',min:-1,max:1,step:.05,default:0},
