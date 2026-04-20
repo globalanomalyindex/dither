@@ -3,8 +3,17 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Prevent the page itself from being cached. Per-script ?v=N query
+       strings bust caches for dither.js/app.js, but they only help if the
+       browser actually re-fetches index.html to see the new version. If
+       index.html is cached, the page keeps loading the old script URLs
+       and every code change is invisible until a hard reload. These
+       headers make the browser always revalidate the shell. -->
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=44">
+  <link rel="stylesheet" href="style.css?v=45">
 </head>
 <body>
   <div id="app">
@@ -720,10 +729,10 @@
     </div>
   </div>
 
-  <script src="dither.js?v=44"></script>
-  <script src="engine.js?v=44"></script>
-  <script src="grain.js?v=44"></script>
-  <script src="paintstroke.js?v=44"></script>
-  <script src="app.js?v=44"></script>
+  <script src="dither.js?v=45"></script>
+  <script src="engine.js?v=45"></script>
+  <script src="grain.js?v=45"></script>
+  <script src="paintstroke.js?v=45"></script>
+  <script src="app.js?v=45"></script>
 </body>
 </html>
