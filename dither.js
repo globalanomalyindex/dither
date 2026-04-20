@@ -166,6 +166,20 @@ const DitherAlgorithms = (() => {
     const strokeL = Math.max(14, Math.round(block * 2.6));
     const totalStrokes = Math.max(30, Math.round((w * h) / (strokeW * strokeL * 0.45)));
     const useMask = !!(bMask && bSize > 1);
+
+    // Detail-aware sizing. Big strokes in smooth areas (sky, walls), small
+    // strokes in busy areas (faces, foliage). detailField returns local
+    // luminance stddev — ~0 in flat regions, 40-60 in textured regions.
+    // We normalize against an estimated high-water mark from a coarse
+    // percentile so the response adapts to image character (a low-contrast
+    // photo still gets size variation, not all-big-strokes).
+    const df = detailField(px, w, h, 8);
+    // Sample df at a stride to estimate a soft "high detail" threshold.
+    let _dmax = 1;
+    const _stride = Math.max(1, ((w * h) / 2048) | 0);
+    for (let i = 0; i < df.length; i += _stride) if (df[i] > _dmax) _dmax = df[i];
+    const dNorm = 1 / Math.max(8, _dmax * 0.6); // soft ceiling
+
     for (let i = 0; i < totalStrokes; i++) {
       const cx = Math.floor(sh(i, 0, 700) * w);
       const cy = Math.floor(sh(i, 0, 701) * h);
@@ -174,21 +188,29 @@ const DitherAlgorithms = (() => {
       const eIdx = Math.min(h - 2, Math.max(1, cy)) * w + Math.min(w - 2, Math.max(1, cx));
       const ang = edgeAng[eIdx] + Math.PI * 0.5 + (sh(i, 0, 702) - 0.5) * 0.8;
       const ca = Math.cos(ang), sa = Math.sin(ang);
-      const rLen = strokeL * 0.5 * (0.65 + sh(i, 0, 703) * 0.75);
-      const rWid = strokeW * 0.5 * (0.55 + sh(i, 0, 704) * 0.55);
+      // Detail-based size multiplier: smooth → 1.55×, very busy → 0.55×.
+      // Gives the classic painterly read of "broad washes in the sky,
+      // tight dabs on the face" without the user having to tune it.
+      const d01 = Math.min(1, df[sampleIdx] * dNorm);
+      const sizeMul = 1.55 - d01 * 1.0;
+      const rLen = strokeL * 0.5 * (0.65 + sh(i, 0, 703) * 0.75) * sizeMul;
+      const rWid = strokeW * 0.5 * (0.55 + sh(i, 0, 704) * 0.55) * sizeMul;
       const rLen2 = rLen * rLen, rWid2 = rWid * rWid;
       const bMax = Math.max(rLen, rWid) + 1;
       const boxMinX = Math.max(0, Math.floor(cx - bMax));
       const boxMaxX = Math.min(w - 1, Math.ceil(cx + bMax));
       const boxMinY = Math.max(0, Math.floor(cy - bMax));
       const boxMaxY = Math.min(h - 1, Math.ceil(cy + bMax));
-      // Pre-derive inverse half-extents for mask sampling. We map the
-      // stroke's oriented coords (t,u) ∈ [-rLen..rLen] × [-rWid..rWid] onto
-      // mask coords [0..bSize). The brush mask is already square with its
-      // natural aspect baked in; here we stretch it to fit the stroke's
-      // elongated footprint (rLen > rWid for typical strokes) so bristle
-      // streaks and splatter edges run ALONG the stroke length, which is
-      // the orientation painters actually lay strokes.
+      // Mask sampling: we map (t,u) ∈ [-rLen..rLen] × [-rWid..rWid] onto the
+      // square mask [0..bSize). The brush mask provides TEXTURE (bristle
+      // gaps, splatter specks, knife striations) but it's multiplied INTO
+      // the ellipse falloff — the ellipse stays the dominant shape so we
+      // keep the dense-core / sparse-edge speckle look that made the old
+      // underpaint feel like real paint. Using the mask alone flattened
+      // strokes into solid blobs (reported as "blurry") because most masks
+      // are largely opaque in their interior. Multiplying ellipse × mask
+      // keeps the character of both: soft stroke edges AND brush-specific
+      // breaks, streaks, or specks where the mask dips below full opacity.
       const invHalfL = 1 / rLen;
       const invHalfW = 1 / rWid;
       const bSz = bSize | 0;
@@ -197,26 +219,24 @@ const DitherAlgorithms = (() => {
           const dx = xx - cx, dy = yy - cy;
           const t = dx * ca + dy * sa;
           const u = -dx * sa + dy * ca;
-          let weight;
+          const r2 = (t * t) / rLen2 + (u * u) / rWid2;
+          if (r2 > 1) continue;
+          const ellipseW = 1 - r2;
+          let weight = ellipseW;
           if (useMask) {
-            // Normalize to [-1..1], reject outside rect, then sample mask.
             const nx = t * invHalfL;
             const ny = u * invHalfW;
-            if (nx < -1 || nx > 1 || ny < -1 || ny > 1) continue;
             let mx = ((nx * 0.5 + 0.5) * bSz) | 0;
             let my = ((ny * 0.5 + 0.5) * bSz) | 0;
             if (mx < 0) mx = 0; else if (mx >= bSz) mx = bSz - 1;
             if (my < 0) my = 0; else if (my >= bSz) my = bSz - 1;
-            weight = bMask[my * bSz + mx] / 255;
+            const maskW = bMask[my * bSz + mx] / 255;
+            // Multiplicative blend. Mask acts as a modulation: where the
+            // mask is solid (~1) the ellipse weight passes through; where
+            // the mask thins (bristle gap, splatter fringe) weight drops
+            // and the hash-threshold rejects more pixels → breaks appear.
+            weight = ellipseW * maskW;
             if (weight <= 0) continue;
-          } else {
-            const r2 = (t * t) / rLen2 + (u * u) / rWid2;
-            if (r2 > 1) continue;
-            // Hash-threshold: probability of painting = soft falloff weight.
-            // Replaces the earlier alpha blend so the stroke reads as dense
-            // specks near the stroke core and sparse specks at the edges —
-            // same dithered texture as the main stamps.
-            weight = (1 - r2);
           }
           if (sh(xx, yy, 705) > weight) continue;
           o[yy * w + xx] = sampleVal;
