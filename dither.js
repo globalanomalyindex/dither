@@ -201,19 +201,30 @@ const DitherAlgorithms = (() => {
       const boxMaxX = Math.min(w - 1, Math.ceil(cx + bMax));
       const boxMinY = Math.max(0, Math.floor(cy - bMax));
       const boxMaxY = Math.min(h - 1, Math.ceil(cy + bMax));
-      // Mask sampling: we map (t,u) ∈ [-rLen..rLen] × [-rWid..rWid] onto the
-      // square mask [0..bSize). The brush mask provides TEXTURE (bristle
-      // gaps, splatter specks, knife striations) but it's multiplied INTO
-      // the ellipse falloff — the ellipse stays the dominant shape so we
-      // keep the dense-core / sparse-edge speckle look that made the old
-      // underpaint feel like real paint. Using the mask alone flattened
-      // strokes into solid blobs (reported as "blurry") because most masks
-      // are largely opaque in their interior. Multiplying ellipse × mask
-      // keeps the character of both: soft stroke edges AND brush-specific
-      // breaks, streaks, or specks where the mask dips below full opacity.
-      const invHalfL = 1 / rLen;
-      const invHalfW = 1 / rWid;
+      // Mask sampling. Two fixes vs. a naive stretch-to-fit-ellipse:
+      //
+      // 1. TILE ALONG LENGTH. A square mask stretched to a long thin stroke
+      //    smears bristle/splatter structure across the whole stroke so its
+      //    natural scale disappears. Instead we tile the mask's t-axis —
+      //    the mask pattern repeats along the stroke length at its native
+      //    scale, so bristle streaks stay crisp and splatter keeps its
+      //    specked density. The width axis still stretches to fit (strokes
+      //    need to sample the mask's full y-range once, not repeat it
+      //    across the narrow dimension).
+      //
+      // 2. GAMMA THE MASK. Most brush masks are near-opaque in their
+      //    interior — a naive ellipse × mask multiply passes the ellipse
+      //    through almost unchanged, so the brush character barely reads.
+      //    We apply ~gamma 2.4 to the mask value, which collapses mid-tones
+      //    (0.5 → 0.19, 0.7 → 0.43, 0.9 → 0.79) and turns subtle bristle
+      //    gaps into hard breaks. Solid regions (~1.0) still pass through.
       const bSz = bSize | 0;
+      const invHalfW = 1 / rWid;
+      // Repeat count along stroke length. Clamped so very short strokes
+      // don't over-tile and lose mask coherence. 0.8 scale keeps the
+      // repeats from being too dense.
+      const lenTiles = Math.max(1, Math.min(6, (rLen / rWid) * 0.8));
+      const invHalfLTiled = lenTiles / rLen;
       for (let yy = boxMinY; yy <= boxMaxY; yy++) {
         for (let xx = boxMinX; xx <= boxMaxX; xx++) {
           const dx = xx - cx, dy = yy - cy;
@@ -224,18 +235,23 @@ const DitherAlgorithms = (() => {
           const ellipseW = 1 - r2;
           let weight = ellipseW;
           if (useMask) {
-            const nx = t * invHalfL;
+            // Width: stretch -1..1 → 0..1.
+            // Length: tile — scale then wrap to 0..1.
             const ny = u * invHalfW;
-            let mx = ((nx * 0.5 + 0.5) * bSz) | 0;
-            let my = ((ny * 0.5 + 0.5) * bSz) | 0;
+            let nxT = t * invHalfLTiled; // may exceed ±1
+            // fract((nxT + 1) * 0.5) — wrap to 0..1
+            let ut = (nxT + 1) * 0.5;
+            ut = ut - Math.floor(ut);
+            const uw = (ny + 1) * 0.5;
+            let mx = (ut * bSz) | 0;
+            let my = (uw * bSz) | 0;
             if (mx < 0) mx = 0; else if (mx >= bSz) mx = bSz - 1;
             if (my < 0) my = 0; else if (my >= bSz) my = bSz - 1;
             const maskW = bMask[my * bSz + mx] / 255;
-            // Multiplicative blend. Mask acts as a modulation: where the
-            // mask is solid (~1) the ellipse weight passes through; where
-            // the mask thins (bristle gap, splatter fringe) weight drops
-            // and the hash-threshold rejects more pixels → breaks appear.
-            weight = ellipseW * maskW;
+            // ~gamma 2.4 via cheap polynomial: m^2 * (0.6*m + 0.4).
+            // Keeps 0→0 and 1→1, aggressively suppresses midtones.
+            const maskSharp = maskW * maskW * (0.6 * maskW + 0.4);
+            weight = ellipseW * maskSharp;
             if (weight <= 0) continue;
           }
           if (sh(xx, yy, 705) > weight) continue;
