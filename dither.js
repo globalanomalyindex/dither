@@ -1595,6 +1595,16 @@ const DitherAlgorithms = (() => {
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.8},
     {id:'skipSmoothAreas',label:'Skip Smooth Areas',min:0,max:1,step:.05,default:.4},
+    // formFollow: bipolar aesthetic slider.
+    //   +1 → strokes track image gradients tightly (clean curves along
+    //        forms, minimal angle jitter, stroke length shortens on edges
+    //        so they hug contours instead of overshooting).
+    //    0 → neutral, current behavior.
+    //   -1 → strokes become angular / chunky — angle quantized to 8
+    //        directions and jitter amplified, so strokes meet at hard
+    //        corners rather than flowing along curves. Reads as block-
+    //        print / woodcut / abstracted brushwork.
+    {id:'formFollow',label:'Angular ↔ Form-Follow',min:-1,max:1,step:.05,default:0},
     // — Wet paint (bleed/streak/smudge) —
     {id:'wetBleed',label:'Wet Bleed',min:0,max:1,step:.05,default:0},
     {id:'wetSmudge',label:'Wet Smudge',min:0,max:1,step:.05,default:0},
@@ -1736,6 +1746,7 @@ const DitherAlgorithms = (() => {
     const detailAware    = (p.detailAware     != null) ? p.detailAware     : 1;
     const sizeByDetail   = (p.sizeByDetail    != null) ? p.sizeByDetail    : 0.8;
     const skipSmoothAreas= (p.skipSmoothAreas != null) ? p.skipSmoothAreas : 0.4;
+    const formFollow     = (p.formFollow      != null) ? p.formFollow      : 0;
     const wetBleed       = (p.wetBleed        != null) ? p.wetBleed        : 0;
     const wetSmudge      = (p.wetSmudge       != null) ? p.wetSmudge       : 0;
     const wetStreak      = (p.wetStreak       != null) ? p.wetStreak       : 0;
@@ -1938,15 +1949,51 @@ const DitherAlgorithms = (() => {
           }
         }
 
-        const ang = eAng + Math.PI/2 + (sh(x, y, 3) - 0.5) * (angleJitter + slotAngJit) + layerAng;
+        // ── Angle composition ──
+        //   base  = perpendicular to image gradient (eAng + π/2)
+        //   jitter = angleJitter + slotAngJit, scaled by detailAware and
+        //            formFollow:
+        //       detailAware × localDetail  → jitter SHRINKS in busy areas
+        //            (tight strokes follow fine detail crisply).
+        //       formFollow > 0             → jitter SHRINKS globally
+        //            (strokes hug form curves, minimal wandering).
+        //       formFollow < 0             → jitter GROWS globally
+        //            (loose, scattered angular stamps).
+        //   layerAng is added after so multi-layer fan-out still works.
+        const detailJitDamp = detail ? (1 - localDetail * detailAware * 0.65) : 1;
+        const formJitScale  = formFollow >= 0
+          ? (1 - formFollow * 0.75)        // +1 → ×0.25
+          : (1 + (-formFollow) * 0.8);     // -1 → ×1.80
+        const effAngleJit   = (angleJitter + slotAngJit) * detailJitDamp * formJitScale;
+        let ang = eAng + Math.PI/2 + (sh(x, y, 3) - 0.5) * effAngleJit + layerAng;
+
+        // Angular / painterly quantization. When formFollow is pushed
+        // negative, snap the stroke angle onto one of 8 cardinal+diagonal
+        // directions (22.5° increments). Strength ramps in past -0.15 so
+        // small negative values still feel loose and only strong negative
+        // values give the woodcut / chunky-abstract read. Blends between
+        // raw and snapped angle so mid values feel organic.
+        if (formFollow < -0.15) {
+          const qStrength = Math.min(1, (-formFollow - 0.15) / 0.85);
+          const qStep = Math.PI * 2 / 16; // 22.5° — 8 directions (bidirectional)
+          const snapped = Math.round(ang / qStep) * qStep;
+          ang = ang * (1 - qStrength) + snapped * qStrength;
+        }
         const dx = Math.cos(ang), dy = Math.sin(ang);
 
-        // Detail-aware knife size: in smooth regions, make strokes bigger
-        // and longer (painterly sky sweep); in detailed regions, keep small.
+        // Detail-aware knife size: smooth regions → bigger strokes,
+        // detailed regions → smaller strokes.
         let detailSizeMul = 1;
         if (detail && sizeByDetail > 0) {
           const smoothFactor = 1 - localDetail;
           detailSizeMul = 1 + smoothFactor * sizeByDetail * 3.0;
+        }
+        // detailAware ALSO shrinks size in detail regions directly — so
+        // even with sizeByDetail low, pushing detailAware up still tightens
+        // strokes on features. Multiplicative with sizeByDetail; never
+        // below 0.4× so strokes remain visible.
+        if (detail && detailAware > 0) {
+          detailSizeMul *= Math.max(0.4, 1 - localDetail * detailAware * 0.5);
         }
 
         const sizeMul = 1 + (sizeByLight > 0 ? lum : (1 - lum)) * Math.abs(sizeByLight) * 1.8;
@@ -1959,7 +2006,16 @@ const DitherAlgorithms = (() => {
         // visually because source-pixel color dominates over stamp shape.
         const knifeW = Math.max(1.5, p.size * canvasScale * sizeMul * detailSizeMul * slotSizeMul);
 
-        const lenBase = p.smear * canvasScale * (0.5 + sh(x, y, 4) * 0.5) * detailSizeMul * slotSizeMul;
+        // detailAware in detail regions → shorter strokes (tight on
+        // edges, don't overshoot). formFollow > 0 → also shorter (strokes
+        // shouldn't run past a curve). Combined so pushing either up
+        // gives more precise strokes on features.
+        const detailLenFactor = detail
+          ? (1 - localDetail * detailAware * 0.55)
+          : 1;
+        const formLenFactor = formFollow > 0 ? (1 - formFollow * 0.35) : 1;
+        const lenBase = p.smear * canvasScale * (0.5 + sh(x, y, 4) * 0.5)
+          * detailSizeMul * slotSizeMul * detailLenFactor * formLenFactor;
         const realSmearLen = lenBase * (1 + edgeN * lengthByEdge * 2.5);
         // WET STREAK extends the smear with a decaying tail — long painterly
         // drag from a loaded brush.
@@ -5468,6 +5524,8 @@ const DitherAlgorithms = (() => {
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.7},
     {id:'skipSmoothAreas',label:'Skip Smooth Areas',min:0,max:1,step:.05,default:.5},
+    // See palette-knife formFollow comment — same semantics here.
+    {id:'formFollow',label:'Angular ↔ Form-Follow',min:-1,max:1,step:.05,default:0},
     // — Wet paint (bleed/streak/smudge) —
     {id:'wetBleed',label:'Wet Bleed',min:0,max:1,step:.05,default:0},
     {id:'wetSmudge',label:'Wet Smudge',min:0,max:1,step:.05,default:0},
@@ -5648,6 +5706,7 @@ const DitherAlgorithms = (() => {
     const detailAware      = (p.detailAware      != null) ? p.detailAware      : 1;
     const sizeByDetail     = (p.sizeByDetail     != null) ? p.sizeByDetail     : 0.7;
     const skipSmoothAreas  = (p.skipSmoothAreas  != null) ? p.skipSmoothAreas  : 0.5;
+    const formFollow       = (p.formFollow       != null) ? p.formFollow       : 0;
     const wetBleed         = (p.wetBleed         != null) ? p.wetBleed         : 0;
     const wetSmudge        = (p.wetSmudge        != null) ? p.wetSmudge        : 0;
     const wetStreak        = (p.wetStreak        != null) ? p.wetStreak        : 0;
@@ -5822,7 +5881,26 @@ const DitherAlgorithms = (() => {
 
       let dirAng = eMag > 5 ? eAng + Math.PI / 2 : sh(i, 0, 106) * Math.PI * 2;
       dirAng = dirAng * p.flowStrength + (sh(i, 0, 107) * Math.PI * 2) * (1 - p.flowStrength);
-      if (angleJitter + slotAngJit > 0) dirAng += (sh(i, 0, 108) - 0.5) * (angleJitter + slotAngJit) * Math.PI;
+      // Detail + formFollow shape the jitter, same as palette-knife.
+      //   detailAware × localDetail → less wander in busy areas.
+      //   formFollow > 0            → less wander globally (form-follow).
+      //   formFollow < 0            → more wander globally (angular).
+      const detailJitDamp = detail ? (1 - localDetail * detailAware * 0.65) : 1;
+      const formJitScale  = formFollow >= 0
+        ? (1 - formFollow * 0.75)
+        : (1 + (-formFollow) * 0.8);
+      const effAngleJit   = (angleJitter + slotAngJit) * detailJitDamp * formJitScale;
+      if (effAngleJit > 0) dirAng += (sh(i, 0, 108) - 0.5) * effAngleJit * Math.PI;
+
+      // Angular quantization when formFollow is strongly negative.
+      // Snap to 22.5° increments (8 directions bidirectional). Matches
+      // palette-knife for consistency across the two algorithms.
+      if (formFollow < -0.15) {
+        const qStrength = Math.min(1, (-formFollow - 0.15) / 0.85);
+        const qStep = Math.PI * 2 / 16;
+        const snapped = Math.round(dirAng / qStep) * qStep;
+        dirAng = dirAng * (1 - qStrength) + snapped * qStrength;
+      }
 
       // Illusion modulation (unchanged)
       let ox = 0, oy = 0;
@@ -5844,11 +5922,23 @@ const DitherAlgorithms = (() => {
         detailSizeMul = 1 + smoothFactor * sizeByDetail * 3.0; // up to 4x in skies
       }
 
+      // detailAware also shrinks size directly in detail regions (in
+      // addition to sizeByDetail), so pushing detailAware up tightens
+      // dabs on features even if sizeByDetail is low. And formFollow > 0
+      // trims length so dabs don't overshoot the curve they're tracking.
+      if (detail && detailAware > 0) {
+        detailSizeMul *= Math.max(0.4, 1 - localDetail * detailAware * 0.5);
+      }
+      const detailLenFactor = detail
+        ? (1 - localDetail * detailAware * 0.55)
+        : 1;
+      const formLenFactor = formFollow > 0 ? (1 - formFollow * 0.35) : 1;
+
       // Dab size + length modulation (slotSizeMul lets each tonal zone
       // paint with a different dab scale — big shadows, tiny highlights).
       // canvasScale keeps brush footprint consistent across canvas sizes.
       const lenMul = 1 + (1 - srcVal/255) * p.lumModulation * 0.4;
-      let len = p.dabLen * canvasScale * lenMul * detailSizeMul * slotSizeMul;
+      let len = p.dabLen * canvasScale * lenMul * detailSizeMul * slotSizeMul * detailLenFactor * formLenFactor;
       if (lengthJitter > 0) len *= (1 + (sh(i, 0, 109) - 0.5) * lengthJitter * 1.5);
       let width = p.dabWidth * canvasScale * detailSizeMul * slotSizeMul;
       if (sizeJitter > 0) width *= (1 + (sh(i, 0, 110) - 0.5) * sizeJitter * 1.5);
