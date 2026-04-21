@@ -106,7 +106,30 @@ const DitherAlgorithms = (() => {
   // so underpaint strokes inherit the selected Brush Shape (bristles,
   // splatter, knife edge, etc.) — matching the top-layer dabs. Falls back
   // to the ellipse weight when no mask is provided.
-  function painterlyUnderpaint(o, px, w, h, block, sh, edgeAng, bMask, bSize) {
+  function painterlyUnderpaint(o, px, w, h, block, sh, edgeAng, bMask, bSize, opts) {
+    // opts: per-algo underpaint knobs (all optional, defaults preserve legacy).
+    //   washNoise     — multiplies the dither noise on the wash (0..2).
+    //   washSmoothness— blends the raw-per-pixel source back in (0 = coarse
+    //                   block wash; 1 = mostly the source luminance). Lets
+    //                   users mix the new painterly underpaint with the old
+    //                   near-source base.
+    //   density       — multiplies stroke count (0.3..3).
+    //   sizeMul       — multiplies per-stroke width + length (0.3..3).
+    //   detailResp    — scales the detail-aware response for density AND
+    //                   size (0 flattens it; 2 amplifies it).
+    //   angleJitter   — raw stroke-angle jitter in radians (default 0.8).
+    //   strokeStrength— alpha blend for the oriented strokes (0 = pure wash,
+    //                   1 = hard stamp). Lower values keep the underpaint
+    //                   soft/vague so the main algo's strokes dominate.
+    opts = opts || {};
+    const _washNoise      = (opts.washNoise      != null) ? opts.washNoise      : 1;
+    const _washSmoothness = (opts.washSmoothness != null) ? opts.washSmoothness : 0;
+    const _density        = (opts.density        != null) ? opts.density        : 1;
+    const _sizeMulU       = (opts.sizeMul        != null) ? opts.sizeMul        : 1;
+    const _detailResp     = (opts.detailResp     != null) ? opts.detailResp     : 1;
+    const _angJitU        = (opts.angleJitter    != null) ? opts.angleJitter    : 0.8;
+    const _strokeStrength = (opts.strokeStrength != null) ? opts.strokeStrength : 1;
+
     // ── Pass 1: tonal wash with NOISE DITHER ──
     // Downsample the source into a coarse grid of block-averages, then
     // bilinear-upsample back — but add strong hash noise before writing.
@@ -136,7 +159,7 @@ const DitherAlgorithms = (() => {
     // Noise amplitude: ±36/255 gives readable speckle without destroying
     // the underlying gradient. Scales the wash's tonal range by about
     // 28% so a smooth mid-gray neighborhood looks stippled, not flat.
-    const NOISE_AMP = 36;
+    const NOISE_AMP = 36 * _washNoise;
     for (let y = 0; y < h; y++) {
       const fy = (y * bHm1) / hDenom;
       const iy0 = Math.floor(fy), iy1 = Math.min(bHm1, iy0 + 1);
@@ -150,7 +173,13 @@ const DitherAlgorithms = (() => {
         const v01 = base[row1 + ix0], v11 = base[row1 + ix1];
         const v0 = v00 + (v10 - v00) * tx;
         const v1 = v01 + (v11 - v01) * tx;
-        const smooth = v0 + (v1 - v0) * ty;
+        let smooth = v0 + (v1 - v0) * ty;
+        // washSmoothness → mix the raw source luminance back in so the
+        // underpaint can behave like the OLD near-source base when the
+        // user wants a tighter tone, or stay broad-blocky (default 0).
+        if (_washSmoothness > 0) {
+          smooth = smooth * (1 - _washSmoothness) + px[y * w + x] * _washSmoothness;
+        }
         const noise = (sh(x, y, 605) - 0.5) * NOISE_AMP * 2;
         const val = smooth + noise;
         o[y * w + x] = val < 0 ? 0 : (val > 255 ? 255 : Math.round(val));
@@ -162,9 +191,9 @@ const DitherAlgorithms = (() => {
     // color by a soft weight we threshold the weight against a spatial
     // hash → hard pixel-sample at probability weight, keep underpaint
     // otherwise. Matches the main renderer's dithered stamp behavior.
-    const strokeW = Math.max(5, Math.round(block * 1.0));
-    const strokeL = Math.max(14, Math.round(block * 2.6));
-    const baseStrokes = Math.max(30, Math.round((w * h) / (strokeW * strokeL * 0.45)));
+    const strokeW = Math.max(5, Math.round(block * 1.0 * _sizeMulU));
+    const strokeL = Math.max(14, Math.round(block * 2.6 * _sizeMulU));
+    const baseStrokes = Math.max(30, Math.round((w * h) / (strokeW * strokeL * 0.45) * _density));
     const useMask = !!(bMask && bSize > 1);
 
     // Detail field — local luminance stddev per pixel. Used for TWO things:
@@ -189,7 +218,21 @@ const DitherAlgorithms = (() => {
     // reading as confident washes.
     const OVERSAMPLE = 2.2;
     const candidates = Math.round(baseStrokes * OVERSAMPLE);
-    const KEEP_MIN = 0.28, KEEP_RANGE = 0.72;
+    // detailResp remaps the density response. At 0 the keep probability
+    // is near-uniform (detail barely affects count); at 2 the contrast
+    // between flat-area sparsity and busy-area density is ~2× stronger.
+    // KEEP_MIN floor keeps some strokes everywhere so flat regions aren't
+    // entirely barren.
+    const _baseMin = 0.28, _baseRange = 0.72;
+    const KEEP_MIN = 0.28 + (_baseMin - 0.28) * 0;  // fixed floor
+    // Shift the *center* of the response toward uniformity as detailResp → 0.
+    // At detailResp=1: floor 0.28, range 0.72 (legacy).
+    // At detailResp=0: floor 0.78, range 0.22 (mostly uniform).
+    // At detailResp=2: floor 0.08, range 0.92 (strong contrast).
+    const _respFloor = 0.28 + 0.5 * (1 - Math.min(1, _detailResp));
+    const _respRange = Math.max(0.05, 0.72 * _detailResp);
+    const _KEEP_MIN2  = Math.max(0.05, Math.min(0.95, _respFloor));
+    const _KEEP_RANGE2= Math.max(0.05, Math.min(1 - _KEEP_MIN2, _respRange));
 
     for (let i = 0; i < candidates; i++) {
       const cx = Math.floor(sh(i, 0, 700) * w);
@@ -199,14 +242,19 @@ const DitherAlgorithms = (() => {
       // stroke size. Sampling once keeps the two responses in lockstep —
       // a flat region gets both bigger strokes AND fewer of them.
       const d01 = Math.min(1, df[sampleIdx] * dNorm);
-      const keepP = KEEP_MIN + KEEP_RANGE * d01;
+      const keepP = _KEEP_MIN2 + _KEEP_RANGE2 * d01;
       if (sh(i, 0, 706) > keepP) continue;
       const sampleVal = px[sampleIdx];
       const eIdx = Math.min(h - 2, Math.max(1, cy)) * w + Math.min(w - 2, Math.max(1, cx));
-      const ang = edgeAng[eIdx] + Math.PI * 0.5 + (sh(i, 0, 702) - 0.5) * 0.8;
+      const ang = edgeAng[eIdx] + Math.PI * 0.5 + (sh(i, 0, 702) - 0.5) * _angJitU;
       const ca = Math.cos(ang), sa = Math.sin(ang);
       // Detail-based size multiplier: smooth → 1.55×, very busy → 0.55×.
-      const sizeMul = 1.55 - d01 * 1.0;
+      // detailResp scales the detail-driven swing around neutral 1.05. At
+      // detailResp=0 every stroke is the same size; at 2 the flat/busy
+      // contrast roughly doubles.
+      const _swingBase = 0.5;  // half-range around mid
+      const _swing = _swingBase * _detailResp;
+      const sizeMul = (1.05 + _swing) - d01 * (2 * _swing);
       const rLen = strokeL * 0.5 * (0.65 + sh(i, 0, 703) * 0.75) * sizeMul;
       const rWid = strokeW * 0.5 * (0.55 + sh(i, 0, 704) * 0.55) * sizeMul;
       const rLen2 = rLen * rLen, rWid2 = rWid * rWid;
@@ -269,7 +317,15 @@ const DitherAlgorithms = (() => {
             if (weight <= 0) continue;
           }
           if (sh(xx, yy, 705) > weight) continue;
-          o[yy * w + xx] = sampleVal;
+          // strokeStrength < 1 → blend with the wash rather than replacing,
+          // so the underpaint stays soft and the main algo's strokes carry
+          // the final read. =1 matches legacy hard-stamp behavior.
+          const _oi = yy * w + xx;
+          if (_strokeStrength >= 0.999) {
+            o[_oi] = sampleVal;
+          } else {
+            o[_oi] = Math.round(sampleVal * _strokeStrength + o[_oi] * (1 - _strokeStrength));
+          }
         }
       }
     }
@@ -1590,7 +1646,21 @@ const DitherAlgorithms = (() => {
       {value:'clean',label:'From blank canvas'}
     ],default:'underpaint'},
     {id:'bgTone',label:'Blank BG Tone',min:0,max:255,step:1,default:255},
+    // — Underpaint customization —
+    // Only active when Canvas = "Painterly underpaint". The wash + oriented
+    // strokes that get laid down before the main algorithm paints over them.
     {id:'underpaintBlock',label:'Underpaint Stroke Scale',min:4,max:40,step:1,default:14},
+    {id:'underpaintNoise',label:'Underpaint Wash Noise',min:0,max:2,step:.05,default:1,
+     hint:'grit in the tonal wash · 0 = smooth bilinear · 2 = gritty'},
+    {id:'underpaintSmoothness',label:'Underpaint Wash ↔ Source',min:0,max:1,step:.05,default:0,
+     hint:'0 = broad block wash · 1 = tighter source luminance'},
+    {id:'underpaintDensity',label:'Underpaint Stroke Density',min:.3,max:3,step:.05,default:1},
+    {id:'underpaintSize',label:'Underpaint Stroke Size',min:.3,max:3,step:.05,default:1},
+    {id:'underpaintDetail',label:'Underpaint Detail Response',min:0,max:2,step:.05,default:1,
+     hint:'how strongly detail drives stroke size + density'},
+    {id:'underpaintAngle',label:'Underpaint Angle Jitter',min:0,max:1.5,step:.05,default:.8},
+    {id:'underpaintStrength',label:'Underpaint Stroke Strength',min:0,max:1,step:.05,default:1,
+     hint:'0 = wash only · 1 = hard painterly strokes'},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.8,
@@ -1620,9 +1690,25 @@ const DitherAlgorithms = (() => {
     {id:'sizeByLight',label:'Size from Luminance',min:-1,max:1,step:.05,default:0},
     {id:'lengthByEdge',label:'Length from Edge',min:0,max:1,step:.05,default:0},
     {id:'pressureByEdge',label:'Pressure from Edge',min:0,max:1,step:.05,default:0},
-    // — Stroke randomness —
+    // — Stroke randomness / per-stroke variety (parity with Impressionism) —
     {id:'angleJitter',label:'Angle Jitter',min:0,max:2,step:.05,default:.5},
     {id:'pressureJitter',label:'Pressure Jitter',min:0,max:1,step:.05,default:0},
+    {id:'sizeJitter',label:'Size Jitter',min:0,max:1,step:.05,default:0},
+    {id:'lengthJitter',label:'Length Jitter',min:0,max:1,step:.05,default:0},
+    {id:'scatter',label:'Position Scatter',min:0,max:30,step:.5,default:0,
+     hint:'px offset per stroke position'},
+    {id:'impurities',label:'Impurities (tone jitter)',min:0,max:1,step:.05,default:0,
+     hint:'dirty-paint tone shift per stroke'},
+    {id:'strokeCurve',label:'Stroke Curve',min:0,max:1,step:.05,default:0,
+     hint:'bends the smear path along its length'},
+    // — Dark-first / adaptive (parity with Impressionism) —
+    {id:'adaptiveDensity',label:'Adaptive Density (detail)',min:0,max:2,step:.05,default:0,
+     hint:'extra strokes in busy areas beyond skipSmooth'},
+    {id:'edgeBreak',label:'Edge Break (stop at edges)',min:0,max:1,step:.05,default:0},
+    {id:'darkStrokeWeight',label:'Dark-First Weight',min:0,max:1,step:.05,default:0,
+     hint:'paints dark areas before light'},
+    {id:'opacityByLum',label:'Opacity by Luminance',min:0,max:1,step:.05,default:0,
+     hint:'darker = more opaque, lighter = translucent'},
     // — Blend-mode legacy control —
     {id:'colorPickup',label:'Color Pickup (blend only)',min:-1,max:1,step:.05,default:0},
     // — Brush shape —
@@ -1744,6 +1830,16 @@ const DitherAlgorithms = (() => {
     // grow proportionally on larger canvases.
     const underpaintBlock = Math.max(2, Math.round(((p.underpaintBlock != null) ? p.underpaintBlock : 14) * canvasScale));
     const colorPickup   = (p.colorPickup != null) ? p.colorPickup : 0;
+    // — Parity-with-impressionism params —
+    const sizeJitter      = (p.sizeJitter      != null) ? p.sizeJitter      : 0;
+    const lengthJitter    = (p.lengthJitter    != null) ? p.lengthJitter    : 0;
+    const scatter         = ((p.scatter        != null) ? p.scatter         : 0) * canvasScale;
+    const impurities      = (p.impurities      != null) ? p.impurities      : 0;
+    const strokeCurve     = (p.strokeCurve     != null) ? p.strokeCurve     : 0;
+    const adaptiveDensity = (p.adaptiveDensity != null) ? p.adaptiveDensity : 0;
+    const edgeBreakAmt    = (p.edgeBreak       != null) ? p.edgeBreak       : 0;
+    const darkStrokeWeight= (p.darkStrokeWeight!= null) ? p.darkStrokeWeight: 0;
+    const opacityByLum    = (p.opacityByLum    != null) ? p.opacityByLum    : 0;
     const detailAware    = (p.detailAware     != null) ? p.detailAware     : 1;
     const sizeByDetail   = (p.sizeByDetail    != null) ? p.sizeByDetail    : 0.8;
     const skipSmoothAreas= (p.skipSmoothAreas != null) ? p.skipSmoothAreas : 0.4;
@@ -1840,7 +1936,16 @@ const DitherAlgorithms = (() => {
       // Pass the active brush mask so underpaint strokes inherit the
       // selected Brush Shape (bristles/splatter/knife etc.) instead of
       // staying as a plain ellipse. Falls back to ellipse when bMask null.
-      painterlyUnderpaint(o, px, w, h, underpaintBlock, sh, edgeAng, bMask, bSize);
+      const _upOpts = {
+        washNoise:      (p.underpaintNoise      != null) ? p.underpaintNoise      : 1,
+        washSmoothness: (p.underpaintSmoothness != null) ? p.underpaintSmoothness : 0,
+        density:        (p.underpaintDensity    != null) ? p.underpaintDensity    : 1,
+        sizeMul:        (p.underpaintSize       != null) ? p.underpaintSize       : 1,
+        detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
+        angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
+        strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1
+      };
+      painterlyUnderpaint(o, px, w, h, underpaintBlock, sh, edgeAng, bMask, bSize, _upOpts);
     } else {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     }
@@ -1887,8 +1992,19 @@ const DitherAlgorithms = (() => {
       const ox = (layer * (baseSp >> 1)) % baseSp;
       const oy = (layer * (baseSp >> 2)) % baseSp;
 
-      for (let y = oy; y < h; y += baseSp) {
-        for (let x = ox; x < w; x += baseSp) {
+      for (let yOrig = oy; yOrig < h; yOrig += baseSp) {
+        for (let xOrig = ox; xOrig < w; xOrig += baseSp) {
+        // scatter: nudge this stroke's origin off the stride grid so
+        // successive strokes don't line up in visible rows. Matches
+        // impressionism's scatter param semantics (pixel distance,
+        // canvas-scaled already). We work off shadow vars (x,y) so the
+        // rest of the stroke body is unchanged — the for-loop counter
+        // (xOrig/yOrig) still advances by baseSp cleanly.
+        let x = xOrig, y = yOrig;
+        if (scatter > 0) {
+          x = Math.max(0, Math.min(w-1, Math.round(xOrig + (sh(xOrig, yOrig, 95) - 0.5) * scatter * 2)));
+          y = Math.max(0, Math.min(h-1, Math.round(yOrig + (sh(xOrig, yOrig, 96) - 0.5) * scatter * 2)));
+        }
         const ex = Math.min(w-2, Math.max(1, x));
         const ey = Math.min(h-2, Math.max(1, y));
         const eIdx = ey * w + ex;
@@ -1906,6 +2022,21 @@ const DitherAlgorithms = (() => {
             const keepProb = localDetail + (1 - skipSmoothAreas * 0.8);
             if (sh(x, y, 120) > Math.min(1, keepProb)) continue;
           }
+          // adaptiveDensity: extra stroke keeps in busy areas. This is
+          // ADDITIVE to skipSmoothAreas — busy → pass more, flat → pass
+          // fewer. Acts as a second-pass filter so pushing both sliders
+          // pushes the density contrast visibly farther.
+          if (adaptiveDensity > 0) {
+            const densProb = 0.5 + (localDetail - 0.5) * adaptiveDensity * 0.8;
+            if (sh(x, y, 121) > Math.min(1, Math.max(0.1, densProb))) continue;
+          }
+        }
+        // darkStrokeWeight: bias toward placing strokes in dark areas
+        // first (so shadows build up before highlights). Reject bright
+        // pixels probabilistically as the weight grows.
+        if (darkStrokeWeight > 0) {
+          const darkKeep = 1 - lum * darkStrokeWeight;
+          if (sh(x, y, 122) > Math.max(0.15, darkKeep)) continue;
         }
 
         // Per-stroke random decisions use position-hash, NOT a call-ordered
@@ -2009,7 +2140,12 @@ const DitherAlgorithms = (() => {
         // and a small highlight brush paints thin AND short strokes — without
         // this the slot's "size" only changed thickness, which barely reads
         // visually because source-pixel color dominates over stamp shape.
-        const knifeW = Math.max(1.5, p.size * canvasScale * sizeMul * detailSizeMul * slotSizeMul);
+        // sizeJitter: per-stroke random size multiplier. ±sizeJitter*0.75
+        // swing keeps it visible but not destroying the base size.
+        const sizeJitMul = sizeJitter > 0
+          ? (1 + (sh(x, y, 130) - 0.5) * sizeJitter * 1.5)
+          : 1;
+        const knifeW = Math.max(1.5, p.size * canvasScale * sizeMul * detailSizeMul * slotSizeMul * sizeJitMul);
 
         // detailAware in detail regions → shorter strokes (tight on
         // edges, don't overshoot). formFollow > 0 → also shorter (strokes
@@ -2019,9 +2155,31 @@ const DitherAlgorithms = (() => {
           ? (1 - localDetail * detailAware * 0.55)
           : 1;
         const formLenFactor = formFollow > 0 ? (1 - formFollow * 0.35) : 1;
+        // lengthJitter: per-stroke random length multiplier, same shape as
+        // sizeJitter but on the smear axis.
+        const lenJitMul = lengthJitter > 0
+          ? (1 + (sh(x, y, 131) - 0.5) * lengthJitter * 1.5)
+          : 1;
         const lenBase = p.smear * canvasScale * (0.5 + sh(x, y, 4) * 0.5)
-          * detailSizeMul * slotSizeMul * detailLenFactor * formLenFactor;
+          * detailSizeMul * slotSizeMul * detailLenFactor * formLenFactor * lenJitMul;
         const realSmearLen = lenBase * (1 + edgeN * lengthByEdge * 2.5);
+        // strokeCurve: bends the smear path. We add a perpendicular
+        // sin-sweep offset to each t-step so the stroke arcs instead of
+        // being a straight line. Amplitude scales with length so short
+        // strokes don't over-curl.
+        const curveAmp = strokeCurve > 0 ? realSmearLen * strokeCurve * 0.18 : 0;
+        const curvePhase = sh(x, y, 132) * Math.PI * 2;
+        // impurities: per-stroke tone jitter applied to sampled source.
+        const impurityShift = impurities > 0
+          ? (sh(x, y, 133) - 0.5) * impurities * 60
+          : 0;
+        // opacityByLum: darker pixels paint more opaquely; bright ones
+        // become translucent. Blends ON TOP of slotOpacity so this is a
+        // per-stroke modulation that works with custom brushes too.
+        const lumOpacityMul = opacityByLum > 0
+          ? (1 - lum * opacityByLum * 0.85)
+          : 1;
+        const effSlotOpacity = slotOpacity * lumOpacityMul;
         // WET STREAK extends the smear with a decaying tail — long painterly
         // drag from a loaded brush.
         const streakExt = wetStreak > 0 ? realSmearLen * wetStreak * 1.5 : 0;
@@ -2069,8 +2227,20 @@ const DitherAlgorithms = (() => {
           const invStamp = 1 / (2 * stampSz);
           const halfMask = (currSize - 1) / 2;
           for (let t = 0; t < effSmearLen; t++) {
-            const fx = Math.round(x + dx*t), fy = Math.round(y + dy*t);
+            // strokeCurve: bend path by sinusoidal perpendicular offset.
+            let curveOx = 0, curveOy = 0;
+            if (curveAmp > 0) {
+              const cAmt = Math.sin(curvePhase + (t / Math.max(1, realSmearLen)) * Math.PI) * curveAmp;
+              curveOx = -dy * cAmt;  // perpendicular
+              curveOy =  dx * cAmt;
+            }
+            const fx = Math.round(x + dx*t + curveOx), fy = Math.round(y + dy*t + curveOy);
             if (fx < 0 || fx >= w || fy < 0 || fy >= h) break;
+            // edgeBreak: stop drawing when stroke crosses a strong edge.
+            if (edgeBreakAmt > 0 && t > 1) {
+              const em = edgeMag[Math.min(h-2, Math.max(1, fy)) * w + Math.min(w-2, Math.max(1, fx))];
+              if (em / 120 * edgeBreakAmt > 0.6 && sh(fx, fy, 140) < edgeBreakAmt) break;
+            }
             // Decay: during real smear it linearly fades; in streak-tail it
             // fades faster (so you get a long thinning tail not a uniform bar).
             const inReal = t < realSmearLen;
@@ -2120,12 +2290,13 @@ const DitherAlgorithms = (() => {
                 const vy = varietyRadius > 0 ? (sh(wx2, wy2, 51 + (t & 3)) - 0.5) * varietyRadius * 2 : 0;
                 const sXi = Math.max(0, Math.min(w-1, Math.round(sOrigX + jx + vx)));
                 const sYi = Math.max(0, Math.min(h-1, Math.round(sOrigY + jy + vy)));
-                const src = clamp(px[sYi * w + sXi]);
+                let src = clamp(px[sYi * w + sXi]);
+                if (impurityShift !== 0) src = clamp(src + impurityShift);
                 const oi = wy2 * w + wx2;
-                if (slotOpacity >= 0.999) {
+                if (effSlotOpacity >= 0.999) {
                   o[oi] = src;
                 } else {
-                  o[oi] = Math.round(src * slotOpacity + o[oi] * (1 - slotOpacity));
+                  o[oi] = Math.round(src * effSlotOpacity + o[oi] * (1 - effSlotOpacity));
                 }
               }
             }
@@ -2134,8 +2305,18 @@ const DitherAlgorithms = (() => {
           // Built-in knife edge — a narrow perpendicular strip
           const halfKnife = Math.max(1, knifeW / 3);
           for (let t = 0; t < effSmearLen; t++) {
-            const fx = Math.round(x + dx*t), fy = Math.round(y + dy*t);
+            let curveOx = 0, curveOy = 0;
+            if (curveAmp > 0) {
+              const cAmt = Math.sin(curvePhase + (t / Math.max(1, realSmearLen)) * Math.PI) * curveAmp;
+              curveOx = -dy * cAmt;
+              curveOy =  dx * cAmt;
+            }
+            const fx = Math.round(x + dx*t + curveOx), fy = Math.round(y + dy*t + curveOy);
             if (fx < 0 || fx >= w || fy < 0 || fy >= h) break;
+            if (edgeBreakAmt > 0 && t > 1) {
+              const em = edgeMag[Math.min(h-2, Math.max(1, fy)) * w + Math.min(w-2, Math.max(1, fx))];
+              if (em / 120 * edgeBreakAmt > 0.6 && sh(fx, fy, 140) < edgeBreakAmt) break;
+            }
             const inReal = t < realSmearLen;
             const decay = inReal
               ? 1 - t / realSmearLen
@@ -2152,7 +2333,7 @@ const DitherAlgorithms = (() => {
               const wy2 = Math.round(fy + dx*ww);
               if (wx2 < 0 || wx2 >= w || wy2 < 0 || wy2 >= h) continue;
               const edgeFalloff = 1 - Math.abs(ww) / Math.max(1, halfKnife);
-              const prob = Math.min(1, edgeFalloff * decay * pressure * coverageDensity * slotOpacity);
+              const prob = Math.min(1, edgeFalloff * decay * pressure * coverageDensity * effSlotOpacity);
               if (sh(wx2, wy2, 10 + ((t|0) & 3)) > prob) continue;
               const jx = sampleJitter > 0 ? (sh(wx2, wy2, 20) - 0.5) * sampleJitter * 2 : 0;
               const jy = sampleJitter > 0 ? (sh(wx2, wy2, 21) - 0.5) * sampleJitter * 2 : 0;
@@ -2160,7 +2341,9 @@ const DitherAlgorithms = (() => {
               const vy = varietyRadius > 0 ? (sh(wx2, wy2, 51 + (t & 3)) - 0.5) * varietyRadius * 2 : 0;
               const sXi = Math.max(0, Math.min(w-1, Math.round(sOrigX + jx + vx)));
               const sYi = Math.max(0, Math.min(h-1, Math.round(sOrigY + jy + vy)));
-              o[wy2 * w + wx2] = clamp(px[sYi * w + sXi]);
+              let src2 = clamp(px[sYi * w + sXi]);
+              if (impurityShift !== 0) src2 = clamp(src2 + impurityShift);
+              o[wy2 * w + wx2] = src2;
             }
           }
         }
@@ -5525,6 +5708,18 @@ const DitherAlgorithms = (() => {
       {value:'clean',label:'From blank canvas (classic)'}
     ],default:'underpaint'},
     {id:'underpaintBlock',label:'Underpaint Stroke Scale',min:4,max:40,step:1,default:14},
+    // — Underpaint customization (same knobs as palette-knife) —
+    {id:'underpaintNoise',label:'Underpaint Wash Noise',min:0,max:2,step:.05,default:1,
+     hint:'grit in the tonal wash · 0 = smooth bilinear · 2 = gritty'},
+    {id:'underpaintSmoothness',label:'Underpaint Wash ↔ Source',min:0,max:1,step:.05,default:0,
+     hint:'0 = broad block wash · 1 = tighter source luminance'},
+    {id:'underpaintDensity',label:'Underpaint Stroke Density',min:.3,max:3,step:.05,default:1},
+    {id:'underpaintSize',label:'Underpaint Stroke Size',min:.3,max:3,step:.05,default:1},
+    {id:'underpaintDetail',label:'Underpaint Detail Response',min:0,max:2,step:.05,default:1,
+     hint:'how strongly detail drives stroke size + density'},
+    {id:'underpaintAngle',label:'Underpaint Angle Jitter',min:0,max:1.5,step:.05,default:.8},
+    {id:'underpaintStrength',label:'Underpaint Stroke Strength',min:0,max:1,step:.05,default:1,
+     hint:'0 = wash only · 1 = hard painterly strokes'},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.7,
@@ -5685,7 +5880,16 @@ const DitherAlgorithms = (() => {
     if (dabStyle === 'pixel' && canvasStart === 'source') {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     } else if (dabStyle === 'pixel' && canvasStart === 'underpaint') {
-      painterlyUnderpaint(o, px, w, h, underpaintBlock, shUnder, edgeAngUp, _upMask, _upSize);
+      const _upOpts = {
+        washNoise:      (p.underpaintNoise      != null) ? p.underpaintNoise      : 1,
+        washSmoothness: (p.underpaintSmoothness != null) ? p.underpaintSmoothness : 0,
+        density:        (p.underpaintDensity    != null) ? p.underpaintDensity    : 1,
+        sizeMul:        (p.underpaintSize       != null) ? p.underpaintSize       : 1,
+        detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
+        angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
+        strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1
+      };
+      painterlyUnderpaint(o, px, w, h, underpaintBlock, shUnder, edgeAngUp, _upMask, _upSize, _upOpts);
     } else {
       o.fill(bgTone);
     }
