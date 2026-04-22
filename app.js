@@ -325,6 +325,16 @@
         cb._resolvedMaskEdge   = resolveBrushSpec(cb.edge);
         params.customBrushes = cb;
       }
+      // Normalize rules so each rule has a numeric toneTarget (derived from
+      // the user's color swatch). State snapshots / presets can land here
+      // with only toneColor set, or with missing fields after schema drift.
+      if (Array.isArray(params.rules) && params.rules.length > 0) {
+        params.rules = params.rules.map(r => {
+          const nr = { ...r };
+          normalizeRule(nr);
+          return nr;
+        });
+      }
       return { algorithm: algo, params };
     });
   }
@@ -483,6 +493,199 @@
       return prefix + (lib.name || 'Untitled');
     }
     return String(spec.source || '—');
+  }
+
+  // ── If/Then RULES — UI helpers ──
+  // Convert a hex color to approximate luminance (Y) — single-channel pipelines
+  // compare tone in luma space so the "tone near" condition works across R/G/B.
+  function hexToLuma(hex) {
+    const h = (hex || '#808080').replace('#', '');
+    if (h.length !== 6) return 128;
+    const r = parseInt(h.slice(0, 2), 16);
+    const g = parseInt(h.slice(2, 4), 16);
+    const b = parseInt(h.slice(4, 6), 16);
+    return Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+  }
+  // Re-hydrate rule-as-hex-and-tolerance → rule-as-toneTarget number.
+  // Also coerces missing fields to safe defaults in-place.
+  function normalizeRule(r) {
+    if (!r || typeof r !== 'object') return;
+    if (r.enabled === undefined) r.enabled = true;
+    if (!r.when) r.when = 'edge';
+    if (!r.then) r.then = 'blend';
+    if (r.amount == null) r.amount = 0.5;
+    if (r.edgeMin == null) r.edgeMin = 0.3;
+    if (r.detailMin == null) r.detailMin = 0.4;
+    if (r.detailMax == null) r.detailMax = 0.25;
+    if (r.toneColor == null) r.toneColor = '#808080';
+    if (r.toneTol == null) r.toneTol = 40;
+    if (r.levels == null) r.levels = 4;
+    if (r.radius == null) r.radius = 2;
+    // Derived: toneTarget is what applyRules reads.
+    r.toneTarget = hexToLuma(r.toneColor);
+  }
+  const RULE_DEFAULT = () => ({
+    enabled: true,
+    when: 'edge',
+    then: 'blend',
+    amount: 0.5,
+    edgeMin: 0.3,
+    detailMin: 0.4,
+    detailMax: 0.25,
+    toneColor: '#808080',
+    toneTarget: 128,
+    toneTol: 40,
+    levels: 4,
+    radius: 2
+  });
+  // Small helper — renders the condition-side extra controls.
+  function renderRuleCondParams(algoId, r, idx) {
+    switch (r.when) {
+      case 'edge':
+        return `<span class="rule-mini" title="edge magnitude threshold 0–1">
+          <span>≥</span>
+          <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="edgeMin"
+            min="0" max="1" step="0.05" value="${r.edgeMin}">
+          <span class="rule-mini-val">${(+r.edgeMin).toFixed(2)}</span>
+        </span>`;
+      case 'tone':
+        return `<span class="rule-mini">
+          <input type="color" class="rule-field rule-color" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="toneColor" value="${r.toneColor}" title="target color (compared by luma)">
+          <span>±</span>
+          <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="toneTol"
+            min="0" max="128" step="1" value="${r.toneTol}" title="tolerance">
+          <span class="rule-mini-val">${r.toneTol}</span>
+        </span>`;
+      case 'detail':
+        return `<span class="rule-mini" title="detail strength">
+          <span>≥</span>
+          <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="detailMin"
+            min="0" max="1" step="0.05" value="${r.detailMin}">
+          <span class="rule-mini-val">${(+r.detailMin).toFixed(2)}</span>
+        </span>`;
+      case 'flat':
+        return `<span class="rule-mini" title="flatness threshold">
+          <span>≤</span>
+          <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="detailMax"
+            min="0" max="1" step="0.05" value="${r.detailMax}">
+          <span class="rule-mini-val">${(+r.detailMax).toFixed(2)}</span>
+        </span>`;
+    }
+    return '';
+  }
+  // Renders the action-side extra controls.
+  function renderRuleActionParams(algoId, r, idx) {
+    let out = `<span class="rule-mini" title="amount">
+      <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="amount"
+        min="0" max="1" step="0.05" value="${r.amount}">
+      <span class="rule-mini-val">${(+r.amount).toFixed(2)}</span>
+    </span>`;
+    if (r.then === 'posterize') {
+      out += `<span class="rule-mini" title="levels">
+        <span>L</span>
+        <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="levels"
+          min="2" max="16" step="1" value="${r.levels}">
+        <span class="rule-mini-val">${r.levels}</span>
+      </span>`;
+    }
+    if (r.then === 'smudge') {
+      out += `<span class="rule-mini" title="smudge radius">
+        <span>R</span>
+        <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="radius"
+          min="1" max="8" step="1" value="${r.radius}">
+        <span class="rule-mini-val">${r.radius}</span>
+      </span>`;
+    }
+    return out;
+  }
+  function renderRuleRow(algoId, r, idx) {
+    normalizeRule(r);
+    const whens = [
+      ['edge',   'if edge is hard'],
+      ['tone',   'if tone is near'],
+      ['detail', 'if in detail area'],
+      ['flat',   'if in flat area']
+    ];
+    const thens = [
+      ['blend',     'blend with source'],
+      ['invert',    'invert (complement)'],
+      ['smudge',    'smudge'],
+      ['boost',     'boost contrast'],
+      ['posterize', 'posterize'],
+      ['darken',    'darken'],
+      ['lighten',   'lighten']
+    ];
+    const whenOpts = whens.map(([v, l]) =>
+      `<option value="${v}" ${r.when === v ? 'selected' : ''}>${l}</option>`).join('');
+    const thenOpts = thens.map(([v, l]) =>
+      `<option value="${v}" ${r.then === v ? 'selected' : ''}>${l}</option>`).join('');
+    return `
+      <div class="rule-row" data-rule-idx="${idx}">
+        <label class="rule-enable" title="Enable / disable this rule">
+          <input type="checkbox" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="enabled" ${r.enabled ? 'checked' : ''}>
+        </label>
+        <select class="rule-field rule-when" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="when">${whenOpts}</select>
+        ${renderRuleCondParams(algoId, r, idx)}
+        <span class="rule-arrow">→</span>
+        <select class="rule-field rule-then" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="then">${thenOpts}</select>
+        ${renderRuleActionParams(algoId, r, idx)}
+        <button class="rule-delete" data-algo="${algoId}" data-rule-idx="${idx}" title="Delete rule">×</button>
+      </div>
+    `;
+  }
+
+  // Rebuild just the rules list for one algo section (after add / delete /
+  // when-change / then-change). Avoids a full section rebuild so focus + open
+  // dropdowns elsewhere in the section aren't disturbed.
+  function rebuildRulesList(section, algoId) {
+    const panel = section.querySelector(`.rules-panel[data-algo="${algoId}"]`);
+    if (!panel) return;
+    const s = state.selectedAlgorithms.find(a => a.id === algoId);
+    if (!s) return;
+    const rules = Array.isArray(s.params.rules) ? s.params.rules : [];
+    const list = panel.querySelector('.rules-list');
+    list.innerHTML = rules.map((r, idx) => renderRuleRow(algoId, r, idx)).join('');
+    // Swap the empty-state banner in/out.
+    let banner = panel.querySelector('.rules-empty');
+    if (rules.length === 0 && !banner) {
+      const msg = document.createElement('div');
+      msg.className = 'rules-empty';
+      msg.textContent = 'No rules yet — click "+ Add Rule" to shape how the algorithm responds to edges, tones, and detail.';
+      panel.appendChild(msg);
+    } else if (rules.length > 0 && banner) {
+      banner.remove();
+    }
+  }
+  // Handle any input/change event inside a rules panel. Routes by
+  // data-rule-field onto the rule object at data-rule-idx.
+  function handleRuleFieldChange(e, section, algoId) {
+    const el = e.target.closest('.rule-field');
+    if (!el) return;
+    const idx = parseInt(el.dataset.ruleIdx, 10);
+    const field = el.dataset.ruleField;
+    const s = state.selectedAlgorithms.find(a => a.id === algoId);
+    if (!s || !Array.isArray(s.params.rules)) return;
+    const r = s.params.rules[idx];
+    if (!r) return;
+    let val;
+    if (el.type === 'checkbox') val = el.checked;
+    else if (el.type === 'number' || el.type === 'range') val = parseFloat(el.value);
+    else val = el.value;
+    r[field] = val;
+    // Keep derived tone-target luma in sync when the color swatch changes.
+    if (field === 'toneColor') r.toneTarget = hexToLuma(val);
+    // when/then changes re-shape the row controls — partial rebuild.
+    if (field === 'when' || field === 'then') {
+      rebuildRulesList(section, algoId);
+    } else {
+      // Sibling mini-val readout (if present).
+      const mv = el.parentElement && el.parentElement.querySelector('.rule-mini-val');
+      if (mv) {
+        if (el.type === 'range' && parseFloat(el.step) < 1) mv.textContent = (+el.value).toFixed(2);
+        else mv.textContent = el.value;
+      }
+    }
+    scheduleProcess();
   }
 
   // DataURL of the thumbnail for a slot spec. Built-ins go through
@@ -1330,18 +1533,17 @@
 
       for (const p of algo.params) {
         if (p.id === 'seed') {
-          // Seed gets a special UI: number input + randomize checkbox
-          const isRandom = !!sel.params._seedRandom;
+          // Seed: number input + a dice button that picks a new random seed
+          // (previously a "Random every render" checkbox — user feedback:
+          // button is clearer and gives them control over when the seed
+          // actually changes).
           html += `
             <div class="param-group seed-group">
               <span class="param-label">${p.label}</span>
               <div class="seed-row">
                 <input type="number" class="seed-input" data-algo="${sel.id}" data-param="seed"
-                  value="${sel.params[p.id]}" min="1" step="1" ${isRandom ? 'disabled' : ''}>
-                <label class="seed-random-label" title="Use a random seed each render">
-                  <input type="checkbox" class="seed-random-check" data-algo="${sel.id}" ${isRandom ? 'checked' : ''}>
-                  <span>Random</span>
-                </label>
+                  value="${sel.params[p.id]}" min="1" step="1">
+                <button class="seed-random-btn" data-algo="${sel.id}" title="Pick a random seed" type="button">🎲 New Seed</button>
               </div>
             </div>
           `;
@@ -1498,6 +1700,25 @@
                   ${renderSlot('edge', 'Edge')}
                 </div>
               </div>
+            </div>
+          `;
+        } else if (p.type === 'rules') {
+          // If/Then rules — user-defined post-pass stylization.
+          // Rules live at sel.params.rules as an array of plain objects; see
+          // applyRules in dither.js for the schema. UI is a stacked list
+          // with an "Add Rule" button and per-row delete.
+          if (!Array.isArray(sel.params[p.id])) sel.params[p.id] = [];
+          const rules = sel.params[p.id];
+          html += `
+            <div class="param-group rules-panel" data-algo="${sel.id}" data-param="${p.id}">
+              <div class="rules-head">
+                <span class="param-label">${p.label}</span>
+                <button class="rules-add" data-algo="${sel.id}" title="Add a rule">+ Add Rule</button>
+              </div>
+              <div class="rules-list" data-algo="${sel.id}">
+                ${rules.map((r, idx) => renderRuleRow(sel.id, r, idx)).join('')}
+              </div>
+              ${rules.length === 0 ? '<div class="rules-empty">No rules yet — click "+ Add Rule" to shape how the algorithm responds to edges, tones, and detail.</div>' : ''}
             </div>
           `;
         } else {
@@ -1764,6 +1985,39 @@
         });
       });
 
+      // ── If/Then RULES wiring ──
+      // Add-rule button: append a fresh default, rebuild the list.
+      section.querySelectorAll('.rules-add').forEach(btn => {
+        btn.addEventListener('click', e => {
+          e.preventDefault();
+          const algoId = btn.dataset.algo;
+          const s = state.selectedAlgorithms.find(a => a.id === algoId);
+          if (!s) return;
+          if (!Array.isArray(s.params.rules)) s.params.rules = [];
+          s.params.rules.push(RULE_DEFAULT());
+          rebuildRulesList(section, algoId);
+          scheduleProcess();
+        });
+      });
+      // Delete button (delegated because rows render dynamically).
+      section.querySelectorAll('.rules-panel').forEach(panel => {
+        const algoId = panel.dataset.algo;
+        panel.addEventListener('click', e => {
+          const del = e.target.closest('.rule-delete');
+          if (!del) return;
+          e.preventDefault();
+          const idx = parseInt(del.dataset.ruleIdx, 10);
+          const s = state.selectedAlgorithms.find(a => a.id === algoId);
+          if (!s || !Array.isArray(s.params.rules)) return;
+          s.params.rules.splice(idx, 1);
+          rebuildRulesList(section, algoId);
+          scheduleProcess();
+        });
+        // Field changes (when/then dropdowns + all rule-field inputs).
+        panel.addEventListener('input', e => handleRuleFieldChange(e, section, algoId));
+        panel.addEventListener('change', e => handleRuleFieldChange(e, section, algoId));
+      });
+
       // Advanced toggle
       section.querySelectorAll('.btn-advanced-toggle').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -1803,23 +2057,20 @@
         });
       });
 
-      section.querySelectorAll('.seed-random-check').forEach(chk => {
-        chk.addEventListener('change', () => {
-          const algoId = chk.dataset.algo;
+      // 🎲 New Seed button — one click picks a fresh random seed, updates
+      // the number input, and triggers a re-render. Replaces the older
+      // "Random every render" checkbox (user feedback: button is clearer).
+      section.querySelectorAll('.seed-random-btn').forEach(btn => {
+        btn.addEventListener('click', e => {
+          e.preventDefault();
+          const algoId = btn.dataset.algo;
           const s = state.selectedAlgorithms.find(a => a.id === algoId);
           const numInput = section.querySelector(`.seed-input[data-algo="${algoId}"]`);
-          if (s) {
-            s.params._seedRandom = chk.checked;
-            if (chk.checked) {
-              const rnd = Math.floor(Math.random() * 999999) + 1;
-              s.params.seed = rnd;
-              numInput.value = rnd;
-              numInput.disabled = true;
-            } else {
-              numInput.disabled = false;
-            }
-            scheduleProcess();
-          }
+          if (!s) return;
+          const rnd = Math.floor(Math.random() * 999999) + 1;
+          s.params.seed = rnd;
+          if (numInput) numInput.value = rnd;
+          scheduleProcess();
         });
       });
     }

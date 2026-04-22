@@ -129,6 +129,22 @@ const DitherAlgorithms = (() => {
     const _detailResp     = (opts.detailResp     != null) ? opts.detailResp     : 1;
     const _angJitU        = (opts.angleJitter    != null) ? opts.angleJitter    : 0.8;
     const _strokeStrength = (opts.strokeStrength != null) ? opts.strokeStrength : 1;
+    // detailPreserve: detail-gated version of washSmoothness. In busy
+    // pixels, blend the raw source back into the wash so subjects stay
+    // sharp while flat areas keep the broad block wash. 0 = pure wash
+    // (legacy), 1 = busy pixels read near-full source.
+    const _detailPreserve = (opts.detailPreserve != null) ? opts.detailPreserve : 0;
+
+    // Build the detail field up front — the wash pass uses it for the
+    // detailPreserve modulation (busy areas bleed source back in) and the
+    // stroke pass uses it downstream for density/size.
+    const dfUp = (_detailPreserve > 0) ? detailField(px, w, h, 8) : null;
+    let _dUpMax = 1;
+    if (dfUp) {
+      const _strideU = Math.max(1, ((w * h) / 2048) | 0);
+      for (let i = 0; i < dfUp.length; i += _strideU) if (dfUp[i] > _dUpMax) _dUpMax = dfUp[i];
+    }
+    const dfUpNorm = 1 / Math.max(8, _dUpMax * 0.6);
 
     // ── Pass 1: tonal wash with NOISE DITHER ──
     // Downsample the source into a coarse grid of block-averages, then
@@ -180,6 +196,14 @@ const DitherAlgorithms = (() => {
         if (_washSmoothness > 0) {
           smooth = smooth * (1 - _washSmoothness) + px[y * w + x] * _washSmoothness;
         }
+        // detailPreserve: bleed the raw source back in DETAIL pixels
+        // (busy) while leaving FLAT pixels as the broad wash. Result:
+        // skies/walls stay loose and gradient-like, subjects stay crisp.
+        if (dfUp) {
+          const d01u = Math.min(1, dfUp[y * w + x] * dfUpNorm);
+          const mixU = d01u * _detailPreserve;
+          if (mixU > 0) smooth = smooth * (1 - mixU) + px[y * w + x] * mixU;
+        }
         const noise = (sh(x, y, 605) - 0.5) * NOISE_AMP * 2;
         const val = smooth + noise;
         o[y * w + x] = val < 0 ? 0 : (val > 255 ? 255 : Math.round(val));
@@ -202,10 +226,14 @@ const DitherAlgorithms = (() => {
     // Both responses inverted against the same per-image soft ceiling so
     // the effect adapts to image character (a flat photo still sees the
     // full range of variation instead of being all-flat).
-    const df = detailField(px, w, h, 8);
+    const df = dfUp || detailField(px, w, h, 8);
     let _dmax = 1;
-    const _stride = Math.max(1, ((w * h) / 2048) | 0);
-    for (let i = 0; i < df.length; i += _stride) if (df[i] > _dmax) _dmax = df[i];
+    if (dfUp) {
+      _dmax = _dUpMax;
+    } else {
+      const _stride = Math.max(1, ((w * h) / 2048) | 0);
+      for (let i = 0; i < df.length; i += _stride) if (df[i] > _dmax) _dmax = df[i];
+    }
     const dNorm = 1 / Math.max(8, _dmax * 0.6);
 
     // Over-scatter candidates, then reject by detail. Keep probability is
@@ -370,6 +398,144 @@ const DitherAlgorithms = (() => {
       }
     }
     return d;
+  }
+
+  // ── If/Then RULES ENGINE ──
+  // A post-pass that walks every pixel and applies user-defined rules of the
+  // form "if <condition> then <action>". Runs after the main stroke pass so
+  // rules can refine/stylize the painted output — e.g. "if edge is hard then
+  // blend with source (0.7)" keeps subject edges crisp without turning off
+  // the painterly strokes elsewhere; "if tone is near #f0c080 then shift to
+  // complement" creates chromatic-aberration-style accents; etc.
+  //
+  // Single-channel pipeline: dither.js runs algorithms on each R/G/B channel
+  // separately, so rules here compare per-channel values rather than whole
+  // RGB triplets. Color pickers in the UI are converted to luminance (Y =
+  // 0.299R + 0.587G + 0.114B) and that luminance is what the "tone near"
+  // condition compares against — gives a reasonable approximation of "this
+  // pixel is near this color" across all three channel passes.
+  //
+  // Conditions: 'edge', 'tone', 'detail', 'flat'
+  // Actions:    'blend', 'invert', 'smudge', 'boost', 'posterize',
+  //             'darken', 'lighten'
+  function applyRules(o, px, w, h, rules, edgeMag, detail, sh) {
+    if (!Array.isArray(rules) || rules.length === 0) return o;
+    const active = [];
+    for (const r of rules) {
+      if (!r || r.enabled === false) continue;
+      if (!r.when || !r.then) continue;
+      active.push(r);
+    }
+    if (active.length === 0) return o;
+
+    // Normalize detail field to 0..1 (same treatment as painterlyUnderpaint).
+    let dNorm = 1;
+    if (detail) {
+      let dMax = 1;
+      const stride = Math.max(1, ((w * h) / 2048) | 0);
+      for (let i = 0; i < detail.length; i += stride) if (detail[i] > dMax) dMax = detail[i];
+      dNorm = 1 / Math.max(8, dMax * 0.6);
+    }
+
+    const total = w * h;
+    // Snapshot for smudge (needs untouched neighbors; otherwise smudge would
+    // compound with itself as we sweep the buffer).
+    let snap = null;
+    for (const r of active) { if (r.then === 'smudge') { snap = new Uint8ClampedArray(o); break; } }
+
+    for (let y = 0; y < h; y++) {
+      const yr = y * w;
+      const ey = Math.min(h - 2, Math.max(1, y));
+      for (let x = 0; x < w; x++) {
+        const i = yr + x;
+        const ex = Math.min(w - 2, Math.max(1, x));
+        const eIdx = ey * w + ex;
+        const em = edgeMag ? edgeMag[eIdx] / 120 : 0;  // normalized to 0..~1
+        const d01 = detail ? Math.min(1, detail[i] * dNorm) : 0;
+
+        for (let ri = 0; ri < active.length; ri++) {
+          const r = active[ri];
+          // Condition
+          let ok = false;
+          switch (r.when) {
+            case 'edge':
+              ok = em >= (r.edgeMin != null ? r.edgeMin : 0.3);
+              break;
+            case 'tone': {
+              const tgt = (r.toneTarget != null) ? r.toneTarget : 128;
+              const tol = (r.toneTol    != null) ? r.toneTol    : 40;
+              ok = Math.abs(o[i] - tgt) <= tol;
+              break;
+            }
+            case 'detail':
+              ok = d01 >= (r.detailMin != null ? r.detailMin : 0.4);
+              break;
+            case 'flat':
+              ok = d01 <= (r.detailMax != null ? r.detailMax : 0.25);
+              break;
+            default:
+              ok = false;
+          }
+          if (!ok) continue;
+
+          // Action
+          const amt = (r.amount != null) ? r.amount : 0.5;
+          const v = o[i];
+          let nv = v;
+          switch (r.then) {
+            case 'blend': {
+              // Blend output toward source — restores subject detail.
+              nv = Math.round(v * (1 - amt) + px[i] * amt);
+              break;
+            }
+            case 'invert':
+              nv = 255 - v;
+              if (amt < 1) nv = Math.round(v * (1 - amt) + nv * amt);
+              break;
+            case 'smudge': {
+              // Swap with a nearby pixel from the untouched snapshot.
+              const radius = Math.max(1, Math.round((r.radius != null ? r.radius : 2)));
+              const jx = Math.round((sh(x, y, 401) - 0.5) * 2 * radius);
+              const jy = Math.round((sh(x, y, 402) - 0.5) * 2 * radius);
+              const nx = Math.max(0, Math.min(w - 1, x + jx));
+              const ny = Math.max(0, Math.min(h - 1, y + jy));
+              const nVal = snap[ny * w + nx];
+              nv = Math.round(v * (1 - amt) + nVal * amt);
+              break;
+            }
+            case 'boost': {
+              // Push away from midtone 128; amt∈[0,1] maps to ~1 + amt*1.5× contrast.
+              const k = 1 + amt * 1.5;
+              const shifted = 128 + (v - 128) * k;
+              nv = shifted < 0 ? 0 : (shifted > 255 ? 255 : Math.round(shifted));
+              break;
+            }
+            case 'posterize': {
+              const lvl = Math.max(2, Math.min(16, r.levels != null ? r.levels : 4));
+              const step = 255 / (lvl - 1);
+              const q = Math.round(v / step) * step;
+              nv = q < 0 ? 0 : (q > 255 ? 255 : Math.round(q));
+              if (amt < 1) nv = Math.round(v * (1 - amt) + nv * amt);
+              break;
+            }
+            case 'darken': {
+              const shift = amt * 80;
+              const s = v - shift;
+              nv = s < 0 ? 0 : Math.round(s);
+              break;
+            }
+            case 'lighten': {
+              const shift = amt * 80;
+              const s = v + shift;
+              nv = s > 255 ? 255 : Math.round(s);
+              break;
+            }
+          }
+          o[i] = nv;
+        }
+      }
+    }
+    return o;
   }
 
   const A = [];
@@ -1661,6 +1827,8 @@ const DitherAlgorithms = (() => {
     {id:'underpaintAngle',label:'Underpaint Angle Jitter',min:0,max:1.5,step:.05,default:.8},
     {id:'underpaintStrength',label:'Underpaint Stroke Strength',min:0,max:1,step:.05,default:1,
      hint:'0 = wash only · 1 = hard painterly strokes'},
+    {id:'underpaintDetailPreserve',label:'Underpaint Subject Detail',min:0,max:1,step:.05,default:.5,
+     hint:'0 = broad wash everywhere · 1 = busy areas reveal source sharply'},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.8,
@@ -1744,6 +1912,9 @@ const DitherAlgorithms = (() => {
       high:   { source:'builtin', builtin:'5', brushId:'', sizeMul:0.7, angleJitter:0.6, opacity:0.85 },
       edge:   { source:'builtin', builtin:'6', brushId:'', sizeMul:0.9, angleJitter:0.1, opacity:1.0 }
     }},
+    // — If/Then Rules —
+    // User-defined post-pass rules. See `applyRules` for conditions/actions.
+    {id:'rules',label:'If/Then Rules',type:'rules',default:[]},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
   ], apply(px,w,h,p) {
     // Sync drain: runs the generator to completion with no yields. Zero
@@ -1943,7 +2114,8 @@ const DitherAlgorithms = (() => {
         sizeMul:        (p.underpaintSize       != null) ? p.underpaintSize       : 1,
         detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
         angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
-        strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1
+        strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1,
+        detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
       };
       painterlyUnderpaint(o, px, w, h, underpaintBlock, sh, edgeAng, bMask, bSize, _upOpts);
     } else {
@@ -2376,6 +2548,14 @@ const DitherAlgorithms = (() => {
         }
         if ((y & 31) === 0) yield o;
       }
+    }
+
+    // — Post-pass: USER IF/THEN RULES —
+    // Applied last so rules see the fully-rendered image (including wet
+    // bleed). Skipped when no rules are defined — zero overhead.
+    if (Array.isArray(p.rules) && p.rules.length > 0) {
+      applyRules(o, px, w, h, p.rules, edgeMag, detail, sh);
+      yield o;
     }
 
     return o;
@@ -5720,6 +5900,8 @@ const DitherAlgorithms = (() => {
     {id:'underpaintAngle',label:'Underpaint Angle Jitter',min:0,max:1.5,step:.05,default:.8},
     {id:'underpaintStrength',label:'Underpaint Stroke Strength',min:0,max:1,step:.05,default:1,
      hint:'0 = wash only · 1 = hard painterly strokes'},
+    {id:'underpaintDetailPreserve',label:'Underpaint Subject Detail',min:0,max:1,step:.05,default:.5,
+     hint:'0 = broad wash everywhere · 1 = busy areas reveal source sharply'},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.7,
@@ -5782,6 +5964,8 @@ const DitherAlgorithms = (() => {
       high:   { source:'builtin', builtin:'5', brushId:'', sizeMul:0.6, angleJitter:0.8, opacity:0.8 },
       edge:   { source:'builtin', builtin:'6', brushId:'', sizeMul:1.1, angleJitter:0.1, opacity:1.0 }
     }},
+    // — If/Then Rules —
+    {id:'rules',label:'If/Then Rules',type:'rules',default:[]},
     {id:'bgTone',label:'Background Tone',min:0,max:255,step:1,default:255},
     {id:'softness',label:'Dab Softness',min:0,max:1,step:.05,default:.4},
     {id:'seed',label:'Seed',min:1,max:999,step:1,default:42}
@@ -5887,7 +6071,8 @@ const DitherAlgorithms = (() => {
         sizeMul:        (p.underpaintSize       != null) ? p.underpaintSize       : 1,
         detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
         angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
-        strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1
+        strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1,
+        detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
       };
       painterlyUnderpaint(o, px, w, h, underpaintBlock, shUnder, edgeAngUp, _upMask, _upSize, _upOpts);
     } else {
@@ -6307,6 +6492,12 @@ const DitherAlgorithms = (() => {
           o[yr + x] = tmp[ny * w + nx];
         }
       }
+    }
+
+    // — Post-pass: USER IF/THEN RULES —
+    if (Array.isArray(p.rules) && p.rules.length > 0) {
+      applyRules(o, px, w, h, p.rules, edgeMag, detail, sh);
+      yield o;
     }
 
     return o;

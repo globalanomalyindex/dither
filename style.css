@@ -494,6 +494,111 @@ button:focus-visible { outline: none; box-shadow: var(--shadow-glow); }
 
 .seed-random-label input:checked + span { color: var(--fun); }
 
+/* 🎲 Seed button — replaces the older "Random every render" checkbox */
+.seed-random-btn {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.1s, border-color 0.1s;
+}
+.seed-random-btn:hover { border-color: var(--fun); background: var(--bg-hover, var(--bg-elev)); }
+.seed-random-btn:active { transform: translateY(1px); }
+
+/* ── If/Then Rules panel ── */
+.rules-panel {
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+}
+.rules-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.rules-add {
+  background: var(--fun);
+  color: #fff;
+  border: none;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.rules-add:hover { filter: brightness(1.1); }
+.rules-empty {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 8px 4px;
+  font-style: italic;
+}
+.rules-list { display: flex; flex-direction: column; gap: 6px; }
+.rule-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  background: var(--bg, #111);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 6px;
+  font-size: 11px;
+}
+.rule-row select {
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.rule-row .rule-arrow { color: var(--fun); font-weight: 700; }
+.rule-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+}
+.rule-mini input[type=range] { width: 60px; }
+.rule-mini-val {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  min-width: 22px;
+  text-align: right;
+}
+.rule-color {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 0;
+  background: none;
+}
+.rule-enable input { cursor: pointer; }
+.rule-delete {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  width: 22px;
+  height: 22px;
+  line-height: 20px;
+  padding: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.rule-delete:hover { border-color: #d55; color: #d55; }
+
 /* ── Algorithm Categories ── */
 .algo-category { margin-bottom: 6px; }
 
