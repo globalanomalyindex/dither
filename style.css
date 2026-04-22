@@ -561,6 +561,8 @@ button:focus-visible { outline: none; box-shadow: var(--shadow-glow); }
   cursor: pointer;
 }
 .rule-row .rule-arrow { color: var(--fun); font-weight: 700; }
+.rule-row .rule-kw { opacity: 0.55; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; padding: 0 2px; }
+.rule-row .rule-state, .rule-row .rule-modifier { min-width: 88px; }
 .rule-mini {
   display: inline-flex;
   align-items: center;

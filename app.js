@@ -506,49 +506,87 @@
     const b = parseInt(h.slice(4, 6), 16);
     return Math.round(0.299 * r + 0.587 * g + 0.114 * b);
   }
-  // Re-hydrate rule-as-hex-and-tolerance → rule-as-toneTarget number.
-  // Also coerces missing fields to safe defaults in-place.
+  // Valid (subject → state) and (action → modifier) combinations. These drive
+  // the contextual second dropdowns in the UI and the normalizeRule migration
+  // for any rule whose saved state/modifier is incompatible with its subject/verb.
+  const SUBJECT_STATES = {
+    edge:   [['hard', 'hard'], ['soft', 'soft']],
+    tone:   [['dark', 'dark'], ['light', 'light'], ['mid', 'mid'], ['near', 'near color']],
+    detail: [['busy', 'busy'], ['moderate', 'moderate'], ['flat', 'flat']]
+  };
+  const ACTION_MODIFIERS = {
+    blend:  [['source', 'source'], ['color', 'color'], ['black', 'black'], ['white', 'white']],
+    smudge: [['random', 'random'], ['edge-along', 'along edge'], ['edge-across', 'across edge']],
+    paint:  [['color', 'color']],
+    bleed:  [['along-edge', 'along edge']],
+    // verbs with no modifier
+    invert: null, boost: null, posterize: null, darken: null, lighten: null
+  };
+  // Coerces rules to the two-dropdown schema in-place. Also migrates legacy
+  // fields (edgeMin → edgeThresh; detailMin/detailMax → detailThresh+state;
+  // top-level 'flat' when → when='detail', state='flat').
   function normalizeRule(r) {
     if (!r || typeof r !== 'object') return;
     if (r.enabled === undefined) r.enabled = true;
-    if (!r.when) r.when = 'edge';
-    if (!r.then) r.then = 'blend';
+    // Legacy: top-level 'flat' when → detail/flat
+    if (r.when === 'flat') { r.when = 'detail'; r.state = 'flat'; if (r.detailMax != null && r.detailThresh == null) r.detailThresh = r.detailMax; }
+    if (!SUBJECT_STATES[r.when]) r.when = 'edge';
+    // State — default first valid option for this subject if missing/incompatible.
+    const validStates = SUBJECT_STATES[r.when].map(([v]) => v);
+    if (!r.state || !validStates.includes(r.state)) r.state = validStates[0];
+    // Action.
+    if (!(r.then in ACTION_MODIFIERS)) r.then = 'blend';
+    const modSpec = ACTION_MODIFIERS[r.then];
+    if (modSpec) {
+      const validMods = modSpec.map(([v]) => v);
+      if (!r.modifier || !validMods.includes(r.modifier)) r.modifier = validMods[0];
+    } else {
+      r.modifier = null;
+    }
+    // Thresholds & modifiers — safe defaults.
     if (r.amount == null) r.amount = 0.5;
-    if (r.edgeMin == null) r.edgeMin = 0.3;
-    if (r.detailMin == null) r.detailMin = 0.4;
-    if (r.detailMax == null) r.detailMax = 0.25;
-    if (r.toneColor == null) r.toneColor = '#808080';
+    if (r.edgeThresh == null) r.edgeThresh = (r.edgeMin != null ? r.edgeMin : 0.3);
+    if (r.detailThresh == null) {
+      r.detailThresh = (r.detailMin != null ? r.detailMin : (r.detailMax != null ? r.detailMax : 0.35));
+    }
+    if (r.toneThresh == null) r.toneThresh = 128;
     if (r.toneTol == null) r.toneTol = 40;
+    if (r.toneColor == null) r.toneColor = '#808080';
+    if (r.modColor == null) r.modColor = '#c04030';
     if (r.levels == null) r.levels = 4;
     if (r.radius == null) r.radius = 2;
-    // Derived: toneTarget is what applyRules reads.
+    // Derived luma values (what dither.js reads per-channel).
     r.toneTarget = hexToLuma(r.toneColor);
+    r.modColorLuma = hexToLuma(r.modColor);
   }
   const RULE_DEFAULT = () => ({
     enabled: true,
-    when: 'edge',
-    then: 'blend',
+    when: 'edge', state: 'hard',
+    then: 'blend', modifier: 'source',
     amount: 0.5,
-    edgeMin: 0.3,
-    detailMin: 0.4,
-    detailMax: 0.25,
-    toneColor: '#808080',
-    toneTarget: 128,
+    edgeThresh: 0.3,
+    detailThresh: 0.35,
+    toneThresh: 128,
     toneTol: 40,
-    levels: 4,
-    radius: 2
+    toneColor: '#808080', toneTarget: 128,
+    modColor: '#c04030', modColorLuma: 90,
+    levels: 4, radius: 2
   });
-  // Small helper — renders the condition-side extra controls.
+  // Condition-side contextual controls: threshold slider appropriate for the
+  // subject+state combo. The subject+state dropdowns themselves are emitted
+  // in renderRuleRow.
   function renderRuleCondParams(algoId, r, idx) {
-    switch (r.when) {
-      case 'edge':
-        return `<span class="rule-mini" title="edge magnitude threshold 0–1">
-          <span>≥</span>
-          <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="edgeMin"
-            min="0" max="1" step="0.05" value="${r.edgeMin}">
-          <span class="rule-mini-val">${(+r.edgeMin).toFixed(2)}</span>
-        </span>`;
-      case 'tone':
+    const mini = (field, min, max, step, val, title, label) =>
+      `<span class="rule-mini" title="${title}">${label ? `<span>${label}</span>` : ''}
+        <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="${field}"
+          min="${min}" max="${max}" step="${step}" value="${val}">
+        <span class="rule-mini-val">${(step < 1 ? (+val).toFixed(2) : val)}</span>
+      </span>`;
+    if (r.when === 'edge') {
+      return mini('edgeThresh', 0, 1, 0.05, r.edgeThresh, 'edge magnitude threshold', r.state === 'soft' ? '<' : '≥');
+    }
+    if (r.when === 'tone') {
+      if (r.state === 'near') {
         return `<span class="rule-mini">
           <input type="color" class="rule-field rule-color" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="toneColor" value="${r.toneColor}" title="target color (compared by luma)">
           <span>±</span>
@@ -556,24 +594,22 @@
             min="0" max="128" step="1" value="${r.toneTol}" title="tolerance">
           <span class="rule-mini-val">${r.toneTol}</span>
         </span>`;
-      case 'detail':
-        return `<span class="rule-mini" title="detail strength">
-          <span>≥</span>
-          <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="detailMin"
-            min="0" max="1" step="0.05" value="${r.detailMin}">
-          <span class="rule-mini-val">${(+r.detailMin).toFixed(2)}</span>
-        </span>`;
-      case 'flat':
-        return `<span class="rule-mini" title="flatness threshold">
-          <span>≤</span>
-          <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="detailMax"
-            min="0" max="1" step="0.05" value="${r.detailMax}">
-          <span class="rule-mini-val">${(+r.detailMax).toFixed(2)}</span>
-        </span>`;
+      }
+      if (r.state === 'mid') {
+        return mini('toneThresh', 0, 255, 1, r.toneThresh, 'midtone center', '~') +
+          mini('toneTol', 0, 128, 1, r.toneTol, 'midtone tolerance', '±');
+      }
+      return mini('toneThresh', 0, 255, 1, r.toneThresh, 'tone threshold', r.state === 'dark' ? '≤' : '≥');
+    }
+    if (r.when === 'detail') {
+      const sym = r.state === 'busy' ? '≥' : (r.state === 'flat' ? '≤' : '≈');
+      return mini('detailThresh', 0, 1, 0.05, r.detailThresh, 'detail threshold', sym);
     }
     return '';
   }
-  // Renders the action-side extra controls.
+  // Action-side contextual controls: amount is always shown; posterize adds
+  // levels; smudge/bleed add radius. The verb + modifier dropdowns themselves
+  // are emitted in renderRuleRow.
   function renderRuleActionParams(algoId, r, idx) {
     let out = `<span class="rule-mini" title="amount">
       <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="amount"
@@ -588,46 +624,63 @@
         <span class="rule-mini-val">${r.levels}</span>
       </span>`;
     }
-    if (r.then === 'smudge') {
-      out += `<span class="rule-mini" title="smudge radius">
+    if (r.then === 'smudge' || r.then === 'bleed') {
+      out += `<span class="rule-mini" title="radius">
         <span>R</span>
         <input type="range" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="radius"
           min="1" max="8" step="1" value="${r.radius}">
         <span class="rule-mini-val">${r.radius}</span>
       </span>`;
     }
+    // Blend-with-color / paint color swatches.
+    if ((r.then === 'blend' && r.modifier === 'color') || r.then === 'paint') {
+      out += `<span class="rule-mini" title="color (compared/applied by luma)">
+        <input type="color" class="rule-field rule-color" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="modColor" value="${r.modColor}">
+      </span>`;
+    }
     return out;
   }
   function renderRuleRow(algoId, r, idx) {
     normalizeRule(r);
-    const whens = [
-      ['edge',   'if edge is hard'],
-      ['tone',   'if tone is near'],
-      ['detail', 'if in detail area'],
-      ['flat',   'if in flat area']
-    ];
-    const thens = [
-      ['blend',     'blend with source'],
-      ['invert',    'invert (complement)'],
-      ['smudge',    'smudge'],
-      ['boost',     'boost contrast'],
-      ['posterize', 'posterize'],
-      ['darken',    'darken'],
-      ['lighten',   'lighten']
-    ];
-    const whenOpts = whens.map(([v, l]) =>
+    // Subject / state dropdowns
+    const subjects = [['edge', 'edge'], ['tone', 'tone'], ['detail', 'detail']];
+    const subjOpts = subjects.map(([v, l]) =>
       `<option value="${v}" ${r.when === v ? 'selected' : ''}>${l}</option>`).join('');
-    const thenOpts = thens.map(([v, l]) =>
+    const stateOpts = SUBJECT_STATES[r.when].map(([v, l]) =>
+      `<option value="${v}" ${r.state === v ? 'selected' : ''}>${l}</option>`).join('');
+    // Verb / modifier dropdowns
+    const verbs = [
+      ['blend', 'blend'],
+      ['smudge', 'smudge'],
+      ['paint', 'paint'],
+      ['bleed', 'bleed'],
+      ['invert', 'invert'],
+      ['boost', 'boost'],
+      ['posterize', 'posterize'],
+      ['darken', 'darken'],
+      ['lighten', 'lighten']
+    ];
+    const verbOpts = verbs.map(([v, l]) =>
       `<option value="${v}" ${r.then === v ? 'selected' : ''}>${l}</option>`).join('');
+    const modSpec = ACTION_MODIFIERS[r.then];
+    const modSelect = modSpec
+      ? `<select class="rule-field rule-modifier" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="modifier">${
+          modSpec.map(([v, l]) => `<option value="${v}" ${r.modifier === v ? 'selected' : ''}>${l}</option>`).join('')
+        }</select>`
+      : '';
     return `
       <div class="rule-row" data-rule-idx="${idx}">
         <label class="rule-enable" title="Enable / disable this rule">
           <input type="checkbox" class="rule-field" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="enabled" ${r.enabled ? 'checked' : ''}>
         </label>
-        <select class="rule-field rule-when" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="when">${whenOpts}</select>
+        <span class="rule-kw">if</span>
+        <select class="rule-field rule-when" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="when">${subjOpts}</select>
+        <span class="rule-kw">is</span>
+        <select class="rule-field rule-state" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="state">${stateOpts}</select>
         ${renderRuleCondParams(algoId, r, idx)}
         <span class="rule-arrow">→</span>
-        <select class="rule-field rule-then" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="then">${thenOpts}</select>
+        <select class="rule-field rule-then" data-algo="${algoId}" data-rule-idx="${idx}" data-rule-field="then">${verbOpts}</select>
+        ${modSelect}
         ${renderRuleActionParams(algoId, r, idx)}
         <button class="rule-delete" data-algo="${algoId}" data-rule-idx="${idx}" title="Delete rule">×</button>
       </div>
@@ -672,10 +725,14 @@
     else if (el.type === 'number' || el.type === 'range') val = parseFloat(el.value);
     else val = el.value;
     r[field] = val;
-    // Keep derived tone-target luma in sync when the color swatch changes.
+    // Keep derived luma values in sync when color swatches change.
     if (field === 'toneColor') r.toneTarget = hexToLuma(val);
-    // when/then changes re-shape the row controls — partial rebuild.
-    if (field === 'when' || field === 'then') {
+    if (field === 'modColor')  r.modColorLuma = hexToLuma(val);
+    // Subject/verb/state/modifier changes can re-shape the row — partial rebuild.
+    if (field === 'when' || field === 'then' || field === 'state' || field === 'modifier') {
+      // When subject changes, state may become invalid — let normalizeRule fix it.
+      if (field === 'when') r.state = null;
+      if (field === 'then') r.modifier = null;
       rebuildRulesList(section, algoId);
     } else {
       // Sibling mini-val readout (if present).

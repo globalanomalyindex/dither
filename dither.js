@@ -251,14 +251,22 @@ const DitherAlgorithms = (() => {
     // between flat-area sparsity and busy-area density is ~2× stronger.
     // KEEP_MIN floor keeps some strokes everywhere so flat regions aren't
     // entirely barren.
-    const _baseMin = 0.28, _baseRange = 0.72;
-    const KEEP_MIN = 0.28 + (_baseMin - 0.28) * 0;  // fixed floor
-    // Shift the *center* of the response toward uniformity as detailResp → 0.
-    // At detailResp=1: floor 0.28, range 0.72 (legacy).
-    // At detailResp=0: floor 0.78, range 0.22 (mostly uniform).
-    // At detailResp=2: floor 0.08, range 0.92 (strong contrast).
-    const _respFloor = 0.28 + 0.5 * (1 - Math.min(1, _detailResp));
-    const _respRange = Math.max(0.05, 0.72 * _detailResp);
+    // detailPreserve now participates in the density + size response so
+    // the user-facing "Subject Detail" slider is the master knob for
+    // detail-aware behaviour across the whole underpaint: high values
+    // give both more source-bleed in busy areas AND smaller, more
+    // precise strokes there, with bigger/looser strokes in flat areas.
+    // detailResp is the legacy "response curve" knob — detailPreserve
+    // stacks multiplicatively on top of it so crank=1 nearly doubles
+    // the effective contrast.
+    const _effDetailResp = _detailResp * (1 + _detailPreserve * 1.3);
+    // Shift the *center* of the density response toward uniformity as
+    // effDetailResp → 0.
+    // At effDetailResp=1: floor 0.28, range 0.72 (legacy).
+    // At effDetailResp=0: floor ~0.78, range ~0.22 (mostly uniform).
+    // At effDetailResp=2: floor ~0.08, range ~0.92 (strong contrast).
+    const _respFloor = 0.28 + 0.5 * (1 - Math.min(1, _effDetailResp));
+    const _respRange = Math.max(0.05, 0.72 * _effDetailResp);
     const _KEEP_MIN2  = Math.max(0.05, Math.min(0.95, _respFloor));
     const _KEEP_RANGE2= Math.max(0.05, Math.min(1 - _KEEP_MIN2, _respRange));
 
@@ -276,12 +284,15 @@ const DitherAlgorithms = (() => {
       const eIdx = Math.min(h - 2, Math.max(1, cy)) * w + Math.min(w - 2, Math.max(1, cx));
       const ang = edgeAng[eIdx] + Math.PI * 0.5 + (sh(i, 0, 702) - 0.5) * _angJitU;
       const ca = Math.cos(ang), sa = Math.sin(ang);
-      // Detail-based size multiplier: smooth → 1.55×, very busy → 0.55×.
-      // detailResp scales the detail-driven swing around neutral 1.05. At
-      // detailResp=0 every stroke is the same size; at 2 the flat/busy
-      // contrast roughly doubles.
+      // Detail-based size multiplier. detailResp + detailPreserve together
+      // drive the swing so the user-facing "Subject Detail" slider
+      // visibly shrinks strokes on busy pixels AND enlarges them on flat
+      // pixels. The extra detailPreserve term means cranking Subject
+      // Detail to 1 roughly doubles the size contrast on top of whatever
+      // detailResp provides — stripes of tiny precise strokes on faces,
+      // broad lazy strokes on skies.
       const _swingBase = 0.5;  // half-range around mid
-      const _swing = _swingBase * _detailResp;
+      const _swing = _swingBase * _effDetailResp;
       const sizeMul = (1.05 + _swing) - d01 * (2 * _swing);
       const rLen = strokeL * 0.5 * (0.65 + sh(i, 0, 703) * 0.75) * sizeMul;
       const rWid = strokeW * 0.5 * (0.55 + sh(i, 0, 704) * 0.55) * sizeMul;
@@ -401,24 +412,34 @@ const DitherAlgorithms = (() => {
   }
 
   // ── If/Then RULES ENGINE ──
-  // A post-pass that walks every pixel and applies user-defined rules of the
-  // form "if <condition> then <action>". Runs after the main stroke pass so
-  // rules can refine/stylize the painted output — e.g. "if edge is hard then
-  // blend with source (0.7)" keeps subject edges crisp without turning off
-  // the painterly strokes elsewhere; "if tone is near #f0c080 then shift to
-  // complement" creates chromatic-aberration-style accents; etc.
+  // A post-pass that walks every pixel and applies user-defined rules shaped
+  // as "if <SUBJECT> is <STATE> → <VERB> [MODIFIER]". The two-dropdown pair
+  // on each side keeps the mental model clean — users first pick the domain
+  // (edge/tone/detail), then the predicate within that domain (hard/soft,
+  // dark/light/mid/near, busy/moderate/flat).
   //
   // Single-channel pipeline: dither.js runs algorithms on each R/G/B channel
-  // separately, so rules here compare per-channel values rather than whole
-  // RGB triplets. Color pickers in the UI are converted to luminance (Y =
-  // 0.299R + 0.587G + 0.114B) and that luminance is what the "tone near"
-  // condition compares against — gives a reasonable approximation of "this
-  // pixel is near this color" across all three channel passes.
+  // separately, so rules here compare per-channel values. Color pickers in
+  // the UI are converted to luminance (Y = 0.299R + 0.587G + 0.114B) and
+  // that luma is what tone-near / paint-with-color / blend-with-color use —
+  // gives a reasonable approximation of "this pixel is near that color"
+  // across all three channel passes without tripping over per-channel
+  // mismatches.
   //
-  // Conditions: 'edge', 'tone', 'detail', 'flat'
-  // Actions:    'blend', 'invert', 'smudge', 'boost', 'posterize',
-  //             'darken', 'lighten'
-  function applyRules(o, px, w, h, rules, edgeMag, detail, sh) {
+  // Two-dropdown schema: if [SUBJECT] is [STATE] → then [ACTION] [MODIFIER].
+  //
+  // Conditions (subject → state):
+  //   edge    → hard | soft                    (thr: edgeThresh 0..1)
+  //   tone    → dark | light | mid | near      (thr: toneThresh 0..255 ; near uses toneTarget + toneTol)
+  //   detail  → busy | moderate | flat         (thr: detailThresh 0..1)
+  //
+  // Actions (paint-engine flavored):
+  //   blend  with:  source | color | black | white     (amount)
+  //   smudge toward: random | edge-along | edge-across (amount, radius)
+  //   paint  color                                      (amount — uses modColor)
+  //   bleed  along-edge                                 (amount, radius — directional smear)
+  //   invert | boost | darken | lighten | posterize     (amount [+ levels])
+  function applyRules(o, px, w, h, rules, edgeMag, edgeAng, detail, sh) {
     if (!Array.isArray(rules) || rules.length === 0) return o;
     const active = [];
     for (const r of rules) {
@@ -437,11 +458,12 @@ const DitherAlgorithms = (() => {
       dNorm = 1 / Math.max(8, dMax * 0.6);
     }
 
-    const total = w * h;
-    // Snapshot for smudge (needs untouched neighbors; otherwise smudge would
-    // compound with itself as we sweep the buffer).
+    // Snapshot for smudge/bleed (needs untouched neighbors; otherwise the op
+    // would compound with itself as we sweep the buffer).
     let snap = null;
-    for (const r of active) { if (r.then === 'smudge') { snap = new Uint8ClampedArray(o); break; } }
+    for (const r of active) {
+      if (r.then === 'smudge' || r.then === 'bleed') { snap = new Uint8ClampedArray(o); break; }
+    }
 
     for (let y = 0; y < h; y++) {
       const yr = y * w;
@@ -450,61 +472,114 @@ const DitherAlgorithms = (() => {
         const i = yr + x;
         const ex = Math.min(w - 2, Math.max(1, x));
         const eIdx = ey * w + ex;
-        const em = edgeMag ? edgeMag[eIdx] / 120 : 0;  // normalized to 0..~1
+        const em = edgeMag ? edgeMag[eIdx] / 120 : 0;    // 0..~1
+        const eA = edgeAng ? edgeAng[eIdx] : 0;
         const d01 = detail ? Math.min(1, detail[i] * dNorm) : 0;
 
         for (let ri = 0; ri < active.length; ri++) {
           const r = active[ri];
-          // Condition
+          // ── Condition: subject + state ──
           let ok = false;
           switch (r.when) {
-            case 'edge':
-              ok = em >= (r.edgeMin != null ? r.edgeMin : 0.3);
-              break;
-            case 'tone': {
-              const tgt = (r.toneTarget != null) ? r.toneTarget : 128;
-              const tol = (r.toneTol    != null) ? r.toneTol    : 40;
-              ok = Math.abs(o[i] - tgt) <= tol;
+            case 'edge': {
+              const thr = (r.edgeThresh != null) ? r.edgeThresh : 0.3;
+              ok = (r.state === 'soft') ? (em < thr) : (em >= thr);
               break;
             }
-            case 'detail':
-              ok = d01 >= (r.detailMin != null ? r.detailMin : 0.4);
+            case 'tone': {
+              const v0 = o[i];
+              const st = r.state || 'mid';
+              if (st === 'near') {
+                const tgt = (r.toneTarget != null) ? r.toneTarget : 128;
+                const tol = (r.toneTol    != null) ? r.toneTol    : 40;
+                ok = Math.abs(v0 - tgt) <= tol;
+              } else if (st === 'dark') {
+                const thr = (r.toneThresh != null) ? r.toneThresh : 96;
+                ok = v0 <= thr;
+              } else if (st === 'light') {
+                const thr = (r.toneThresh != null) ? r.toneThresh : 160;
+                ok = v0 >= thr;
+              } else { // mid
+                const thr = (r.toneThresh != null) ? r.toneThresh : 128;
+                const tol = (r.toneTol != null) ? r.toneTol : 40;
+                ok = Math.abs(v0 - thr) <= tol;
+              }
               break;
-            case 'flat':
-              ok = d01 <= (r.detailMax != null ? r.detailMax : 0.25);
+            }
+            case 'detail': {
+              const thr = (r.detailThresh != null) ? r.detailThresh : 0.35;
+              const st = r.state || 'busy';
+              if (st === 'busy') ok = d01 >= thr;
+              else if (st === 'flat') ok = d01 <= thr;
+              else { // moderate — within a band around thr
+                ok = Math.abs(d01 - thr) <= 0.15;
+              }
               break;
-            default:
-              ok = false;
+            }
+            default: ok = false;
           }
           if (!ok) continue;
 
-          // Action
+          // ── Action: verb + modifier ──
           const amt = (r.amount != null) ? r.amount : 0.5;
           const v = o[i];
           let nv = v;
           switch (r.then) {
             case 'blend': {
-              // Blend output toward source — restores subject detail.
-              nv = Math.round(v * (1 - amt) + px[i] * amt);
+              const m = r.modifier || 'source';
+              let tgt = px[i];
+              if (m === 'color')      tgt = (r.modColorLuma != null) ? r.modColorLuma : 128;
+              else if (m === 'black') tgt = 0;
+              else if (m === 'white') tgt = 255;
+              nv = Math.round(v * (1 - amt) + tgt * amt);
               break;
             }
-            case 'invert':
-              nv = 255 - v;
-              if (amt < 1) nv = Math.round(v * (1 - amt) + nv * amt);
+            case 'paint': {
+              const tgt = (r.modColorLuma != null) ? r.modColorLuma : 128;
+              nv = Math.round(v * (1 - amt) + tgt * amt);
               break;
+            }
             case 'smudge': {
-              // Swap with a nearby pixel from the untouched snapshot.
               const radius = Math.max(1, Math.round((r.radius != null ? r.radius : 2)));
-              const jx = Math.round((sh(x, y, 401) - 0.5) * 2 * radius);
-              const jy = Math.round((sh(x, y, 402) - 0.5) * 2 * radius);
+              const m = r.modifier || 'random';
+              let jx, jy;
+              if (m === 'edge-along') {
+                // Walk along the edge tangent (perpendicular to gradient).
+                const t = (sh(x, y, 401) - 0.5) * 2 * radius;
+                jx = Math.round(Math.cos(eA + Math.PI * 0.5) * t);
+                jy = Math.round(Math.sin(eA + Math.PI * 0.5) * t);
+              } else if (m === 'edge-across') {
+                // Across the edge (along gradient).
+                const t = (sh(x, y, 401) - 0.5) * 2 * radius;
+                jx = Math.round(Math.cos(eA) * t);
+                jy = Math.round(Math.sin(eA) * t);
+              } else {
+                jx = Math.round((sh(x, y, 401) - 0.5) * 2 * radius);
+                jy = Math.round((sh(x, y, 402) - 0.5) * 2 * radius);
+              }
               const nx = Math.max(0, Math.min(w - 1, x + jx));
               const ny = Math.max(0, Math.min(h - 1, y + jy));
               const nVal = snap[ny * w + nx];
               nv = Math.round(v * (1 - amt) + nVal * amt);
               break;
             }
+            case 'bleed': {
+              // Directional pull along the edge tangent — a paint-engine wet-bleed.
+              const radius = Math.max(1, Math.round((r.radius != null ? r.radius : 3)));
+              const t = sh(x, y, 403) * radius;  // 0..radius (single-sided pull)
+              const jx = Math.round(Math.cos(eA + Math.PI * 0.5) * t);
+              const jy = Math.round(Math.sin(eA + Math.PI * 0.5) * t);
+              const nx = Math.max(0, Math.min(w - 1, x + jx));
+              const ny = Math.max(0, Math.min(h - 1, y + jy));
+              const nVal = snap[ny * w + nx];
+              nv = Math.round(v * (1 - amt) + nVal * amt);
+              break;
+            }
+            case 'invert':
+              nv = 255 - v;
+              if (amt < 1) nv = Math.round(v * (1 - amt) + nv * amt);
+              break;
             case 'boost': {
-              // Push away from midtone 128; amt∈[0,1] maps to ~1 + amt*1.5× contrast.
               const k = 1 + amt * 1.5;
               const shifted = 128 + (v - 128) * k;
               nv = shifted < 0 ? 0 : (shifted > 255 ? 255 : Math.round(shifted));
@@ -519,14 +594,12 @@ const DitherAlgorithms = (() => {
               break;
             }
             case 'darken': {
-              const shift = amt * 80;
-              const s = v - shift;
+              const s = v - amt * 80;
               nv = s < 0 ? 0 : Math.round(s);
               break;
             }
             case 'lighten': {
-              const shift = amt * 80;
-              const s = v + shift;
+              const s = v + amt * 80;
               nv = s > 255 ? 255 : Math.round(s);
               break;
             }
@@ -2554,7 +2627,7 @@ const DitherAlgorithms = (() => {
     // Applied last so rules see the fully-rendered image (including wet
     // bleed). Skipped when no rules are defined — zero overhead.
     if (Array.isArray(p.rules) && p.rules.length > 0) {
-      applyRules(o, px, w, h, p.rules, edgeMag, detail, sh);
+      applyRules(o, px, w, h, p.rules, edgeMag, edgeAng, detail, sh);
       yield o;
     }
 
@@ -6496,7 +6569,7 @@ const DitherAlgorithms = (() => {
 
     // — Post-pass: USER IF/THEN RULES —
     if (Array.isArray(p.rules) && p.rules.length > 0) {
-      applyRules(o, px, w, h, p.rules, edgeMag, detail, sh);
+      applyRules(o, px, w, h, p.rules, edgeMag, edgeAng, detail, sh);
       yield o;
     }
 
