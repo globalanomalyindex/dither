@@ -46,6 +46,7 @@
   const canvas = $('canvas-preview');
   const ctx = canvas.getContext('2d');
   const canvasWrapper = $('canvas-wrapper');
+  const canvasAlphaBadge = $('canvas-alpha-badge');
   const paramsContainer = $('params-container');
 
   // ── Undo/Redo System ──
@@ -168,6 +169,31 @@
     }
     updateColorModeUI();
     if (g.palette) renderPaletteSwatches();
+  }
+
+  function currentSourceAlphaInfo() {
+    if (typeof DitherEngine === 'undefined' || !DitherEngine.getSourceAlphaInfo) {
+      return { hasTransparency: false, hasPartialTransparency: false };
+    }
+    return DitherEngine.getSourceAlphaInfo();
+  }
+
+  function updateCanvasTransparencyUI(info) {
+    const hasAlpha = !!(info && info.hasTransparency);
+    if (canvasWrapper) canvasWrapper.classList.toggle('has-alpha', hasAlpha);
+    if (canvasAlphaBadge) {
+      canvasAlphaBadge.classList.toggle('hidden', !hasAlpha);
+      canvasAlphaBadge.textContent = info && info.hasPartialTransparency ? 'Transparency' : 'Alpha';
+    }
+  }
+
+  function setImageInfo(width, height, label) {
+    const alphaInfo = currentSourceAlphaInfo();
+    const alphaText = alphaInfo.hasTransparency
+      ? (alphaInfo.hasPartialTransparency ? ' • transparency' : ' • alpha mask')
+      : '';
+    $('image-info').textContent = `${width} × ${height} — ${label}${alphaText}`;
+    updateCanvasTransparencyUI(alphaInfo);
   }
 
   $('btn-undo').addEventListener('click', undo);
@@ -986,7 +1012,7 @@
 
   async function handleFile(file) {
     const { width, height } = await DitherEngine.loadImage(file);
-    $('image-info').textContent = `${width} \u00d7 ${height} \u2014 ${file.name}`;
+    setImageInfo(width, height, file.name);
     dropZone.style.display = 'none';
     workspace.classList.remove('hidden');
     $('btn-export').disabled = false;
@@ -2816,7 +2842,7 @@
     // 2. Install those pixels as the new source.
     const result = DitherEngine.bakeImageData(snapshot);
     if (!result) return;
-    $('image-info').textContent = `${result.width} \u00d7 ${result.height} \u2014 baked`;
+    setImageInfo(result.width, result.height, 'baked');
     // 3. Reset all pipeline state — the baked pixels are the starting point now.
     state.selectedAlgorithms = [];
     state.globals.brightness = 0;

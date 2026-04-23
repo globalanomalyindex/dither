@@ -64,6 +64,28 @@ const DitherEngine = (() => {
     return { r, g, b };
   }
 
+  function extractAlphaInfo(data, w, h) {
+    const px = data.data, n = w * h;
+    const alpha = new Uint8ClampedArray(n);
+    let hasTransparency = false;
+    let hasPartialTransparency = false;
+    for (let i = 0; i < n; i++) {
+      const a = px[i * 4 + 3];
+      alpha[i] = a;
+      if (a < 255) hasTransparency = true;
+      if (a > 0 && a < 255) hasPartialTransparency = true;
+    }
+    return { alpha, hasTransparency, hasPartialTransparency };
+  }
+
+  function alphaByte(alphaInfo, idx) {
+    if (!alphaInfo || !alphaInfo.alpha) return 255;
+    const a = alphaInfo.alpha[idx];
+    if (a <= 4) return 0;
+    if (a >= 251) return 255;
+    return a;
+  }
+
   function applyPreProcess(ch, brightness, contrast, gamma) {
     const n = ch.length, out = new Float32Array(n);
     const br = brightness * 2.55;
@@ -348,13 +370,14 @@ const DitherEngine = (() => {
     gray = applyPreProcess(gray, globals.brightness, globals.contrast, globals.gamma);
     const origGray = gray;
     const toneLock = globals.toneLock;
+    const alphaInfo = extractAlphaInfo(data, w, h);
 
     if (pipeline.length === 0) {
       const result = new ImageData(w, h);
       for (let i = 0; i < w*h; i++) {
         const v = clampByte(gray[i]);
         result.data[i*4] = result.data[i*4+1] = result.data[i*4+2] = v;
-        result.data[i*4+3] = 255;
+        result.data[i*4+3] = alphaByte(alphaInfo, i);
       }
       return result;
     }
@@ -415,7 +438,7 @@ const DitherEngine = (() => {
       rd[o]   = dk[0] + (lt[0]-dk[0]) * t;
       rd[o+1] = dk[1] + (lt[1]-dk[1]) * t;
       rd[o+2] = dk[2] + (lt[2]-dk[2]) * t;
-      rd[o+3] = 255;
+      rd[o+3] = alphaByte(alphaInfo, i);
     }
     return result;
   }
@@ -429,6 +452,7 @@ const DitherEngine = (() => {
     const origR = new Float32Array(rCh), origG = new Float32Array(gCh), origB = new Float32Array(bCh);
     const n = w * h;
     const grayRef = new Float32Array(n);
+    const alphaInfo = extractAlphaInfo(data, w, h);
     for (let i = 0; i < n; i++) grayRef[i] = 0.2126 * origR[i] + 0.7152 * origG[i] + 0.0722 * origB[i];
     const toneLock = globals.toneLock;
 
@@ -485,7 +509,7 @@ const DitherEngine = (() => {
     const rd = result.data;
     for (let i = 0; i < n; i++) {
       const o = i * 4;
-      rd[o] = clampByte(rCh[i]); rd[o+1] = clampByte(gCh[i]); rd[o+2] = clampByte(bCh[i]); rd[o+3] = 255;
+      rd[o] = clampByte(rCh[i]); rd[o+1] = clampByte(gCh[i]); rd[o+2] = clampByte(bCh[i]); rd[o+3] = alphaByte(alphaInfo, i);
     }
     return result;
   }
@@ -499,6 +523,7 @@ const DitherEngine = (() => {
     let rCh = applyPreProcess(ch.r, globals.brightness, globals.contrast, globals.gamma);
     let gCh = applyPreProcess(ch.g, globals.brightness, globals.contrast, globals.gamma);
     let bCh = applyPreProcess(ch.b, globals.brightness, globals.contrast, globals.gamma);
+    const alphaInfo = extractAlphaInfo(data, w, h);
 
     const n = w * h;
     const toneLock = globals.toneLock;
@@ -570,7 +595,7 @@ const DitherEngine = (() => {
         const i = y*w+x, o = i*4;
         const or2 = clampByte(rBuf[i]), og = clampByte(gBuf[i]), ob = clampByte(bBuf[i]);
         const [nr, ng, nb] = nearestColor(or2, og, ob, palette);
-        rd[o] = nr; rd[o+1] = ng; rd[o+2] = nb; rd[o+3] = 255;
+        rd[o] = nr; rd[o+1] = ng; rd[o+2] = nb; rd[o+3] = alphaByte(alphaInfo, i);
         const er = (or2-nr)*.7, eg = (og-ng)*.7, eb = (ob-nb)*.7;
         for (const [mdx, mdy, mw] of dm) {
           const nx = x + (ltr ? mdx : -mdx), ny = y + mdy;
@@ -597,6 +622,7 @@ const DitherEngine = (() => {
     const toneLock = globals.toneLock;
     const n = w * h;
     const dk = globals.colorDark, lt = globals.colorLight;
+    const alphaInfo = extractAlphaInfo(data, w, h);
 
     const renderGrayToImageData = (buf) => {
       const out = new ImageData(w, h);
@@ -607,7 +633,7 @@ const DitherEngine = (() => {
         rd[o]   = dk[0] + (lt[0]-dk[0]) * t;
         rd[o+1] = dk[1] + (lt[1]-dk[1]) * t;
         rd[o+2] = dk[2] + (lt[2]-dk[2]) * t;
-        rd[o+3] = 255;
+        rd[o+3] = alphaByte(alphaInfo, i);
       }
       return out;
     };
@@ -617,7 +643,7 @@ const DitherEngine = (() => {
       for (let i = 0; i < n; i++) {
         const v = clampByte(gray[i]);
         result.data[i*4] = result.data[i*4+1] = result.data[i*4+2] = v;
-        result.data[i*4+3] = 255;
+        result.data[i*4+3] = alphaByte(alphaInfo, i);
       }
       return result;
     }
@@ -687,6 +713,7 @@ const DitherEngine = (() => {
     const origR = new Float32Array(rCh), origG = new Float32Array(gCh), origB = new Float32Array(bCh);
     const n = w * h;
     const grayRef = new Float32Array(n);
+    const alphaInfo = extractAlphaInfo(data, w, h);
     for (let i = 0; i < n; i++) grayRef[i] = 0.2126 * origR[i] + 0.7152 * origG[i] + 0.0722 * origB[i];
     const toneLock = globals.toneLock;
 
@@ -695,7 +722,7 @@ const DitherEngine = (() => {
       const rd = out.data;
       for (let i = 0; i < n; i++) {
         const o = i * 4;
-        rd[o] = clampByte(rBuf[i]); rd[o+1] = clampByte(gBuf[i]); rd[o+2] = clampByte(bBuf[i]); rd[o+3] = 255;
+        rd[o] = clampByte(rBuf[i]); rd[o+1] = clampByte(gBuf[i]); rd[o+2] = clampByte(bBuf[i]); rd[o+3] = alphaByte(alphaInfo, i);
       }
       return out;
     };
@@ -787,6 +814,7 @@ const DitherEngine = (() => {
     let rCh = applyPreProcess(ch.r, globals.brightness, globals.contrast, globals.gamma);
     let gCh = applyPreProcess(ch.g, globals.brightness, globals.contrast, globals.gamma);
     let bCh = applyPreProcess(ch.b, globals.brightness, globals.contrast, globals.gamma);
+    const alphaInfo = extractAlphaInfo(data, w, h);
 
     const n = w * h;
     const toneLock = globals.toneLock;
@@ -864,7 +892,7 @@ const DitherEngine = (() => {
         const i = y*w+x, o = i*4;
         const or2 = clampByte(rBuf[i]), og = clampByte(gBuf[i]), ob = clampByte(bBuf[i]);
         const [nr, ng, nb] = nearestColor(or2, og, ob, palette);
-        rd[o] = nr; rd[o+1] = ng; rd[o+2] = nb; rd[o+3] = 255;
+        rd[o] = nr; rd[o+1] = ng; rd[o+2] = nb; rd[o+3] = alphaByte(alphaInfo, i);
         const er = (or2-nr)*.7, eg = (og-ng)*.7, eb = (ob-nb)*.7;
         for (const [mdx, mdy, mw] of dm) {
           const nx = x + (ltr ? mdx : -mdx), ny = y + mdy;
@@ -1035,8 +1063,20 @@ const DitherEngine = (() => {
     const px = sourceData.data, n = sourceData.width * sourceData.height;
     const step = Math.max(1, Math.floor(n / 10000));
     const samples = [];
-    for (let i = 0; i < n; i += step) samples.push([px[i*4], px[i*4+1], px[i*4+2]]);
+    for (let i = 0; i < n; i += step) {
+      if (px[i*4 + 3] <= 4) continue;
+      samples.push([px[i*4], px[i*4+1], px[i*4+2]]);
+    }
     return medianCut(samples, maxColors);
+  }
+
+  function getSourceAlphaInfo() {
+    if (!sourceData) return { hasTransparency: false, hasPartialTransparency: false };
+    const info = extractAlphaInfo(sourceData, sourceData.width, sourceData.height);
+    return {
+      hasTransparency: info.hasTransparency,
+      hasPartialTransparency: info.hasPartialTransparency
+    };
   }
 
   return {
@@ -1046,6 +1086,6 @@ const DitherEngine = (() => {
     getPalettePresets, getPalette, extractPalette, medianCut, nearestColor,
     // Exposed so app-side features (e.g. zone visualizer) can sample the
     // source at a preview-matched resolution without redoing the scale.
-    getDownsampled
+    getDownsampled, getSourceAlphaInfo
   };
 })();

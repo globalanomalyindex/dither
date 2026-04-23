@@ -38,6 +38,9 @@
   --cyan: #4dd4e2;
   --cyan-bright: #7aeaf5;
   --cyan-tint: rgba(77, 212, 226, 0.10);
+  --alpha-a: rgba(208, 218, 232, 0.055);
+  --alpha-b: rgba(108, 124, 148, 0.11);
+  --alpha-glow: rgba(150, 177, 207, 0.14);
 
   /* Pink accent — destructive/reset, caution */
   --pink: #ff7ab2;
@@ -336,6 +339,27 @@ button:focus-visible { outline: none; box-shadow: var(--shadow-glow); }
   cursor: grab;
 }
 
+.canvas-wrapper::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--transition);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0)),
+    linear-gradient(90deg, var(--alpha-a) 25%, transparent 25%, transparent 75%, var(--alpha-a) 75%, var(--alpha-a)),
+    linear-gradient(var(--alpha-a) 25%, transparent 25%, transparent 75%, var(--alpha-a) 75%, var(--alpha-a)),
+    linear-gradient(90deg, var(--alpha-b) 25%, transparent 25%, transparent 75%, var(--alpha-b) 75%, var(--alpha-b)),
+    linear-gradient(var(--alpha-b) 25%, transparent 25%, transparent 75%, var(--alpha-b) 75%, var(--alpha-b));
+  background-size: auto, 32px 32px, 32px 32px, 16px 16px, 16px 16px;
+  background-position: 0 0, 0 0, 16px 16px, 0 0, 8px 8px;
+}
+
+.canvas-wrapper.has-alpha::before {
+  opacity: 1;
+}
+
 .canvas-wrapper.panning { cursor: grabbing; }
 
 .canvas-wrapper canvas {
@@ -343,6 +367,28 @@ button:focus-visible { outline: none; box-shadow: var(--shadow-glow); }
   max-width: none;
   position: absolute;
   transform-origin: 0 0;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.03), 0 18px 40px rgba(0,0,0,0.25);
+}
+
+.canvas-alpha-badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 2;
+  padding: 6px 9px;
+  border-radius: 999px;
+  background: rgba(10, 12, 16, 0.74);
+  border: 1px solid rgba(188, 204, 224, 0.16);
+  color: rgba(230, 238, 248, 0.88);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.2), 0 0 0 1px var(--alpha-glow);
+  backdrop-filter: blur(10px);
+}
+
+.canvas-alpha-badge.hidden {
+  display: none;
 }
 
 /* ── Sidebar ── */
