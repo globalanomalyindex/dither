@@ -1554,6 +1554,14 @@
         _feather: 10, _edgeMode: 'soft', _toneResponse: 0, _advancedOpen: false,
         _blendMode: 'normal', _useOriginal: false };
       for (const p of algo.params) params[p.id] = p.default;
+      // Fresh seed every time the algorithm is toggled on — static default of
+      // 42 produced identical output on every re-toggle. Randomize within the
+      // param's declared range so users get a new variation automatically.
+      for (const p of algo.params) {
+        if (p.id === 'seed' && typeof p.min === 'number' && typeof p.max === 'number') {
+          params[p.id] = Math.floor(p.min + Math.random() * (p.max - p.min + 1));
+        }
+      }
       state.selectedAlgorithms.push({ id, params });
     }
     updateAlgorithmUI();

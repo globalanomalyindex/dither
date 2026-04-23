@@ -411,6 +411,179 @@ const DitherAlgorithms = (() => {
     return d;
   }
 
+  // ── ADVANCED PAINTING ENGINE ──
+  // Seed-driven multi-phase painter. Replaces the main stroke loop of
+  // impressionism / palette-knife when their `advancedEngine` flag is on.
+  //
+  // The pipeline is per-channel so we can't truly cross-correlate R/G/B here,
+  // but we *can* simulate a painter's workflow on a single channel by cycling
+  // through analytical "phases" — each phase only paints pixels that pass its
+  // filter, uses brush/size/angle/opacity choices appropriate for that phase,
+  // and the seed shuffles phase order so each seed produces a structurally
+  // different painting. Running the same per-channel logic on R/G/B with
+  // slightly different phase orders (because seed is scrambled per channel
+  // by the pipeline) produces emergent color variation that reads as
+  // "multi-channel aware" even though each channel is painted independently.
+  //
+  // Phases:
+  //   edge-follow   — strokes perpendicular to gradient, tight along hard edges
+  //   detail-busy   — small dense strokes in high-detail zones (subject texture)
+  //   broad-flat    — large soft strokes in low-detail zones (sky, skin, walls)
+  //   shadow        — medium strokes in dark tones, thicker/opaque
+  //   highlight     — short bright strokes in light tones
+  //   unifying-wash — very large low-opacity strokes everywhere (ties it together)
+  //   cross-grain   — strokes ALONG the gradient (deliberately crossing form)
+  //
+  // Each stroke samples the source with pickup-jitter (the painter's
+  // "dipping then dragging" move), stamps an elliptical or brush-mask
+  // footprint rotated either form-following or free.
+  //
+  // Args:
+  //   o         — destination buffer (already has underpaint/source/clean laid down)
+  //   px        — source luma (single channel)
+  //   edgeMag   — sobel magnitude, 0..~255
+  //   edgeAng   — sobel angle (radians, gradient direction)
+  //   detail    — detail field (stddev-based, 0..~80)
+  //   bMask,bSize — optional PaintEngine brush mask (customBrushes can override per-stroke later)
+  //   baseSz    — canvas-scaled base stroke size
+  //   intensity — global density multiplier (advancedIntensity param, 0.3..3)
+  function advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, bMask, bSize, baseSz, intensity) {
+    const seed = (p.seed|0) || 42;
+    const rnd = mkRand(seed * 2654435761 % 2147483647);
+    // Normalize detail → 0..1
+    let dMax = 1;
+    const stride = Math.max(1, ((w * h) / 2048) | 0);
+    for (let i = 0; i < detail.length; i += stride) if (detail[i] > dMax) dMax = detail[i];
+    const dNorm = 1 / Math.max(8, dMax * 0.6);
+
+    // Phase definitions — filter + painterly knobs.
+    const PHASES = [
+      { name:'edge-follow',   filter:'edge-hard',   sizeMul:0.75, aspect:0.28, opacity:0.92, formFollow:true,  density:0.9, sizeJitter:0.4 },
+      { name:'detail-busy',   filter:'detail-high', sizeMul:0.55, aspect:0.5,  opacity:0.85, formFollow:true,  density:1.4, sizeJitter:0.6 },
+      { name:'broad-flat',    filter:'detail-low',  sizeMul:1.8,  aspect:0.55, opacity:0.6,  formFollow:false, density:0.45, sizeJitter:0.5 },
+      { name:'shadow',        filter:'tone-dark',   sizeMul:1.1,  aspect:0.45, opacity:0.88, formFollow:false, density:0.55, sizeJitter:0.5 },
+      { name:'highlight',     filter:'tone-light',  sizeMul:0.85, aspect:0.55, opacity:0.95, formFollow:false, density:0.5,  sizeJitter:0.4 },
+      { name:'unifying-wash', filter:'full',        sizeMul:1.5,  aspect:0.7,  opacity:0.28, formFollow:false, density:0.3,  sizeJitter:0.7 },
+      { name:'cross-grain',   filter:'edge-hard',   sizeMul:0.65, aspect:0.35, opacity:0.55, formFollow:'cross', density:0.25, sizeJitter:0.5 }
+    ];
+    // Fisher-Yates shuffle so seed picks the order (painter decides what to
+    // lay down first — block-in, then detail, or vice-versa).
+    const order = PHASES.slice();
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(rnd() * (i + 1));
+      const t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+
+    // Pixel-level ellipse stamp with optional brush mask.
+    function stamp(cx, cy, rx, ry, ang, sampleV, opa) {
+      const cosA = Math.cos(ang), sinA = Math.sin(ang);
+      const ext = Math.max(rx, ry) + 1;
+      for (let dy = -ext; dy <= ext; dy++) {
+        const ny = cy + dy;
+        if (ny < 0 || ny >= h) continue;
+        for (let dx = -ext; dx <= ext; dx++) {
+          const nx = cx + dx;
+          if (nx < 0 || nx >= w) continue;
+          // Rotate into brush-local frame.
+          const lx = dx * cosA + dy * sinA;
+          const ly = -dx * sinA + dy * cosA;
+          const nr2 = (lx*lx)/(rx*rx + 0.01) + (ly*ly)/(ry*ry + 0.01);
+          if (nr2 > 1) continue;
+          let maskA = 1 - nr2;  // soft ellipse falloff
+          if (bMask && bSize > 0) {
+            // Sample the brush mask at this rotated position.
+            const mx = Math.round((lx / rx) * 0.5 * (bSize - 1) + 0.5 * (bSize - 1));
+            const my = Math.round((ly / ry) * 0.5 * (bSize - 1) + 0.5 * (bSize - 1));
+            if (mx >= 0 && mx < bSize && my >= 0 && my < bSize) {
+              maskA = (bMask[my * bSize + mx] / 255) * (1 - nr2 * 0.3);
+            }
+          }
+          const alpha = Math.max(0, Math.min(1, maskA * opa));
+          if (alpha <= 0.01) continue;
+          const idx = ny * w + nx;
+          o[idx] = Math.round(o[idx] * (1 - alpha) + sampleV * alpha);
+        }
+      }
+    }
+
+    const _intensity = Math.max(0.3, Math.min(3, intensity || 1));
+    for (const phase of order) {
+      // Estimate stroke count — density of a unit cell is (density/sz²).
+      const avgSz = Math.max(3, baseSz * phase.sizeMul);
+      const nStrokes = Math.floor((w * h) / (avgSz * avgSz) * phase.density * _intensity);
+      let placed = 0, attempts = 0;
+      const maxAttempts = nStrokes * 6;
+      while (placed < nStrokes && attempts < maxAttempts) {
+        attempts++;
+        const x = Math.floor(rnd() * w);
+        const y = Math.floor(rnd() * h);
+        const i = y * w + x;
+        const em  = edgeMag[i] / 120;
+        const d01 = Math.min(1, detail[i] * dNorm);
+        const v0  = px[i];
+        let ok = false;
+        switch (phase.filter) {
+          case 'edge-hard':   ok = em >= 0.25; break;
+          case 'detail-high': ok = d01 >= 0.4;  break;
+          case 'detail-low':  ok = d01 <= 0.25; break;
+          case 'tone-dark':   ok = v0 <= 90;    break;
+          case 'tone-light':  ok = v0 >= 165;   break;
+          case 'full':        ok = true;        break;
+        }
+        if (!ok) continue;
+        placed++;
+        // Stroke geometry.
+        const sz = Math.max(2, Math.round(avgSz * (1 - phase.sizeJitter * 0.5 + rnd() * phase.sizeJitter)));
+        const rx = sz;
+        const ry = Math.max(2, Math.round(sz * phase.aspect));
+        let ang;
+        if (phase.formFollow === true) {
+          ang = edgeAng[i] + Math.PI * 0.5 + (rnd() - 0.5) * 0.5;
+        } else if (phase.formFollow === 'cross') {
+          ang = edgeAng[i] + (rnd() - 0.5) * 0.3;
+        } else {
+          ang = rnd() * Math.PI * 2;
+        }
+        // Pickup: painter dips the brush + drags — sample with small offset.
+        const pickR = Math.max(1, Math.round(sz * 0.35));
+        const pJx = Math.round((rnd() - 0.5) * 2 * pickR);
+        const pJy = Math.round((rnd() - 0.5) * 2 * pickR);
+        const sx = Math.max(0, Math.min(w - 1, x + pJx));
+        const sy = Math.max(0, Math.min(h - 1, y + pJy));
+        const sampleV = px[sy * w + sx];
+        const opa = phase.opacity * (0.7 + rnd() * 0.4);
+        stamp(x, y, rx, ry, ang, sampleV, opa);
+      }
+    }
+    return o;
+  }
+
+  // ── Detail Jitter post-pass (illusion mode) ──
+  // Simulates micro-detail by adding deterministic noise scaled by the local
+  // detail field. Busy regions get more jitter; flat areas stay clean. Runs
+  // per-channel, so independently-jittered R/G/B produces chromatic grain
+  // that reads as extra "texture" the source didn't actually have.
+  function detailJitterPass(o, detail, w, h, strength, seed) {
+    if (!detail || !(strength > 0)) return o;
+    let dMax = 1;
+    const stride = Math.max(1, ((w * h) / 2048) | 0);
+    for (let i = 0; i < detail.length; i += stride) if (detail[i] > dMax) dMax = detail[i];
+    const dNorm = 1 / Math.max(8, dMax * 0.6);
+    const amp = strength * 80;  // ±80 at full strength in busy zones
+    const S = (seed|0) || 42;
+    for (let i = 0; i < o.length; i++) {
+      const d01 = Math.min(1, detail[i] * dNorm);
+      // Deterministic per-pixel hash → [-1, 1].
+      let hh = Math.imul(i + 374761393, 0x9E3779B1) ^ S;
+      hh = Math.imul(hh ^ (hh >>> 15), 0x85EBCA77);
+      hh = Math.imul(hh ^ (hh >>> 13), 0xC2B2AE3D);
+      const r = ((hh ^ (hh >>> 16)) >>> 0) / 4294967296 - 0.5;
+      const v = o[i] + r * 2 * amp * d01;
+      o[i] = v < 0 ? 0 : (v > 255 ? 255 : Math.round(v));
+    }
+    return o;
+  }
+
   // ── If/Then RULES ENGINE ──
   // A post-pass that walks every pixel and applies user-defined rules shaped
   // as "if <SUBJECT> is <STATE> → <VERB> [MODIFIER]". The two-dropdown pair
@@ -1867,6 +2040,13 @@ const DitherAlgorithms = (() => {
   }});
 
   A.push({ id:'palette-knife', name:'Palette Knife', category:'reconstructive', params:[
+    // — EXPERIMENTAL advanced engine —
+    // When ON, replaces the normal stroke loop with the seed-driven multi-phase
+    // painter (advancedPaintPass). The output changes noticeably each seed.
+    {id:'advancedEngine',label:'🧪 Use Advanced Engine',type:'checkbox',default:false,
+     hint:'Multi-phase painter. Seed shuffles phase order — edges, detail, shadows, highlights, wash. Produces a unique painting per seed.'},
+    {id:'advancedIntensity',label:'Advanced Stroke Density',min:.3,max:3,step:.05,default:1,
+     hint:'Only used when Advanced Engine is on.'},
     // — Core shape —
     {id:'size',label:'Knife Size',min:4,max:40,step:1,default:10},
     {id:'smear',label:'Smear Length',min:5,max:100,step:1,default:15},
@@ -1953,19 +2133,9 @@ const DitherAlgorithms = (() => {
     // — Blend-mode legacy control —
     {id:'colorPickup',label:'Color Pickup (blend only)',min:-1,max:1,step:.05,default:0},
     // — Brush shape —
-    {id:'brushShape',label:'Brush Shape',type:'select',options:[
-      {value:'default',label:'Built-in knife edge'},
-      {value:'0',label:'Round Soft'},
-      {value:'1',label:'Round Hard'},
-      {value:'2',label:'Flat'},
-      {value:'3',label:'Splatter'},
-      {value:'4',label:'Noise'},
-      {value:'5',label:'Stipple'},
-      {value:'6',label:'Rake'},
-      {value:'7',label:'Dry Brush'},
-      {value:'8',label:'Charcoal'},
-      {value:'9',label:'Fan'}
-    ],default:'default'},
+    // Dab shape is now either the built-in knife-edge ellipse (default) or
+    // whatever the Custom Brushes panel below dispatches per-stroke. No more
+    // mid-tier dropdown — keeps the mental model clean.
     // — CUSTOM BRUSH mode —
     // When enabled, the algorithm dispatches different brushes per
     // tonal zone (shadow/mid/highlight) + an edge-override brush,
@@ -2195,8 +2365,22 @@ const DitherAlgorithms = (() => {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     }
 
-    const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0;
+    const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0 || p.advancedEngine;
     const detail = needDetail ? detailField(px, w, h, 8) : null;
+
+    // ── EXPERIMENTAL: Advanced multi-phase painter ──
+    // See impressionism for the full rationale. When on, replaces the smear
+    // loop with advancedPaintPass.
+    if (p.advancedEngine) {
+      const advBase = Math.max(4, Math.round(((p.size != null ? p.size : 10)) * canvasScale * 0.8));
+      advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, bMask, bSize, advBase, (p.advancedIntensity != null ? p.advancedIntensity : 1));
+      yield o;
+      if (Array.isArray(p.rules) && p.rules.length > 0) {
+        applyRules(o, px, w, h, p.rules, edgeMag, edgeAng, detail, sh);
+        yield o;
+      }
+      return o;
+    }
 
     // Stride between strokes. PREVIEW widens stride (~1.5×) so the preview
     // runs on roughly half as many strokes — quality drops slightly but
@@ -5940,6 +6124,11 @@ const DitherAlgorithms = (() => {
   // several "optical illusion" variants that bend the dab placement to
   // produce Riley-style op-art or subtle chromatic-aberration feel.
   A.push({ id:'impressionism', name:'Impressionism / Op-Art', category:'artistic', params:[
+    // — EXPERIMENTAL advanced engine —
+    {id:'advancedEngine',label:'🧪 Use Advanced Engine',type:'checkbox',default:false,
+     hint:'Multi-phase painter. Seed shuffles phase order — edges, detail, shadows, highlights, wash. Produces a unique painting per seed.'},
+    {id:'advancedIntensity',label:'Advanced Stroke Density',min:.3,max:3,step:.05,default:1,
+     hint:'Only used when Advanced Engine is on.'},
     // — Core (same defaults as legacy) —
     {id:'dabCount',label:'Dab Count',min:500,max:40000,step:100,default:4000},
     {id:'dabLen',label:'Dab Length',min:2,max:60,step:1,default:8},
@@ -6007,23 +6196,12 @@ const DitherAlgorithms = (() => {
       {value:'riley',label:'Riley Moiré (wavy bands)'},
       {value:'radial',label:'Radial Starburst'},
       {value:'chromabber',label:'Chromatic Split'},
-      {value:'spiral',label:'Spiral Twist'}
+      {value:'spiral',label:'Spiral Twist'},
+      {value:'detailJitter',label:'Detail Jitter (simulated micro-detail)'}
     ],default:'none'},
     {id:'illusionStrength',label:'Illusion Strength',min:0,max:1,step:.05,default:.5},
-    // — Brush shape (optional PaintEngine mask) —
-    {id:'brushShape',label:'Dab Shape',type:'select',options:[
-      {value:'default',label:'Built-in soft ellipse'},
-      {value:'0',label:'Round Soft'},
-      {value:'1',label:'Round Hard'},
-      {value:'2',label:'Flat'},
-      {value:'3',label:'Splatter'},
-      {value:'4',label:'Noise'},
-      {value:'5',label:'Stipple'},
-      {value:'6',label:'Rake'},
-      {value:'7',label:'Dry Brush'},
-      {value:'8',label:'Charcoal'},
-      {value:'9',label:'Fan'}
-    ],default:'default'},
+    // Dab shape is now either the built-in soft ellipse (default) or whatever
+    // the Custom Brushes panel below dispatches per-dab.
     // — CUSTOM BRUSH mode (same as palette-knife) —
     // Dispatches per-dab brush choice by local luminance + edge magnitude.
     // See palette-knife's customBrushes comment for the full model.
@@ -6242,8 +6420,30 @@ const DitherAlgorithms = (() => {
     // underpaint could orient its wash strokes. Reuse those aliases here
     // under the names the main dab loop expects — no duplicate sobel pass.
     const edgeMag = edgeMagUp, edgeAng = edgeAngUp;
-    const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0;
+    // Advanced-engine needs detail always (phases depend on it).
+    const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0 || p.advancedEngine;
     const detail = needDetail ? detailField(px, w, h, 8) : null;
+
+    // ── EXPERIMENTAL: Advanced multi-phase painter ──
+    // When on, bypass the normal dab loop entirely. advancedPaintPass lays
+    // down strokes in a seed-shuffled agenda of analytical phases (edges,
+    // detail-busy, detail-flat, shadows, highlights, wash, cross-grain),
+    // each with its own brush profile and stroke density.
+    if (p.advancedEngine) {
+      const advBase = Math.max(4, Math.round(((p.dabLen != null ? p.dabLen : 8)) * canvasScale));
+      advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, bMask, bSize, advBase, (p.advancedIntensity != null ? p.advancedIntensity : 1));
+      yield o;
+      if (p.illusion === 'detailJitter' && detail) {
+        detailJitterPass(o, detail, w, h, p.illusionStrength || 0.5, seedI);
+        yield o;
+      }
+      // Rules post-pass still applies (user's if/then layer runs after).
+      if (Array.isArray(p.rules) && p.rules.length > 0) {
+        applyRules(o, px, w, h, p.rules, edgeMag, edgeAng, detail, sh);
+        yield o;
+      }
+      return o;
+    }
 
     // When detail-awareness is active, reduce total dabs (a human would
     // not paint 4000 strokes in a flat sky; we redistribute them).
@@ -6565,6 +6765,12 @@ const DitherAlgorithms = (() => {
           o[yr + x] = tmp[ny * w + nx];
         }
       }
+    }
+
+    // — Post-pass: Detail Jitter illusion (if selected) —
+    if (p.illusion === 'detailJitter' && detail) {
+      detailJitterPass(o, detail, w, h, p.illusionStrength || 0.5, seedI);
+      yield o;
     }
 
     // — Post-pass: USER IF/THEN RULES —
