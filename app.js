@@ -1544,24 +1544,53 @@
   }
   function onDragEnd() { this.style.opacity = ''; dragSrcId = null; }
 
+  function cloneParamValue(value) {
+    if (Array.isArray(value) || (value && typeof value === 'object')) {
+      return JSON.parse(JSON.stringify(value));
+    }
+    return value;
+  }
+
+  function randomSeedForParam(param) {
+    const min = typeof param.min === 'number' ? Math.floor(param.min) : 1;
+    const max = 999999;
+    return Math.floor(min + Math.random() * (max - min + 1));
+  }
+
+  function randomizeSeedParams(algo, params) {
+    for (const p of algo.params) {
+      if (p.id === 'seed') params[p.id] = randomSeedForParam(p);
+    }
+  }
+
+  function buildAlgorithmParams(algo, overrides) {
+    const params = {
+      _mix: 0,
+      _invert: false,
+      _blackPoint: 0,
+      _whitePoint: 255,
+      _feather: 10,
+      _edgeMode: 'soft',
+      _toneResponse: 0,
+      _advancedOpen: false,
+      _blendMode: 'normal',
+      _useOriginal: false
+    };
+    for (const p of algo.params) params[p.id] = cloneParamValue(p.default);
+    if (overrides) {
+      for (const [key, value] of Object.entries(overrides)) params[key] = cloneParamValue(value);
+    }
+    randomizeSeedParams(algo, params);
+    return params;
+  }
+
   function toggleAlgorithm(id) {
     const idx = state.selectedAlgorithms.findIndex(a => a.id === id);
     if (idx !== -1) {
       state.selectedAlgorithms.splice(idx, 1);
     } else {
       const algo = DitherAlgorithms.find(a => a.id === id);
-      const params = { _mix: 0, _invert: false, _blackPoint: 0, _whitePoint: 255,
-        _feather: 10, _edgeMode: 'soft', _toneResponse: 0, _advancedOpen: false,
-        _blendMode: 'normal', _useOriginal: false };
-      for (const p of algo.params) params[p.id] = p.default;
-      // Fresh seed every time the algorithm is toggled on — static default of
-      // 42 produced identical output on every re-toggle. Randomize within the
-      // param's declared range so users get a new variation automatically.
-      for (const p of algo.params) {
-        if (p.id === 'seed' && typeof p.min === 'number' && typeof p.max === 'number') {
-          params[p.id] = Math.floor(p.min + Math.random() * (p.max - p.min + 1));
-        }
-      }
+      const params = buildAlgorithmParams(algo);
       state.selectedAlgorithms.push({ id, params });
     }
     updateAlgorithmUI();
@@ -2230,11 +2259,7 @@
     for (const pAlgo of preset.algorithms) {
       const algo = DitherAlgorithms.find(a => a.id === pAlgo.id);
       if (!algo) continue;
-      const params = { _mix: 0, _invert: false, _blackPoint: 0, _whitePoint: 255,
-        _feather: 10, _edgeMode: 'soft', _toneResponse: 0, _advancedOpen: false,
-        _blendMode: 'normal', _useOriginal: false };
-      for (const p of algo.params) params[p.id] = p.default;
-      if (pAlgo.params) Object.assign(params, pAlgo.params);
+      const params = buildAlgorithmParams(algo, pAlgo.params);
       state.selectedAlgorithms.push({ id: pAlgo.id, params });
     }
 
@@ -2405,24 +2430,26 @@
     const shuffled = [...DitherAlgorithms].sort(() => Math.random() - 0.5);
     for (let i = 0; i < count && i < shuffled.length; i++) {
       const algo = shuffled[i];
-      const params = {
-        _mix: Math.round(Math.random() * 20) * 0.05,
-        _invert: Math.random() > 0.8,
-        _blackPoint: Math.random() > 0.7 ? randomInt(0, 60) : 0,
-        _whitePoint: Math.random() > 0.7 ? randomInt(200, 255) : 255,
-        _feather: randomInt(0, 40),
-        _edgeMode: ['soft', 'hard', 'dissolve'][randomInt(0, 2)],
-        _toneResponse: Math.random() > 0.6 ? randomInt(-80, 80) : 0,
-        _advancedOpen: false
-      };
+      const params = buildAlgorithmParams(algo);
+      params._mix = Math.round(Math.random() * 20) * 0.05;
+      params._invert = Math.random() > 0.8;
+      params._blackPoint = Math.random() > 0.7 ? randomInt(0, 60) : 0;
+      params._whitePoint = Math.random() > 0.7 ? randomInt(200, 255) : 255;
+      params._feather = randomInt(0, 40);
+      params._edgeMode = ['soft', 'hard', 'dissolve'][randomInt(0, 2)];
+      params._toneResponse = Math.random() > 0.6 ? randomInt(-80, 80) : 0;
+      params._advancedOpen = false;
       for (const p of algo.params) {
+        if (p.id === 'seed') continue;
         if (p.type === 'checkbox') params[p.id] = Math.random() > 0.5;
         else if (p.type === 'select') params[p.id] = p.options[randomInt(0, p.options.length - 1)].value;
+        else if (p.type === 'customBrushes' || p.type === 'rules') params[p.id] = cloneParamValue(p.default);
         else {
           const steps = (p.max - p.min) / p.step;
           params[p.id] = Math.round((p.min + Math.round(Math.random() * steps) * p.step) * 1000) / 1000;
         }
       }
+      randomizeSeedParams(algo, params);
       state.selectedAlgorithms.push({ id: algo.id, params });
     }
     updateAlgorithmUI();

@@ -317,6 +317,32 @@ const DitherEngine = (() => {
     return step.algorithm.apply(channel, w, h, step.params);
   }
 
+  function withChannelHint(step, hint, fn) {
+    const params = step.params || (step.params = {});
+    const hadHint = Object.prototype.hasOwnProperty.call(params, '_advChannelHint');
+    const prevHint = params._advChannelHint;
+    params._advChannelHint = hint;
+    try {
+      return fn();
+    } finally {
+      if (hadHint) params._advChannelHint = prevHint;
+      else delete params._advChannelHint;
+    }
+  }
+
+  async function withChannelHintAsync(step, hint, fn) {
+    const params = step.params || (step.params = {});
+    const hadHint = Object.prototype.hasOwnProperty.call(params, '_advChannelHint');
+    const prevHint = params._advChannelHint;
+    params._advChannelHint = hint;
+    try {
+      return await fn();
+    } finally {
+      if (hadHint) params._advChannelHint = prevHint;
+      else delete params._advChannelHint;
+    }
+  }
+
   function processGrayscaleDither(pipeline, globals, w, h, data) {
     let gray = toGrayscale(data, w, h, globals.grayscaleMode || 'luminance');
     gray = applyPreProcess(gray, globals.brightness, globals.contrast, globals.gamma);
@@ -340,7 +366,7 @@ const DitherEngine = (() => {
       const step = pipeline[pi];
       const useOrig = step.params._useOriginal || false;
       const inputData = useOrig ? new Float32Array(origGray) : new Float32Array(current);
-      const dithResult = step.algorithm.apply(inputData, w, h, step.params);
+      const dithResult = withChannelHint(step, 'gray', () => step.algorithm.apply(inputData, w, h, step.params));
       const mix = step.params._mix || 0;
       const inv = step.params._invert || false;
       const bp = step.params._blackPoint || 0;
@@ -422,9 +448,9 @@ const DitherEngine = (() => {
       const inR = useOrig ? new Float32Array(origR) : new Float32Array(rCh);
       const inG = useOrig ? new Float32Array(origG) : new Float32Array(gCh);
       const inB = useOrig ? new Float32Array(origB) : new Float32Array(bCh);
-      const drR = step.algorithm.apply(inR, w, h, step.params);
-      const drG = step.algorithm.apply(inG, w, h, step.params);
-      const drB = step.algorithm.apply(inB, w, h, step.params);
+      const drR = withChannelHint(step, 'r', () => step.algorithm.apply(inR, w, h, step.params));
+      const drG = withChannelHint(step, 'g', () => step.algorithm.apply(inG, w, h, step.params));
+      const drB = withChannelHint(step, 'b', () => step.algorithm.apply(inB, w, h, step.params));
       const prevR = new Float32Array(rCh), prevG = new Float32Array(gCh), prevB = new Float32Array(bCh);
       for (let j = 0; j < n; j++) {
         let vr = drR[j], vg = drG[j], vb = drB[j];
@@ -498,9 +524,9 @@ const DitherEngine = (() => {
         const inR = useOrig ? new Float32Array(origR) : new Float32Array(rCh);
         const inG = useOrig ? new Float32Array(origG) : new Float32Array(gCh);
         const inB = useOrig ? new Float32Array(origB) : new Float32Array(bCh);
-        const drR = step.algorithm.apply(inR, w, h, step.params);
-        const drG = step.algorithm.apply(inG, w, h, step.params);
-        const drB = step.algorithm.apply(inB, w, h, step.params);
+        const drR = withChannelHint(step, 'r', () => step.algorithm.apply(inR, w, h, step.params));
+        const drG = withChannelHint(step, 'g', () => step.algorithm.apply(inG, w, h, step.params));
+        const drB = withChannelHint(step, 'b', () => step.algorithm.apply(inB, w, h, step.params));
         const prevR = new Float32Array(rCh), prevG = new Float32Array(gCh), prevB = new Float32Array(bCh);
         for (let j = 0; j < n; j++) {
           let vr = drR[j], vg = drG[j], vb = drB[j];
@@ -614,7 +640,7 @@ const DitherEngine = (() => {
         onProgress(renderGrayToImageData(partialBuf));
       } : null;
 
-      const dithResult = await runApply(step, inputData, w, h, onStepProgress, signal);
+      const dithResult = await withChannelHintAsync(step, 'gray', () => runApply(step, inputData, w, h, onStepProgress, signal));
       if (signal.cancelled) return null;
 
       const mix = step.params._mix || 0;
@@ -705,17 +731,17 @@ const DitherEngine = (() => {
         onProgress(renderRGBToImageData(partial, partial, partial));
       } : null;
 
-      const drR = await runApply(step, inR, w, h, onPartialChannelProgress, signal);
+      const drR = await withChannelHintAsync(step, 'r', () => runApply(step, inR, w, h, onPartialChannelProgress, signal));
       if (signal.cancelled) return null;
       // Between channels, show R as full grayscale snapshot so user sees a
       // visible milestone even if the next channel starts slow.
       if (onProgress) onProgress(renderRGBToImageData(drR, drR, drR));
       await yieldTick();
-      const drG = await runApply(step, inG, w, h, onPartialChannelProgress, signal);
+      const drG = await withChannelHintAsync(step, 'g', () => runApply(step, inG, w, h, onPartialChannelProgress, signal));
       if (signal.cancelled) return null;
       if (onProgress) onProgress(renderRGBToImageData(drR, drG, drG));
       await yieldTick();
-      const drB = await runApply(step, inB, w, h, onPartialChannelProgress, signal);
+      const drB = await withChannelHintAsync(step, 'b', () => runApply(step, inB, w, h, onPartialChannelProgress, signal));
       if (signal.cancelled) return null;
 
       const prevR = new Float32Array(rCh), prevG = new Float32Array(gCh), prevB = new Float32Array(bCh);
@@ -788,13 +814,13 @@ const DitherEngine = (() => {
         const inG = useOrig ? new Float32Array(origG) : new Float32Array(gCh);
         const inB = useOrig ? new Float32Array(origB) : new Float32Array(bCh);
 
-        const drR = await runApply(step, inR, w, h, null, signal);
+        const drR = await withChannelHintAsync(step, 'r', () => runApply(step, inR, w, h, null, signal));
         if (signal.cancelled) return null;
         await yieldTick();
-        const drG = await runApply(step, inG, w, h, null, signal);
+        const drG = await withChannelHintAsync(step, 'g', () => runApply(step, inG, w, h, null, signal));
         if (signal.cancelled) return null;
         await yieldTick();
-        const drB = await runApply(step, inB, w, h, null, signal);
+        const drB = await withChannelHintAsync(step, 'b', () => runApply(step, inB, w, h, null, signal));
         if (signal.cancelled) return null;
 
         const prevR = new Float32Array(rCh), prevG = new Float32Array(gCh), prevB = new Float32Array(bCh);

@@ -64,6 +64,123 @@ const DitherAlgorithms = (() => {
     if (!(v > 0)) return 0;
     return v > 1 ? (v / 255) : v;
   }
+  let _ADV_SOURCE_ANALYSIS = { key: '', analysis: null };
+  function _advArrayKey(arr) {
+    if (!arr || arr.length === 0) return '0';
+    const n = arr.length;
+    const pts = [0, (n * 0.17) | 0, (n * 0.43) | 0, (n * 0.71) | 0, n - 1];
+    return pts.map(i => clamp(Math.round(arr[i] || 0))).join(',');
+  }
+  function _advFieldStats(arr) {
+    let maxV = 1;
+    const stride = Math.max(1, ((arr.length || 1) / 2048) | 0);
+    for (let i = 0; i < arr.length; i += stride) if (arr[i] > maxV) maxV = arr[i];
+    return maxV;
+  }
+  function _buildAdvancedField(value, w, h, skipDetail) {
+    const sf = sobelField(value, w, h);
+    const det = skipDetail ? new Float32Array(w * h) : detailField(value, w, h, 8);
+    return {
+      value,
+      edgeMag: sf.mag,
+      edgeAng: sf.ang,
+      detail: det,
+      edgeNorm: 1 / Math.max(16, _advFieldStats(sf.mag) * 0.6),
+      detailNorm: 1 / Math.max(8, _advFieldStats(det) * 0.6)
+    };
+  }
+  function buildAdvancedSourceAnalysis(w, h, fallbackPx) {
+    let src = null;
+    try {
+      if (typeof DitherEngine !== 'undefined' && DitherEngine.getDownsampled) {
+        src = DitherEngine.getDownsampled(Math.max(w, h));
+      }
+    } catch (_) {}
+    const useSource = !!(src && src.width === w && src.height === h && src.data);
+    const key = useSource
+      ? `rgba:${w}x${h}:${_advArrayKey(src.data)}`
+      : `gray:${w}x${h}:${_advArrayKey(fallbackPx)}`;
+    if (_ADV_SOURCE_ANALYSIS.key === key && _ADV_SOURCE_ANALYSIS.analysis) return _ADV_SOURCE_ANALYSIS.analysis;
+
+    const n = w * h;
+    const r = new Float32Array(n);
+    const g = new Float32Array(n);
+    const b = new Float32Array(n);
+    const a = new Float32Array(n);
+    const gray = new Float32Array(n);
+    const value = new Float32Array(n);
+    const saturation = new Float32Array(n);
+    const full = new Float32Array(n);
+    const zone = new Uint8Array(n);
+
+    if (useSource) {
+      const px = src.data;
+      for (let i = 0; i < n; i++) {
+        const o = i * 4;
+        const rv = px[o], gv = px[o + 1], bv = px[o + 2], av = px[o + 3];
+        const mx = Math.max(rv, gv, bv);
+        const mn = Math.min(rv, gv, bv);
+        const sat = mx <= 0 ? 0 : ((mx - mn) / Math.max(1, mx)) * 255;
+        r[i] = rv; g[i] = gv; b[i] = bv; a[i] = av;
+        gray[i] = 0.2126 * rv + 0.7152 * gv + 0.0722 * bv;
+        value[i] = mx;
+        saturation[i] = sat;
+        full[i] = gray[i] * 0.42 + value[i] * 0.33 + sat * 0.15 + av * 0.10;
+        if (sat < 18) zone[i] = 0;
+        else if (rv >= gv && rv >= bv) zone[i] = gv > bv * 1.08 ? 4 : (bv > gv * 1.08 ? 6 : 1);
+        else if (gv >= rv && gv >= bv) zone[i] = rv > bv * 1.08 ? 4 : (bv > rv * 1.08 ? 5 : 2);
+        else zone[i] = rv > gv * 1.08 ? 6 : (gv > rv * 1.08 ? 5 : 3);
+      }
+    } else {
+      for (let i = 0; i < n; i++) {
+        const v = fallbackPx ? clamp(fallbackPx[i]) : 0;
+        r[i] = g[i] = b[i] = gray[i] = value[i] = full[i] = v;
+        a[i] = 255;
+        saturation[i] = 0;
+        zone[i] = 0;
+      }
+    }
+
+    const fields = {
+      gray: _buildAdvancedField(gray, w, h, false),
+      r: _buildAdvancedField(r, w, h, false),
+      g: _buildAdvancedField(g, w, h, false),
+      b: _buildAdvancedField(b, w, h, false),
+      a: _buildAdvancedField(a, w, h, true),
+      value: _buildAdvancedField(value, w, h, false),
+      saturation: _buildAdvancedField(saturation, w, h, false),
+      full: _buildAdvancedField(full, w, h, false)
+    };
+    const detailValue = new Float32Array(n);
+    for (let i = 0; i < n; i++) detailValue[i] = Math.min(255, fields.gray.detail[i] * fields.gray.detailNorm * 255);
+    fields.detail = {
+      value: detailValue,
+      edgeMag: fields.gray.edgeMag,
+      edgeAng: fields.gray.edgeAng,
+      detail: fields.gray.detail,
+      edgeNorm: fields.gray.edgeNorm,
+      detailNorm: fields.gray.detailNorm
+    };
+    const analysis = { fields, zone };
+    _ADV_SOURCE_ANALYSIS = { key, analysis };
+    return analysis;
+  }
+  function buildAdvancedAgenda(seed, channelHint) {
+    const base = ['full', 'gray', 'detail', 'value', 'r', 'g', 'b', 'a', 'saturation'];
+    const cur = base.includes(channelHint) ? channelHint : 'gray';
+    const rest = base.filter(name => name !== cur && name !== 'full' && name !== 'gray');
+    const rnd = mkRand((Math.imul((seed | 0) || 1, 0x9E3779B1) ^ 0x7f4a7c15) >>> 0 || 1);
+    for (let i = rest.length - 1; i > 0; i--) {
+      const j = Math.floor(rnd() * (i + 1));
+      const t = rest[i]; rest[i] = rest[j]; rest[j] = t;
+    }
+    const agenda = [cur];
+    if (cur !== 'full') agenda.push('full');
+    if (cur !== 'gray') agenda.push('gray');
+    for (const name of rest) if (!agenda.includes(name)) agenda.push(name);
+    if (!agenda.includes('detail')) agenda.push('detail');
+    return agenda;
+  }
 
   // Simple edge detection helper
   function sobelAt(px, x, y, w, h) {
@@ -406,8 +523,14 @@ const DitherAlgorithms = (() => {
   //   grainBias — 0..1, adds oriented directional grain near edges
   //   edgeAng  — sobel angle (for the grain)
   //   edgeMag  — sobel magnitude (gates the grain)
-  function advancedUnderpaint(o, px, w, h, bands, grainBias, edgeMag, edgeAng) {
+  function advancedUnderpaint(o, px, w, h, bands, grainBias, edgeMag, edgeAng, analysis, seed, channelHint) {
     const N = Math.max(3, Math.min(12, bands|0 || 5));
+    const agenda = buildAdvancedAgenda((seed | 0) || 42, channelHint || 'gray');
+    const fields = analysis && analysis.fields ? analysis.fields : null;
+    const primary = fields ? (fields[agenda[0]] || fields.gray) : null;
+    const secondary = fields ? (fields[agenda[1]] || fields.full || fields.gray) : null;
+    const tertiary = fields ? (fields[agenda[2]] || fields.detail || fields.gray) : null;
+    const grayField = fields ? (fields.gray || primary) : null;
     // Even-spaced value bands 0..255.
     const bandV = new Array(N);
     for (let k = 0; k < N; k++) bandV[k] = Math.round(k * 255 / (N - 1));
@@ -425,16 +548,35 @@ const DitherAlgorithms = (() => {
       const yr = y * w;
       for (let x = 0; x < w; x++) {
         const i = yr + x;
-        const v = px[i];
-        const b = _band[v], f = _frac[v];
+        const zoneN = analysis && analysis.zone ? (analysis.zone[i] / 6) : 0;
+        let v = px[i];
+        if (primary && secondary && tertiary) {
+          v = clamp(
+            px[i] * 0.34 +
+            primary.value[i] * 0.24 +
+            secondary.value[i] * 0.18 +
+            tertiary.value[i] * 0.12 +
+            (grayField ? grayField.value[i] : px[i]) * 0.12 +
+            zoneN * 26 * (0.35 + grainBias * 0.5)
+          );
+        }
+        const vi = clamp(Math.round(v));
+        const b = _band[vi], f = _frac[vi];
         // Bayer-dithered transition between bandV[b] and bandV[b+1].
         let thr = _advBayerAt(x, y);
         // Grain: shift the dither threshold by an oriented pattern near edges
         // so the banding boundary has directional texture (like chisel marks).
-        if (grainBias > 0 && edgeMag && edgeMag[i] > 15) {
-          const a = edgeAng[i];
-          const gx = Math.round(x * Math.cos(a) + y * Math.sin(a)) & 7;
-          const gy = Math.round(-x * Math.sin(a) + y * Math.cos(a)) & 3;
+        let ang = edgeAng ? edgeAng[i] : 0;
+        let edgeV = edgeMag ? edgeMag[i] : 0;
+        if (primary && secondary) {
+          const pE = primary.edgeMag[i] * primary.edgeNorm;
+          const sE = secondary.edgeMag[i] * secondary.edgeNorm;
+          if (pE >= sE && pE > 0.08) { ang = primary.edgeAng[i]; edgeV = primary.edgeMag[i]; }
+          else if (sE > 0.08) { ang = secondary.edgeAng[i]; edgeV = secondary.edgeMag[i]; }
+        }
+        if (grainBias > 0 && edgeV > 15) {
+          const gx = Math.round(x * Math.cos(ang) + y * Math.sin(ang)) & 7;
+          const gy = Math.round(-x * Math.sin(ang) + y * Math.cos(ang)) & 3;
           const g = ((gx + gy * 3) & 7) / 7;  // 0..1
           thr = thr * (1 - grainBias) + g * grainBias;
         }
@@ -570,12 +712,51 @@ const DitherAlgorithms = (() => {
     const phaseSeedMix  = Math.max(0, Math.min(1, cfg.phaseSeedMix ?? 0.6));
     const wetSmudgeA    = Math.max(0, Math.min(1.5, cfg.wetSmudge ?? 0));
     const wetStreakA    = Math.max(0, Math.min(1.5, cfg.wetStreak ?? 0));
+    const analysis      = cfg.analysis || buildAdvancedSourceAnalysis(w, h, px);
+    const channelHint   = cfg.channelHint || p._advChannelHint || 'gray';
+    const agenda        = buildAdvancedAgenda(seed, channelHint);
+
+    let eMax = 1;
+    const poolStride = Math.max(1, ((w * h) / 2048) | 0);
+    for (let i = 0; i < edgeMag.length; i += poolStride) if (edgeMag[i] > eMax) eMax = edgeMag[i];
+    const currentEdgeNorm = 1 / Math.max(16, eMax * 0.6);
 
     // ── Normalize detail → 0..1 (stable across channels/canvas sizes) ──
     let dMax = 1;
-    const poolStride = Math.max(1, ((w * h) / 2048) | 0);
     for (let i = 0; i < detail.length; i += poolStride) if (detail[i] > dMax) dMax = detail[i];
     const dNorm = 1 / Math.max(8, dMax * 0.6);
+    const currentField = { value: px, edgeMag, edgeAng, detail, edgeNorm: currentEdgeNorm, detailNorm: dNorm };
+    const fieldGray = analysis && analysis.fields && analysis.fields.gray ? analysis.fields.gray : currentField;
+    const fieldFull = analysis && analysis.fields && analysis.fields.full ? analysis.fields.full : fieldGray;
+    const fieldDetail = analysis && analysis.fields && analysis.fields.detail ? analysis.fields.detail : fieldGray;
+    const fieldAlpha = analysis && analysis.fields && analysis.fields.a ? analysis.fields.a : null;
+    function phaseField(name) {
+      if (name === 'current') return currentField;
+      return analysis && analysis.fields && analysis.fields[name] ? analysis.fields[name] : fieldGray;
+    }
+    function strongestPhaseAngle(idx, primaryField, supportField) {
+      let bestAng = edgeAng[idx];
+      let bestEdge = edgeMag[idx] * currentEdgeNorm;
+      const gEdge = fieldGray.edgeMag[idx] * fieldGray.edgeNorm;
+      if (gEdge > bestEdge) { bestEdge = gEdge; bestAng = fieldGray.edgeAng[idx]; }
+      if (primaryField) {
+        const pEdge = primaryField.edgeMag[idx] * primaryField.edgeNorm;
+        if (pEdge > bestEdge) { bestEdge = pEdge; bestAng = primaryField.edgeAng[idx]; }
+      }
+      if (supportField) {
+        const sEdge = supportField.edgeMag[idx] * supportField.edgeNorm;
+        if (sEdge > bestEdge) { bestEdge = sEdge; bestAng = supportField.edgeAng[idx]; }
+      }
+      return bestAng;
+    }
+    function mixedSampleValue(ii, primaryField, supportField) {
+      const alphaMix = fieldAlpha ? (fieldAlpha.value[ii] / 255) : 1;
+      const base = px[ii] * (0.52 + alphaMix * 0.08);
+      const primary = primaryField ? primaryField.value[ii] * 0.24 : 0;
+      const support = supportField ? supportField.value[ii] * 0.12 : 0;
+      const grayMix = fieldGray ? fieldGray.value[ii] * 0.12 : 0;
+      return clamp(base + primary + support + grayMix);
+    }
 
     // ── Build candidate pools — every phase's strokes land in-zone with zero
     //    rejected attempts (vs the old "random retry" loop that would bail). ──
@@ -583,9 +764,35 @@ const DitherAlgorithms = (() => {
           pToneDark = [], pToneLight = [], pToneMid = [];
     const N = w * h;
     for (let i = 0; i < N; i++) {
-      const em  = edgeMag[i] / 120;
-      const d01 = Math.min(1, detail[i] * dNorm);
-      const v0  = px[i];
+      const colorEdge = analysis && analysis.fields
+        ? Math.max(
+            analysis.fields.r.edgeMag[i] * analysis.fields.r.edgeNorm,
+            analysis.fields.g.edgeMag[i] * analysis.fields.g.edgeNorm,
+            analysis.fields.b.edgeMag[i] * analysis.fields.b.edgeNorm
+          )
+        : 0;
+      const colorDetail = analysis && analysis.fields
+        ? Math.max(
+            analysis.fields.r.detail[i] * analysis.fields.r.detailNorm,
+            analysis.fields.g.detail[i] * analysis.fields.g.detailNorm,
+            analysis.fields.b.detail[i] * analysis.fields.b.detailNorm
+          )
+        : 0;
+      const em  = Math.max(
+        edgeMag[i] * currentEdgeNorm,
+        fieldGray.edgeMag[i] * fieldGray.edgeNorm,
+        fieldFull.edgeMag[i] * fieldFull.edgeNorm * 0.9,
+        colorEdge
+      );
+      const d01 = Math.max(
+        Math.min(1, detail[i] * dNorm),
+        fieldGray.detail[i] * fieldGray.detailNorm,
+        fieldFull.detail[i] * fieldFull.detailNorm * 0.9,
+        fieldDetail.value[i] / 255,
+        colorDetail
+      );
+      const v0  = clamp(px[i] * 0.42 + fieldGray.value[i] * 0.23 + fieldFull.value[i] * 0.20 + fieldDetail.value[i] * 0.15);
+      if (fieldAlpha && fieldAlpha.value[i] < 4) continue;
       if (em >= 0.25)        pEdgeHard.push(i);
       else if (em < 0.12)    pEdgeSoft.push(i);
       if (d01 >= 0.38)       pDetailHi.push(i);
@@ -643,7 +850,7 @@ const DitherAlgorithms = (() => {
       if (!(custom && custom.enabled)) {
         return { mask: baseMask, size: baseSize, opacity: 1, angleJitter: 0, ditherBand: 0 };
       }
-      const lum = px[sampleIdx];
+      const lum = fieldGray ? fieldGray.value[sampleIdx] : px[sampleIdx];
       const edgeActive = custom.edgeEnabled && edgeLocal * 120 >= custom.edgeThreshold;
       let slot = custom.high || null;
       let resolved = custom.highMI || { m: baseMask, s: baseSize };
@@ -718,7 +925,7 @@ const DitherAlgorithms = (() => {
     // jitter). Radius tapers at both ends. The path can curve slightly each
     // step (curvature). This is what gives strokes the "traveled brush"
     // feel — they describe direction, not just splat.
-    function emitPath(x0, y0, ang0, pathLen, brushR, phase, edgeLocal, sampleIdx, strokeKey) {
+    function emitPath(x0, y0, ang0, pathLen, brushR, phase, edgeLocal, sampleIdx, strokeKey, primaryField, supportField) {
       const brushSpec = selectBrushSpec(sampleIdx, edgeLocal);
       const brushAngleBase = ang0 + (brushSpec.angleJitter || 0) * ((_advHash01(seed, sampleIdx, strokeKey, 881) - 0.5) * Math.PI);
       brushR *= Math.max(0.25, brushSpec.sizeMul != null ? brushSpec.sizeMul : 1);
@@ -730,13 +937,13 @@ const DitherAlgorithms = (() => {
       const pR = Math.max(0, pickupRadius + colorVariety * brushR * 1.2);
       let lx = Math.max(0, Math.min(w - 1, x0 + (rnd() - 0.5) * 2 * pR));
       let ly = Math.max(0, Math.min(h - 1, y0 + (rnd() - 0.5) * 2 * pR));
-      let loadV = px[(ly|0) * w + (lx|0)];
+      let loadV = mixedSampleValue((ly|0) * w + (lx|0), primaryField, supportField);
       let loadLeft = Math.max(1, Math.round(nSteps * (0.3 + rnd() * 0.5) * (1 + wetStreakA * 0.45)));
       // Curvature scales with the phase's waviness + inverse flow strength
       // (high flow = strokes stay committed to their direction).
       const curvature = (1 - flowStrength) * 0.25 + (phase.curvature || 0);
       const curveSign = _advHash01(seed, sampleIdx, strokeKey, 882) < 0.5 ? -1 : 1;
-      const lumAtStart = px[sampleIdx] / 255;
+      const lumAtStart = mixedSampleValue(sampleIdx, primaryField, supportField) / 255;
       const smudgeDrag = wetSmudgeA * pathLen * 0.18;
       for (let s = 0; s < nSteps; s++) {
         // Taper: quartic envelope, peaks mid-stroke, fades at ends.
@@ -781,7 +988,7 @@ const DitherAlgorithms = (() => {
           const dragT = nSteps > 1 ? (s / (nSteps - 1)) : 0;
           const sx = Math.max(0, Math.min(w - 1, x - Math.cos(ang) * smudgeDrag * dragT + (rnd() - 0.5) * 2 * driftR));
           const sy = Math.max(0, Math.min(h - 1, y - Math.sin(ang) * smudgeDrag * dragT + (rnd() - 0.5) * 2 * driftR));
-          loadV = px[(sy|0) * w + (sx|0)];
+          loadV = mixedSampleValue((sy|0) * w + (sx|0), primaryField, supportField);
           loadLeft = Math.max(1, Math.round((nSteps - s) * (0.25 + rnd() * 0.4) * (1 + wetStreakA * 0.45)));
         }
       }
@@ -806,14 +1013,31 @@ const DitherAlgorithms = (() => {
         let idx = baseIdx;
         let x = idx % w;
         let y = (idx / w) | 0;
+        const primaryField = phaseField(agenda[ph % agenda.length]);
+        const supportField = phaseField(agenda[(ph + 2) % agenda.length]);
         if (scatterAmt > 0) {
           x = Math.max(0, Math.min(w - 1, Math.round(x + (_advHash01(seed, x, y, 886 + ph) - 0.5) * scatterAmt * 2)));
           y = Math.max(0, Math.min(h - 1, Math.round(y + (_advHash01(seed, x, y, 887 + ph) - 0.5) * scatterAmt * 2)));
           idx = y * w + x;
         }
-        const em = edgeMag[idx] / 120;
-        const d01 = Math.min(1, detail[idx] * dNorm);
-        const lum01 = px[idx] / 255;
+        const em = Math.max(
+          edgeMag[idx] * currentEdgeNorm,
+          fieldGray.edgeMag[idx] * fieldGray.edgeNorm,
+          primaryField.edgeMag[idx] * primaryField.edgeNorm,
+          supportField.edgeMag[idx] * supportField.edgeNorm * 0.82
+        );
+        const d01 = Math.max(
+          Math.min(1, detail[idx] * dNorm),
+          fieldGray.detail[idx] * fieldGray.detailNorm,
+          primaryField.detail[idx] * primaryField.detailNorm,
+          supportField.detail[idx] * supportField.detailNorm * 0.75
+        );
+        const lum01 = clamp(
+          px[idx] * 0.38 +
+          primaryField.value[idx] * 0.30 +
+          supportField.value[idx] * 0.18 +
+          fieldGray.value[idx] * 0.14
+        ) / 255;
         if (darkFirst > 0 && _advHash01(seed, x, y, 884 + ph) > Math.max(0.12, 1 - lum01 * darkFirst)) continue;
         if (adaptiveDensity > 0) {
           const dKeep = 0.45 + (d01 - 0.5) * adaptiveDensity * 0.9;
@@ -837,9 +1061,10 @@ const DitherAlgorithms = (() => {
         // Initial angle.
         let ang;
         if (phase.formMode === 'form') {
-          ang = edgeAng[idx] + Math.PI * 0.5 + (rnd() - 0.5) * angleJitter * (1 - flowStrength * 0.7);
+          ang = strongestPhaseAngle(idx, primaryField, supportField) + Math.PI * 0.5 +
+            (rnd() - 0.5) * angleJitter * (1 - flowStrength * 0.7);
         } else if (phase.formMode === 'cross') {
-          ang = edgeAng[idx] + (rnd() - 0.5) * 0.35;
+          ang = strongestPhaseAngle(idx, primaryField, supportField) + (rnd() - 0.5) * 0.35;
         } else if (phase.formMode === 'global') {
           ang = globalAng + (rnd() - 0.5) * (angleJitter + 0.2);
         } else {
@@ -852,7 +1077,7 @@ const DitherAlgorithms = (() => {
         const sx = x - Math.cos(ang) * pathLen * 0.5;
         const sy = y - Math.sin(ang) * pathLen * 0.5;
         if (edgeBreak > 0 && em * edgeBreak > 0.78 && _advHash01(seed, x, y, 888 + ph) < edgeBreak * 0.6) continue;
-        emitPath(sx, sy, ang, pathLen, bR, phase, em, idx, (ph << 16) ^ s);
+        emitPath(sx, sy, ang, pathLen, bR, phase, em, idx, (ph << 16) ^ s, primaryField, supportField);
       }
     }
     return o;
@@ -880,6 +1105,24 @@ const DitherAlgorithms = (() => {
       const r = ((hh ^ (hh >>> 16)) >>> 0) / 4294967296 - 0.5;
       const v = o[i] + r * 2 * amp * d01;
       o[i] = v < 0 ? 0 : (v > 255 ? 255 : Math.round(v));
+    }
+    return o;
+  }
+
+  function colorJitterDetailPass(o, analysis, w, h, strength, channelHint, seed) {
+    if (!analysis || !analysis.fields || !(strength > 0)) return o;
+    const fieldGray = analysis.fields.gray;
+    const fieldSat = analysis.fields.saturation || fieldGray;
+    const fieldDetail = analysis.fields.detail || fieldGray;
+    const active = analysis.fields[channelHint] || fieldGray;
+    for (let i = 0; i < o.length; i++) {
+      const satN = fieldSat.value[i] / 255;
+      const detN = fieldDetail.value[i] / 255;
+      if (satN < 0.02 && detN < 0.05) continue;
+      const chroma = active.value[i] - fieldGray.value[i];
+      const noise = (_advHash01(seed, i, active.value[i] | 0, 930) - 0.5) * 2;
+      const delta = chroma * strength * 0.35 + noise * 42 * strength * satN * (0.35 + detN * 0.65);
+      o[i] = clamp(o[i] + delta);
     }
     return o;
   }
@@ -2363,7 +2606,7 @@ const DitherAlgorithms = (() => {
     // When ON, replaces the normal stroke loop with the seed-driven multi-phase
     // painter (advancedPaintPass). The output changes noticeably each seed.
     {id:'advancedEngine',label:'🧪 Use Advanced Engine',type:'checkbox',default:false,
-     hint:'Multi-phase painter. Seed shuffles phase order — edges, detail, shadows, highlights, wash. Produces a unique painting per seed.'},
+     hint:'Full painter rewrite. Analyzes gray/R/G/B/A, value, saturation, edges, and detail; seed shuffles the channel agenda and painting order.'},
     {id:'advancedIntensity',label:'Advanced Stroke Density',min:.3,max:3,step:.05,default:1,
      hint:'Only used when Advanced Engine is on.'},
     // — Core shape —
@@ -2686,6 +2929,10 @@ const DitherAlgorithms = (() => {
 
     const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0 || p.advancedEngine;
     const detail = needDetail ? detailField(px, w, h, 8) : null;
+    const toneGuide = (cbEnabled || p.advancedEngine) ? buildAdvancedSourceAnalysis(w, h, px) : null;
+    const cbGrayMap = toneGuide && toneGuide.fields && toneGuide.fields.gray ? toneGuide.fields.gray.value : null;
+    const advAnalysis = p.advancedEngine ? toneGuide : null;
+    const advChannelHint = p._advChannelHint || 'gray';
 
     // ── EXPERIMENTAL: Advanced multi-phase painter ──
     // See impressionism for the full rationale. When on, replaces the smear
@@ -2700,7 +2947,7 @@ const DitherAlgorithms = (() => {
       if (canvasStart !== 'clean') {
         const advBands = Math.max(3, Math.min(9, Math.round(12 - (p.underpaintBlock || 14) * 0.3)));
         const advGrain = Math.max(0, Math.min(1, (p.underpaintAngle != null ? p.underpaintAngle : 0.8) * 0.6));
-        advancedUnderpaint(o, px, w, h, advBands, advGrain, edgeMag, edgeAng);
+        advancedUnderpaint(o, px, w, h, advBands, advGrain, edgeMag, edgeAng, advAnalysis, seedI, advChannelHint);
         yield o;
       }
       // — Palette-knife → advanced engine config —
@@ -2753,6 +3000,8 @@ const DitherAlgorithms = (() => {
       advCfg.edgeBreak = edgeBreakAmt;
       advCfg.wetSmudge = wetSmudge;
       advCfg.wetStreak = wetStreak;
+      advCfg.analysis = advAnalysis;
+      advCfg.channelHint = advChannelHint;
       advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, advBrushCtx, advCfg);
       yield o;
       if (wetBleed > 0) {
@@ -2871,7 +3120,7 @@ const DitherAlgorithms = (() => {
         let currMask = bMask, currSize = bSize;
         let slotSizeMul = 1, slotOpacity = 1, slotAngJit = 0;
         if (cbEnabled) {
-          const lumByte = Math.round(lum * 255);
+          const lumByte = cbGrayMap ? Math.round(cbGrayMap[y * w + x]) : Math.round(lum * 255);
           if (cbEdgeEn && eMag >= cbEdgeThr) {
             currMask = cbEdgeMI.m; currSize = cbEdgeMI.s;
             if (cbEdge) {
@@ -6510,7 +6759,7 @@ const DitherAlgorithms = (() => {
   A.push({ id:'impressionism', name:'Impressionism / Op-Art', category:'artistic', params:[
     // — EXPERIMENTAL advanced engine —
     {id:'advancedEngine',label:'🧪 Use Advanced Engine',type:'checkbox',default:false,
-     hint:'Multi-phase painter. Seed shuffles phase order — edges, detail, shadows, highlights, wash. Produces a unique painting per seed.'},
+     hint:'Full painter rewrite. Analyzes gray/R/G/B/A, value, saturation, edges, and detail; seed shuffles the channel agenda and painting order.'},
     {id:'advancedIntensity',label:'Advanced Stroke Density',min:.3,max:3,step:.05,default:1,
      hint:'Only used when Advanced Engine is on.'},
     // — Core (same defaults as legacy) —
@@ -6581,7 +6830,8 @@ const DitherAlgorithms = (() => {
       {value:'radial',label:'Radial Starburst'},
       {value:'chromabber',label:'Chromatic Split'},
       {value:'spiral',label:'Spiral Twist'},
-      {value:'detailJitter',label:'Detail Jitter (simulated micro-detail)'}
+      {value:'detailJitter',label:'Detail Jitter (simulated micro-detail)'},
+      {value:'colorJitterDetail',label:'Color Jitter Detail'}
     ],default:'none'},
     {id:'illusionStrength',label:'Illusion Strength',min:0,max:1,step:.05,default:.5},
     // Dab shape is now either the built-in soft ellipse (default) or whatever
@@ -6807,6 +7057,12 @@ const DitherAlgorithms = (() => {
     // Advanced-engine needs detail always (phases depend on it).
     const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0 || p.advancedEngine;
     const detail = needDetail ? detailField(px, w, h, 8) : null;
+    const toneGuide = (cbEnabled || p.advancedEngine || p.illusion === 'colorJitterDetail')
+      ? buildAdvancedSourceAnalysis(w, h, px)
+      : null;
+    const cbGrayMap = toneGuide && toneGuide.fields && toneGuide.fields.gray ? toneGuide.fields.gray.value : null;
+    const advAnalysis = toneGuide;
+    const advChannelHint = p._advChannelHint || 'gray';
 
     // ── EXPERIMENTAL: Advanced multi-phase painter ──
     // When on, bypass the normal dab loop entirely. advancedPaintPass lays
@@ -6817,7 +7073,7 @@ const DitherAlgorithms = (() => {
       if (canvasStart !== 'clean') {
         const advBands = Math.max(3, Math.min(9, Math.round(12 - (p.underpaintBlock || 14) * 0.3)));
         const advGrain = Math.max(0, Math.min(1, (p.underpaintAngle != null ? p.underpaintAngle : 0.8) * 0.6));
-        advancedUnderpaint(o, px, w, h, advBands, advGrain, edgeMagUp, edgeAngUp);
+        advancedUnderpaint(o, px, w, h, advBands, advGrain, edgeMagUp, edgeAngUp, advAnalysis, seedI, advChannelHint);
         yield o;
       }
       // — Impressionism → advanced engine config —
@@ -6872,6 +7128,8 @@ const DitherAlgorithms = (() => {
       advCfg.edgeBreak = edgeBreak;
       advCfg.wetSmudge = wetSmudge;
       advCfg.wetStreak = wetStreak;
+      advCfg.analysis = advAnalysis;
+      advCfg.channelHint = advChannelHint;
       advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, advBrushCtx, advCfg);
       yield o;
       if (wetBleed > 0) {
@@ -6880,6 +7138,9 @@ const DitherAlgorithms = (() => {
       }
       if (p.illusion === 'detailJitter' && detail) {
         detailJitterPass(o, detail, w, h, p.illusionStrength || 0.5, seedI);
+        yield o;
+      } else if (p.illusion === 'colorJitterDetail') {
+        colorJitterDetailPass(o, advAnalysis, w, h, p.illusionStrength || 0.5, advChannelHint, seedI);
         yield o;
       }
       // Rules post-pass still applies (user's if/then layer runs after).
@@ -6973,7 +7234,7 @@ const DitherAlgorithms = (() => {
             slotAngJit  = cbEdge.angleJitter || 0;
           }
         } else {
-          const lumByte = srcVal;
+          const lumByte = cbGrayMap ? Math.round(cbGrayMap[y * w + x]) : srcVal;
           const hv = sh(i, 0, 998);
           const ldith = lumByte + (cbDither > 0 ? (hv - 0.5) * cbDither * 2 : 0);
           let spec;
@@ -7216,6 +7477,10 @@ const DitherAlgorithms = (() => {
     if (p.illusion === 'detailJitter' && detail) {
       detailJitterPass(o, detail, w, h, p.illusionStrength || 0.5, seedI);
       yield o;
+    } else if (p.illusion === 'colorJitterDetail') {
+      const colorAnalysis = buildAdvancedSourceAnalysis(w, h, px);
+      colorJitterDetailPass(o, colorAnalysis, w, h, p.illusionStrength || 0.5, p._advChannelHint || 'gray', seedI);
+      yield o;
     }
 
     // — Post-pass: USER IF/THEN RULES —
@@ -7379,6 +7644,10 @@ const DitherAlgorithms = (() => {
           o[idx] = Math.round(o[idx] * (1 - blend) + (255 - inkJit) * blend);
         }
       }
+    }
+    if (p.illusion === 'colorJitterDetail') {
+      const colorAnalysis = buildAdvancedSourceAnalysis(w, h, px);
+      colorJitterDetailPass(o, colorAnalysis, w, h, p.illusionStrength || 0.5, p._advChannelHint || 'gray', (p.seed|0) || 42);
     }
     return o;
   }
