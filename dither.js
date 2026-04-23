@@ -412,147 +412,241 @@ const DitherAlgorithms = (() => {
   }
 
   // ── ADVANCED PAINTING ENGINE ──
-  // Seed-driven multi-phase painter. Replaces the main stroke loop of
-  // impressionism / palette-knife when their `advancedEngine` flag is on.
+  // When `advancedEngine` is on, this replaces the main stroke loop of
+  // impressionism / palette-knife. It's NOT just a different post-pass —
+  // it reinterprets every existing slider on that algorithm through a
+  // phase-based painter's paradigm:
   //
-  // The pipeline is per-channel so we can't truly cross-correlate R/G/B here,
-  // but we *can* simulate a painter's workflow on a single channel by cycling
-  // through analytical "phases" — each phase only paints pixels that pass its
-  // filter, uses brush/size/angle/opacity choices appropriate for that phase,
-  // and the seed shuffles phase order so each seed produces a structurally
-  // different painting. Running the same per-channel logic on R/G/B with
-  // slightly different phase orders (because seed is scrambled per channel
-  // by the pipeline) produces emergent color variation that reads as
-  // "multi-channel aware" even though each channel is painted independently.
+  //   size / dabLen / dabWidth  → base stroke geometry (length & width)
+  //   smear                     → stroke elongation (how much longer than wide)
+  //   pressure                  → global opacity baseline
+  //   dabCount / coverageDensity→ global stroke density (multiplied into every phase)
+  //   flowStrength / formFollow → how much strokes align with the form (gradient perp)
+  //   edgeSens / edgeBoost      → boosts edge-phase density + shrinks its strokes
+  //   detailAware / sizeByDetail→ boosts detail-busy phase + shrinks its strokes in busy zones
+  //   skipSmoothAreas           → inverse of broad-flat phase density
+  //   sampleDrift / sampleJitter/ colorVariety / colorPickup → pickup offset radius
+  //   angleJitter / pressureJit → randomness within each phase
+  //   lumModulation / sizeByLight→ per-stroke opacity & size based on local luma
+  //   lengthByEdge              → stroke length boost in high-edge zones
+  //   pressureByEdge            → opacity boost in high-edge zones
+  //   wetBleed / wetSmudge / wetStreak → applied as post-passes after painting
+  //   illusion / illusionStrength → still apply (detailJitter post-pass)
   //
-  // Phases:
-  //   edge-follow   — strokes perpendicular to gradient, tight along hard edges
-  //   detail-busy   — small dense strokes in high-detail zones (subject texture)
-  //   broad-flat    — large soft strokes in low-detail zones (sky, skin, walls)
-  //   shadow        — medium strokes in dark tones, thicker/opaque
-  //   highlight     — short bright strokes in light tones
-  //   unifying-wash — very large low-opacity strokes everywhere (ties it together)
-  //   cross-grain   — strokes ALONG the gradient (deliberately crossing form)
+  // Each seed produces a structurally different painting because:
+  //   (a) phase order is shuffled by seed — painter decides whether to block
+  //       in shadows first or detail first
+  //   (b) stroke placement within each phase uses the seed
+  //   (c) the pipeline runs this per-channel, so R/G/B each get their own
+  //       order → emergent color variation that reads as cross-channel awareness
   //
-  // Each stroke samples the source with pickup-jitter (the painter's
-  // "dipping then dragging" move), stamps an elliptical or brush-mask
-  // footprint rotated either form-following or free.
-  //
-  // Args:
-  //   o         — destination buffer (already has underpaint/source/clean laid down)
-  //   px        — source luma (single channel)
-  //   edgeMag   — sobel magnitude, 0..~255
-  //   edgeAng   — sobel angle (radians, gradient direction)
-  //   detail    — detail field (stddev-based, 0..~80)
-  //   bMask,bSize — optional PaintEngine brush mask (customBrushes can override per-stroke later)
-  //   baseSz    — canvas-scaled base stroke size
-  //   intensity — global density multiplier (advancedIntensity param, 0.3..3)
-  function advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, bMask, bSize, baseSz, intensity) {
+  // Phases (7 total — each with a filter, brush profile, and density):
+  //   block-in, broad-flat, shadow, midtone-form, detail-busy, edge-follow,
+  //   highlight, cross-grain, accent-flicks, unifying-wash
+  function advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, bMask, bSize, cfg) {
     const seed = (p.seed|0) || 42;
-    const rnd = mkRand(seed * 2654435761 % 2147483647);
-    // Normalize detail → 0..1
+    const rnd = mkRand((seed * 2654435761) % 2147483647 || 1);
+
+    // ── Config decode (caller passed algo-specific mappings) ──
+    const baseSz        = Math.max(3, cfg.baseSz || 10);
+    const baseW         = Math.max(1, cfg.baseW  || baseSz * 0.35);
+    const stretch       = Math.max(0.4, Math.min(6, cfg.stretch ?? 1.8));
+    const pressure      = Math.max(0.1, Math.min(1.5, cfg.pressure ?? 0.95));
+    const globalDensity = Math.max(0.2, Math.min(4,  cfg.globalDensity ?? 1));
+    const flowStrength  = Math.max(0, Math.min(1, cfg.flowStrength ?? 0.85));
+    const edgeBoost     = Math.max(0, Math.min(3, cfg.edgeBoost ?? 1));
+    const detailAware   = Math.max(0, Math.min(2, cfg.detailAware ?? 1));
+    const sizeByDetail  = Math.max(0, Math.min(2, cfg.sizeByDetail ?? 0.7));
+    const skipSmooth    = Math.max(0, Math.min(1, cfg.skipSmooth ?? 0.5));
+    const lumModulation = Math.max(0, Math.min(2, cfg.lumModulation ?? 1));
+    const lengthByEdge  = Math.max(0, Math.min(2, cfg.lengthByEdge ?? 0.6));
+    const pressureByEdge= Math.max(0, Math.min(2, cfg.pressureByEdge ?? 0.5));
+    const pickupRadius  = Math.max(0, cfg.pickupRadius ?? 2);
+    const angleJitter   = Math.max(0, Math.min(Math.PI, cfg.angleJitter ?? 0.4));
+    const pressureJit   = Math.max(0, Math.min(1, cfg.pressureJit ?? 0.3));
+    const colorVariety  = Math.max(0, Math.min(1, cfg.colorVariety ?? 0.25));
+
+    // ── Normalize detail → 0..1 (stable across channels/canvas sizes) ──
     let dMax = 1;
-    const stride = Math.max(1, ((w * h) / 2048) | 0);
-    for (let i = 0; i < detail.length; i += stride) if (detail[i] > dMax) dMax = detail[i];
+    const poolStride = Math.max(1, ((w * h) / 2048) | 0);
+    for (let i = 0; i < detail.length; i += poolStride) if (detail[i] > dMax) dMax = detail[i];
     const dNorm = 1 / Math.max(8, dMax * 0.6);
 
-    // Phase definitions — filter + painterly knobs.
+    // ── Build candidate pools — every phase's strokes land in-zone with zero
+    //    rejected attempts (vs the old "random retry" loop that would bail). ──
+    const pEdgeHard = [], pEdgeSoft = [], pDetailHi = [], pDetailLo = [],
+          pToneDark = [], pToneLight = [], pToneMid = [];
+    const N = w * h;
+    for (let i = 0; i < N; i++) {
+      const em  = edgeMag[i] / 120;
+      const d01 = Math.min(1, detail[i] * dNorm);
+      const v0  = px[i];
+      if (em >= 0.25)        pEdgeHard.push(i);
+      else if (em < 0.12)    pEdgeSoft.push(i);
+      if (d01 >= 0.38)       pDetailHi.push(i);
+      else if (d01 <= 0.22)  pDetailLo.push(i);
+      if (v0 <= 90)          pToneDark.push(i);
+      else if (v0 >= 170)    pToneLight.push(i);
+      else                   pToneMid.push(i);
+    }
+    const poolFor = {
+      'full':        null,
+      'edge-hard':   pEdgeHard,
+      'edge-soft':   pEdgeSoft,
+      'detail-high': pDetailHi,
+      'detail-low':  pDetailLo,
+      'tone-dark':   pToneDark,
+      'tone-light':  pToneLight,
+      'tone-mid':    pToneMid
+    };
+
+    // Each phase's density is a multiplier on its pool size — so "cover X%
+    // of the pixels in this pool with strokes". After seed shuffle the order
+    // determines the painting's structure. Stretch ratios are applied via
+    // the `stretch` config knob (smear, dabLen/dabWidth, etc.).
     const PHASES = [
-      { name:'edge-follow',   filter:'edge-hard',   sizeMul:0.75, aspect:0.28, opacity:0.92, formFollow:true,  density:0.9, sizeJitter:0.4 },
-      { name:'detail-busy',   filter:'detail-high', sizeMul:0.55, aspect:0.5,  opacity:0.85, formFollow:true,  density:1.4, sizeJitter:0.6 },
-      { name:'broad-flat',    filter:'detail-low',  sizeMul:1.8,  aspect:0.55, opacity:0.6,  formFollow:false, density:0.45, sizeJitter:0.5 },
-      { name:'shadow',        filter:'tone-dark',   sizeMul:1.1,  aspect:0.45, opacity:0.88, formFollow:false, density:0.55, sizeJitter:0.5 },
-      { name:'highlight',     filter:'tone-light',  sizeMul:0.85, aspect:0.55, opacity:0.95, formFollow:false, density:0.5,  sizeJitter:0.4 },
-      { name:'unifying-wash', filter:'full',        sizeMul:1.5,  aspect:0.7,  opacity:0.28, formFollow:false, density:0.3,  sizeJitter:0.7 },
-      { name:'cross-grain',   filter:'edge-hard',   sizeMul:0.65, aspect:0.35, opacity:0.55, formFollow:'cross', density:0.25, sizeJitter:0.5 }
+      { name:'block-in',      filter:'full',        sizeMul:1.9, stretchMul:0.9, opacity:1.00, formMode:'none',   density:0.22, sizeJit:0.5 },
+      { name:'broad-flat',    filter:'detail-low',  sizeMul:1.5, stretchMul:1.0, opacity:0.92, formMode:'global', density:0.70 * (1 - skipSmooth * 0.5), sizeJit:0.4 },
+      { name:'shadow',        filter:'tone-dark',   sizeMul:1.0, stretchMul:1.1, opacity:1.00, formMode:'form',   density:0.85, sizeJit:0.45 },
+      { name:'midtone-form',  filter:'tone-mid',    sizeMul:0.85,stretchMul:1.2, opacity:0.92, formMode:'form',   density:0.65, sizeJit:0.45 },
+      { name:'detail-busy',   filter:'detail-high', sizeMul:0.55,stretchMul:1.4, opacity:0.98, formMode:'form',   density:1.3 * detailAware, sizeJit:0.55 },
+      { name:'edge-follow',   filter:'edge-hard',   sizeMul:0.45,stretchMul:1.6, opacity:1.00, formMode:'form',   density:1.2 * edgeBoost, sizeJit:0.35 },
+      { name:'highlight',     filter:'tone-light',  sizeMul:0.7, stretchMul:1.0, opacity:1.00, formMode:'form',   density:0.75, sizeJit:0.4 },
+      { name:'cross-grain',   filter:'edge-hard',   sizeMul:0.55,stretchMul:1.3, opacity:0.85, formMode:'cross',  density:0.4 * edgeBoost, sizeJit:0.5 },
+      { name:'accent-flicks', filter:'detail-high', sizeMul:0.35,stretchMul:1.8, opacity:1.00, formMode:'form',   density:0.5 * detailAware, sizeJit:0.5 },
+      { name:'unifying-wash', filter:'full',        sizeMul:1.2, stretchMul:0.8, opacity:0.35, formMode:'global', density:0.25, sizeJit:0.6 }
     ];
-    // Fisher-Yates shuffle so seed picks the order (painter decides what to
-    // lay down first — block-in, then detail, or vice-versa).
+    // Fisher-Yates shuffle — seed picks the painter's order of operations.
     const order = PHASES.slice();
     for (let i = order.length - 1; i > 0; i--) {
       const j = Math.floor(rnd() * (i + 1));
       const t = order[i]; order[i] = order[j]; order[j] = t;
     }
 
-    // Pixel-level ellipse stamp with optional brush mask.
-    function stamp(cx, cy, rx, ry, ang, sampleV, opa) {
+    // One "global" angle per painting (seed-derived) — the painter's
+    // dominant direction for flat areas. Feels coherent, not chaotic.
+    const globalAng = rnd() * Math.PI * 2;
+
+    // ── Directional capsule stamp ── (a REAL brushmark, not an ellipse dot).
+    // Draws a pill shape of half-length `hl` and half-width `hw` at angle
+    // `ang`, with soft edges + optional brush-mask texture + soft taper at
+    // stroke ends. Opacity can be well above 0.5 and still feel painterly
+    // because the taper hides the hard edge.
+    function strokeStamp(cx, cy, hl, hw, ang, sampleV, opa) {
       const cosA = Math.cos(ang), sinA = Math.sin(ang);
-      const ext = Math.max(rx, ry) + 1;
+      const ext = Math.ceil(Math.max(hl, hw)) + 1;
       for (let dy = -ext; dy <= ext; dy++) {
         const ny = cy + dy;
         if (ny < 0 || ny >= h) continue;
         for (let dx = -ext; dx <= ext; dx++) {
           const nx = cx + dx;
           if (nx < 0 || nx >= w) continue;
-          // Rotate into brush-local frame.
-          const lx = dx * cosA + dy * sinA;
-          const ly = -dx * sinA + dy * cosA;
-          const nr2 = (lx*lx)/(rx*rx + 0.01) + (ly*ly)/(ry*ry + 0.01);
-          if (nr2 > 1) continue;
-          let maskA = 1 - nr2;  // soft ellipse falloff
+          const lt = dx * cosA + dy * sinA;   // along stroke (-hl..hl inside)
+          const ln = -dx * sinA + dy * cosA;  // across stroke
+          // Distance to the line segment from (-hl,0) to (hl,0).
+          const clT = lt < -hl ? -hl : (lt > hl ? hl : lt);
+          const ddx = lt - clT;
+          const distSq = ddx * ddx + ln * ln;
+          if (distSq > hw * hw) continue;
+          const dist = Math.sqrt(distSq);
+          let wt = 1 - dist / hw;                       // radial falloff
+          // Soft end-taper — last 30% of length fades out.
+          const aAbs = Math.abs(lt);
+          if (aAbs > hl * 0.7) {
+            const endF = 1 - (aAbs - hl * 0.7) / (hl * 0.3 + 0.01);
+            wt *= Math.max(0, endF);
+          }
+          // Brush-mask texture: scratchy bristles, splatter, etc.
           if (bMask && bSize > 0) {
-            // Sample the brush mask at this rotated position.
-            const mx = Math.round((lx / rx) * 0.5 * (bSize - 1) + 0.5 * (bSize - 1));
-            const my = Math.round((ly / ry) * 0.5 * (bSize - 1) + 0.5 * (bSize - 1));
+            const mx = Math.round((lt / hl) * 0.5 * (bSize - 1) + 0.5 * (bSize - 1));
+            const my = Math.round((ln / hw) * 0.5 * (bSize - 1) + 0.5 * (bSize - 1));
             if (mx >= 0 && mx < bSize && my >= 0 && my < bSize) {
-              maskA = (bMask[my * bSize + mx] / 255) * (1 - nr2 * 0.3);
+              wt *= (bMask[my * bSize + mx] / 255);
             }
           }
-          const alpha = Math.max(0, Math.min(1, maskA * opa));
-          if (alpha <= 0.01) continue;
+          // Sharpen the edge so strokes don't bleed into a blur.
+          wt = Math.min(1, wt * 1.7);
+          if (wt <= 0.02) continue;
+          const alpha = Math.max(0, Math.min(1, wt * opa));
           const idx = ny * w + nx;
           o[idx] = Math.round(o[idx] * (1 - alpha) + sampleV * alpha);
         }
       }
     }
 
-    const _intensity = Math.max(0.3, Math.min(3, intensity || 1));
-    for (const phase of order) {
-      // Estimate stroke count — density of a unit cell is (density/sz²).
-      const avgSz = Math.max(3, baseSz * phase.sizeMul);
-      const nStrokes = Math.floor((w * h) / (avgSz * avgSz) * phase.density * _intensity);
-      let placed = 0, attempts = 0;
-      const maxAttempts = nStrokes * 6;
-      while (placed < nStrokes && attempts < maxAttempts) {
-        attempts++;
-        const x = Math.floor(rnd() * w);
-        const y = Math.floor(rnd() * h);
-        const i = y * w + x;
-        const em  = edgeMag[i] / 120;
-        const d01 = Math.min(1, detail[i] * dNorm);
-        const v0  = px[i];
-        let ok = false;
-        switch (phase.filter) {
-          case 'edge-hard':   ok = em >= 0.25; break;
-          case 'detail-high': ok = d01 >= 0.4;  break;
-          case 'detail-low':  ok = d01 <= 0.25; break;
-          case 'tone-dark':   ok = v0 <= 90;    break;
-          case 'tone-light':  ok = v0 >= 165;   break;
-          case 'full':        ok = true;        break;
-        }
-        if (!ok) continue;
-        placed++;
-        // Stroke geometry.
-        const sz = Math.max(2, Math.round(avgSz * (1 - phase.sizeJitter * 0.5 + rnd() * phase.sizeJitter)));
-        const rx = sz;
-        const ry = Math.max(2, Math.round(sz * phase.aspect));
+    // ── Phase loop ──
+    for (let ph = 0; ph < order.length; ph++) {
+      const phase = order[ph];
+      const pool = poolFor[phase.filter];
+      const poolSz = pool ? pool.length : N;
+      if (poolSz === 0) continue;
+      // Stroke count: density × pool coverage × global intensity.
+      // Approx: each stroke covers ~ (avg stroke area) pixels → cover density fraction.
+      const avgSz = baseSz * phase.sizeMul;
+      const avgW  = Math.max(1, baseW * phase.sizeMul * 0.8);
+      const strokeArea = Math.max(4, avgSz * avgW * 2);
+      const targetCover = Math.min(2.5, phase.density * globalDensity);
+      const nStrokes = Math.max(4, Math.floor((poolSz * targetCover) / strokeArea));
+
+      for (let s = 0; s < nStrokes; s++) {
+        // Pick a pool-indexed pixel (guaranteed in-zone) or a random one for 'full'.
+        const idx = pool ? pool[Math.floor(rnd() * poolSz)] : Math.floor(rnd() * N);
+        const x = idx % w;
+        const y = (idx / w) | 0;
+        const v0 = px[idx];
+        const em = edgeMag[idx] / 120;
+        const d01 = Math.min(1, detail[idx] * dNorm);
+
+        // Stroke geometry — length scales with stretch × phase × per-stroke jitter,
+        // size responds to detail (shrink in busy areas) + luma (sizeByLight).
+        let sizeFactor = 1;
+        if (sizeByDetail > 0) sizeFactor *= (1 - sizeByDetail * d01 * 0.5);
+        // Small strokes in hard-edge zones read as "tighter subject description".
+        if (phase.filter === 'edge-hard') sizeFactor *= (1 - 0.3 * edgeBoost / 3);
+        const jit = 1 - phase.sizeJit * 0.5 + rnd() * phase.sizeJit;
+        const wScale = avgSz * sizeFactor * jit;
+        let hl = Math.max(2, Math.round(wScale * stretch * phase.stretchMul * 0.5));
+        if (lengthByEdge > 0) hl = Math.round(hl * (1 + lengthByEdge * em * 0.8));
+        const hw = Math.max(1, Math.round(avgW * sizeFactor * jit * 0.5));
+
+        // Angle — three form-modes.
         let ang;
-        if (phase.formFollow === true) {
-          ang = edgeAng[i] + Math.PI * 0.5 + (rnd() - 0.5) * 0.5;
-        } else if (phase.formFollow === 'cross') {
-          ang = edgeAng[i] + (rnd() - 0.5) * 0.3;
+        if (phase.formMode === 'form') {
+          // Perpendicular to gradient = along the edge = form-following.
+          const base = edgeAng[idx] + Math.PI * 0.5;
+          const noise = (rnd() - 0.5) * angleJitter * (1 - flowStrength * 0.7);
+          ang = base + noise;
+        } else if (phase.formMode === 'cross') {
+          // Along gradient — deliberately cutting across form (brush energy).
+          ang = edgeAng[idx] + (rnd() - 0.5) * 0.4;
+        } else if (phase.formMode === 'global') {
+          ang = globalAng + (rnd() - 0.5) * (angleJitter + 0.3);
         } else {
           ang = rnd() * Math.PI * 2;
         }
-        // Pickup: painter dips the brush + drags — sample with small offset.
-        const pickR = Math.max(1, Math.round(sz * 0.35));
-        const pJx = Math.round((rnd() - 0.5) * 2 * pickR);
-        const pJy = Math.round((rnd() - 0.5) * 2 * pickR);
+
+        // Pickup (painter dips + drags). colorVariety widens the pickup area
+        // so strokes in neighboring zones inherit each other's luminance —
+        // gives the multi-color fiber feel.
+        const pR = Math.max(0, pickupRadius + colorVariety * avgSz * 0.8);
+        const pJx = Math.round((rnd() - 0.5) * 2 * pR);
+        const pJy = Math.round((rnd() - 0.5) * 2 * pR);
         const sx = Math.max(0, Math.min(w - 1, x + pJx));
         const sy = Math.max(0, Math.min(h - 1, y + pJy));
-        const sampleV = px[sy * w + sx];
-        const opa = phase.opacity * (0.7 + rnd() * 0.4);
-        stamp(x, y, rx, ry, ang, sampleV, opa);
+        let sampleV = px[sy * w + sx];
+
+        // Per-stroke opacity — phase baseline × pressure × jitter × luma/edge mods.
+        let opa = phase.opacity * pressure;
+        if (lumModulation > 0) {
+          // Brighter tones = more opaque strokes (more paint loaded).
+          const lumFactor = 0.6 + 0.4 * (v0 / 255);
+          opa *= (1 - lumModulation * 0.4) + lumModulation * 0.4 * lumFactor;
+        }
+        if (pressureByEdge > 0) opa *= (1 + pressureByEdge * em * 0.5);
+        opa *= (1 - pressureJit * 0.5 + rnd() * pressureJit);
+        opa = Math.max(0, Math.min(1, opa));
+
+        strokeStamp(x, y, hl, hw, ang, sampleV, opa);
       }
     }
     return o;
@@ -2372,8 +2466,51 @@ const DitherAlgorithms = (() => {
     // See impressionism for the full rationale. When on, replaces the smear
     // loop with advancedPaintPass.
     if (p.advancedEngine) {
-      const advBase = Math.max(4, Math.round(((p.size != null ? p.size : 10)) * canvasScale * 0.8));
-      advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, bMask, bSize, advBase, (p.advancedIntensity != null ? p.advancedIntensity : 1));
+      // Force a painterly base regardless of canvasStart. Without this, if
+      // the user left canvasStart='source' the advanced strokes would paint
+      // translucent on top of a pristine source image — which reads as a
+      // blur filter, not a painting. We overwrite `o` with a fresh underpaint
+      // (skipping the clean case so the user can still get "strokes on
+      // blank" if they explicitly want it).
+      if (canvasStart !== 'clean') {
+        const _upOpts = {
+          washNoise:      (p.underpaintNoise      != null) ? p.underpaintNoise      : 1,
+          washSmoothness: (p.underpaintSmoothness != null) ? p.underpaintSmoothness : 0,
+          density:        (p.underpaintDensity    != null) ? p.underpaintDensity    : 1,
+          sizeMul:        (p.underpaintSize       != null) ? p.underpaintSize       : 1,
+          detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
+          angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
+          strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1,
+          detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
+        };
+        painterlyUnderpaint(o, px, w, h, underpaintBlock, sh, edgeAng, bMask, bSize, _upOpts);
+        yield o;
+      }
+      // — Palette-knife → advanced engine config —
+      // Every slider on the algo page gets re-interpreted through the
+      // phase paradigm below. See advancedPaintPass for the full mapping.
+      const knifeSz = (p.size != null ? p.size : 10) * canvasScale;
+      const advCfg = {
+        baseSz:        knifeSz,
+        baseW:         Math.max(2, knifeSz * 0.5),
+        stretch:       Math.max(0.6, Math.min(4, (p.smear || 15) / 10)),
+        pressure:      p.pressure != null ? p.pressure : 0.9,
+        globalDensity: (p.coverageDensity != null ? p.coverageDensity : 0.85)
+                        * (p.advancedIntensity != null ? p.advancedIntensity : 1) * 1.6,
+        flowStrength:  Math.max(0, Math.min(1, 1 - (p.angleJitter || 0.3))),
+        edgeBoost:     Math.max(0.3, Math.min(3, (p.edgeSens != null ? p.edgeSens : 1) + 0.3)),
+        detailAware:   p.detailAware != null ? p.detailAware : 1,
+        sizeByDetail:  Math.max(0, Math.min(1.5, p.sizeByLight != null ? p.sizeByLight : 0.7)),
+        skipSmooth:    p.skipSmoothAreas != null ? p.skipSmoothAreas : 0.5,
+        lumModulation: Math.max(0, Math.min(2, p.lsBias != null ? Math.abs(p.lsBias) + 1 : 1)),
+        lengthByEdge:  p.lengthByEdge != null ? p.lengthByEdge : 0.6,
+        pressureByEdge:p.pressureByEdge != null ? p.pressureByEdge : 0.5,
+        pickupRadius:  (p.sampleJitter != null ? p.sampleJitter : 2) + (p.sampleDrift || 0) * 4,
+        angleJitter:   (p.angleJitter != null ? p.angleJitter : 0.3) * Math.PI * 0.5,
+        pressureJit:   p.pressureJit != null ? p.pressureJit : 0.3,
+        colorVariety:  p.colorPickup != null ? p.colorPickup : 0.25
+      };
+      advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, bMask, bSize, advCfg);
       yield o;
       if (Array.isArray(p.rules) && p.rules.length > 0) {
         applyRules(o, px, w, h, p.rules, edgeMag, edgeAng, detail, sh);
@@ -6430,8 +6567,48 @@ const DitherAlgorithms = (() => {
     // detail-busy, detail-flat, shadows, highlights, wash, cross-grain),
     // each with its own brush profile and stroke density.
     if (p.advancedEngine) {
-      const advBase = Math.max(4, Math.round(((p.dabLen != null ? p.dabLen : 8)) * canvasScale));
-      advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, bMask, bSize, advBase, (p.advancedIntensity != null ? p.advancedIntensity : 1));
+      // Force a painterly base — see palette-knife for rationale.
+      if (canvasStart !== 'clean') {
+        const _upOpts2 = {
+          washNoise:      (p.underpaintNoise      != null) ? p.underpaintNoise      : 1,
+          washSmoothness: (p.underpaintSmoothness != null) ? p.underpaintSmoothness : 0,
+          density:        (p.underpaintDensity    != null) ? p.underpaintDensity    : 1,
+          sizeMul:        (p.underpaintSize       != null) ? p.underpaintSize       : 1,
+          detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
+          angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
+          strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1,
+          detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
+        };
+        painterlyUnderpaint(o, px, w, h, underpaintBlock, shUnder, edgeAngUp, _upMask, _upSize, _upOpts2);
+        yield o;
+      }
+      // — Impressionism → advanced engine config —
+      // dabLen × dabWidth drives base geometry; dabCount sets global density
+      // (normalized against the 4000 default); flowStrength/formFollow shape
+      // orientation; wet* params are still applied as post-passes below.
+      const dabL = (p.dabLen != null ? p.dabLen : 8) * canvasScale;
+      const dabW = (p.dabWidth != null ? p.dabWidth : 2) * canvasScale;
+      const advCfg = {
+        baseSz:        Math.max(3, dabL * 0.6),
+        baseW:         Math.max(1, dabW),
+        stretch:       Math.max(0.8, Math.min(5, dabL / Math.max(1, dabW) * 0.5)),
+        pressure:      1.0,
+        globalDensity: ((p.dabCount != null ? p.dabCount : 4000) / 4000)
+                        * (p.advancedIntensity != null ? p.advancedIntensity : 1),
+        flowStrength:  p.flowStrength != null ? p.flowStrength : 0.85,
+        edgeBoost:     Math.max(0.3, Math.min(3, (p.edgeBoost != null ? p.edgeBoost : 0.8) + 0.4)),
+        detailAware:   p.detailAware != null ? p.detailAware : 1,
+        sizeByDetail:  p.sizeByDetail != null ? p.sizeByDetail : 0.7,
+        skipSmooth:    p.skipSmoothAreas != null ? p.skipSmoothAreas : 0.5,
+        lumModulation: p.lumModulation != null ? p.lumModulation : 1,
+        lengthByEdge:  0.5,
+        pressureByEdge:0.3,
+        pickupRadius:  (p.sampleJitter != null ? p.sampleJitter : 2) + (p.sampleDrift || 0) * 3,
+        angleJitter:   (1 - (p.flowStrength != null ? p.flowStrength : 0.85)) * Math.PI,
+        pressureJit:   0.25,
+        colorVariety:  p.colorVariety != null ? p.colorVariety : 0.25
+      };
+      advancedPaintPass(o, px, w, h, p, edgeMag, edgeAng, detail, bMask, bSize, advCfg);
       yield o;
       if (p.illusion === 'detailJitter' && detail) {
         detailJitterPass(o, detail, w, h, p.illusionStrength || 0.5, seedI);
