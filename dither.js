@@ -886,17 +886,184 @@ const DitherAlgorithms = (() => {
     }
   }
 
+  // ── CONSTRUCTION SKETCH HELPERS ──
+  // The sketch engine traces ACTUAL CONTOURS instead of stamping a grid of
+  // unrelated lines. Two passes:
+  //   (1) Edge contour chains — walk along salient edges, snapping to local
+  //       maxima, producing curves that follow the subject's silhouette.
+  //   (2) Tonal mass-boundary chains — same trace algorithm but on the
+  //       gradient of the gray-luma field, so it picks up where lit and
+  //       shadow PLANES meet (form lines, e.g., cheek-into-shadow).
+  // Both produce polylines that are then rendered as wobbly tapered
+  // brushy strokes — the painter's "thinking on paper" energy.
+
+  // Walk one direction (forward = +1, backward = −1) from a seed point along
+  // the edge tangent, snapping to local maxima of the magnitude field. Stops
+  // when the magnitude drops, the chain leaves the canvas, or maxLen is
+  // exhausted. Returns a list of {x, y, m, ang} samples, seed-first.
+  function _walkChainOneDir(seedX, seedY, dirSign, magField, angField, fieldNorm, w, h, opts) {
+    const maxLen     = opts.maxLen || 80;
+    const stepSize   = opts.stepSize || 1.4;
+    const minMag     = opts.minMag != null ? opts.minMag : 0.10;
+    const lookAhead  = opts.lookAhead || 2;
+    const points = [];
+    let x = seedX, y = seedY;
+    let prevAng = null;
+    let traveled = 0;
+    while (traveled < maxLen) {
+      const ix = Math.round(x), iy = Math.round(y);
+      if (ix < 1 || ix >= w - 1 || iy < 1 || iy >= h - 1) break;
+      const i = iy * w + ix;
+      const m = magField[i] * fieldNorm;
+      if (m < minMag) break;
+      // Tangent = perpendicular to gradient.
+      let ang = angField[i] + Math.PI * 0.5;
+      // Tangent has a 180° ambiguity. Pick the side that continues forward.
+      if (prevAng !== null) {
+        const ang2 = ang + Math.PI;
+        let d1 = ang - prevAng, d2 = ang2 - prevAng;
+        while (d1 >  Math.PI) d1 -= 2 * Math.PI;
+        while (d1 < -Math.PI) d1 += 2 * Math.PI;
+        while (d2 >  Math.PI) d2 -= 2 * Math.PI;
+        while (d2 < -Math.PI) d2 += 2 * Math.PI;
+        if (Math.abs(d2) < Math.abs(d1)) ang = ang2;
+      }
+      points.push({ x, y, m, ang });
+      const cosA = Math.cos(ang), sinA = Math.sin(ang);
+      const stepX = cosA * stepSize * dirSign;
+      const stepY = sinA * stepSize * dirSign;
+      // Snap perpendicular: search ±lookAhead pixels orthogonal to the
+      // tangent for the highest edge magnitude — this is what keeps the
+      // chain glued to the actual edge instead of drifting off.
+      let bestX = x + stepX, bestY = y + stepY, bestM = -1;
+      const perpX = -sinA, perpY = cosA;
+      for (let s = -lookAhead; s <= lookAhead; s++) {
+        const tx = x + stepX + perpX * s * 0.65;
+        const ty = y + stepY + perpY * s * 0.65;
+        const itx = Math.round(tx), ity = Math.round(ty);
+        if (itx < 1 || itx >= w - 1 || ity < 1 || ity >= h - 1) continue;
+        const tm = magField[ity * w + itx] * fieldNorm;
+        if (tm > bestM) { bestM = tm; bestX = tx; bestY = ty; }
+      }
+      if (bestM < minMag * 0.65) break;
+      x = bestX;
+      y = bestY;
+      prevAng = ang;
+      traveled += stepSize;
+    }
+    return points;
+  }
+  // Trace a full contour chain from a seed by walking forward + backward.
+  function _traceContourChain(seedX, seedY, magField, angField, fieldNorm, w, h, opts) {
+    const fwd = _walkChainOneDir(seedX, seedY, +1, magField, angField, fieldNorm, w, h, opts);
+    const bwd = _walkChainOneDir(seedX, seedY, -1, magField, angField, fieldNorm, w, h, opts);
+    bwd.reverse();
+    // Avoid duplicating the seed sample (it's first in both arrays).
+    return bwd.concat(fwd.length > 0 ? fwd.slice(1) : []);
+  }
+  // Stamp a small soft brush dot, using a hash-based dither so the stroke
+  // reads as brushy/scratchy rather than as a solid line.
+  function _stampSketchDot(o, w, h, cx, cy, r, mark, opa, seed, jitter) {
+    if (opa < 0.02 || r < 0.35) return;
+    const ir = Math.ceil(r);
+    const r2 = r * r;
+    const dropoff = 0.78 + Math.max(0, jitter) * 0.36;
+    for (let dy = -ir; dy <= ir; dy++) {
+      const wy = Math.round(cy + dy);
+      if (wy < 0 || wy >= h) continue;
+      for (let dx = -ir; dx <= ir; dx++) {
+        const wx = Math.round(cx + dx);
+        if (wx < 0 || wx >= w) continue;
+        const dd = dx * dx + dy * dy;
+        if (dd > r2) continue;
+        const fall = 1 - Math.sqrt(dd) / r;
+        const aa = fall * opa;
+        if (_advHash01(seed | 0, wx, wy, 4317) > aa * dropoff) continue;
+        const oi = wy * w + wx;
+        const ablend = Math.min(0.95, aa);
+        o[oi] = Math.round(mark * ablend + o[oi] * (1 - ablend));
+      }
+    }
+  }
+  // Walk a polyline as a continuous brushy stroke — tapered at both ends,
+  // wobble accumulating along the path so the line feels hand-drawn.
+  function _renderSketchChain(o, px, w, h, chain, halfW, strength, opacity, jitter, seed, lineFeel) {
+    if (!chain || chain.length < 2) return;
+    let totalLen = 0;
+    const segLens = [];
+    for (let i = 0; i < chain.length - 1; i++) {
+      const dx = chain[i + 1].x - chain[i].x;
+      const dy = chain[i + 1].y - chain[i].y;
+      const l = Math.sqrt(dx * dx + dy * dy);
+      segLens.push(l);
+      totalLen += l;
+    }
+    if (totalLen < 1.5) return;
+    const taperLen = Math.min(totalLen * 0.18, halfW * 6);
+    const stepSize = 0.7;
+    const wobAmp = Math.max(0, jitter) * (0.8 + lineFeel * 0.7);
+    let traveled = 0;
+    for (let i = 0; i < chain.length - 1; i++) {
+      const p1 = chain[i], p2 = chain[i + 1];
+      const segLen = segLens[i];
+      if (segLen < 0.1) { traveled += segLen; continue; }
+      const dx = p2.x - p1.x, dy = p2.y - p1.y;
+      const segAng = Math.atan2(dy, dx);
+      const perpX = -Math.sin(segAng), perpY = Math.cos(segAng);
+      const nSteps = Math.max(1, Math.ceil(segLen / stepSize));
+      for (let s = 0; s < nSteps; s++) {
+        const f = s / nSteps;
+        const lt = traveled + segLen * f;
+        let taper = 1;
+        if (lt < taperLen) taper = lt / taperLen;
+        else if (lt > totalLen - taperLen) taper = (totalLen - lt) / taperLen;
+        taper = Math.max(0, Math.min(1, taper));
+        // Two layered sines for organic wobble (not a clean sinewave).
+        const phase = lt * 0.18 + (seed | 0) * 0.0017;
+        const wob = (Math.sin(phase) + Math.sin(phase * 1.7 + 0.4) * 0.42) * wobAmp;
+        const cx = p1.x + dx * f + perpX * wob;
+        const cy = p1.y + dy * f + perpY * wob;
+        const ix = Math.max(0, Math.min(w - 1, Math.round(cx)));
+        const iy = Math.max(0, Math.min(h - 1, Math.round(cy)));
+        const src = px[iy * w + ix];
+        // Dark on bright, light on dark — like a charcoal/conté line that
+        // adapts to the subject's local value.
+        const mark = clamp(src + (src < 128 ? -72 : 56) * strength * (0.55 + taper * 0.55));
+        const dotR = Math.max(0.7, halfW * (0.55 + taper * 0.6));
+        const opa = opacity * taper * (0.48 + strength * 0.52);
+        _stampSketchDot(o, w, h, cx, cy, dotR, mark, opa, seed + (i & 31), jitter);
+      }
+      traveled += segLen;
+    }
+  }
+  // Mark the area within `radius` of every polyline sample so subsequent
+  // seeds in the same trace pass don't re-walk the same contour.
+  function _suppressChain(visited, chain, radius, w, h) {
+    const r2 = radius * radius;
+    const ir = Math.max(1, Math.ceil(radius));
+    for (let i = 0; i < chain.length; i++) {
+      const cx = Math.round(chain[i].x), cy = Math.round(chain[i].y);
+      for (let dy = -ir; dy <= ir; dy++) {
+        const wy = cy + dy;
+        if (wy < 0 || wy >= h) continue;
+        for (let dx = -ir; dx <= ir; dx++) {
+          const wx = cx + dx;
+          if (wx < 0 || wx >= w) continue;
+          if (dx * dx + dy * dy > r2) continue;
+          visited[wy * w + wx] = 1;
+        }
+      }
+    }
+  }
+
   function paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, analysis, opts) {
     opts = opts || {};
     const strength = clamp01(opts.strength != null ? opts.strength : 0);
     if (strength <= 0.01 || !edgeMag || !edgeAng) return o;
     const seed = (opts.seed | 0) || 42;
     const style = opts.style || 'hybrid';
-    const angular = opts.angularity != null
-      ? clamp01(opts.angularity)
-      : (style === 'angular' ? 1 : (style === 'form' ? 0 : 0.48));
+    const angular = opts.angularity != null ? clamp01(opts.angularity) : (style === 'angular' ? 1 : (style === 'form' ? 0 : 0.48));
     const detailFocus = Math.max(0, Math.min(1.5, opts.detailFocus != null ? opts.detailFocus : 0.85));
-    const detailDrive = clamp01((opts.detailDrive != null ? opts.detailDrive : 0.5) * (0.70 + detailFocus * 0.36));
     const density = Math.max(0.15, opts.density != null ? opts.density : 1);
     const opacity = Math.max(0, Math.min(1.5, opts.opacity != null ? opts.opacity : 1));
     const jitter = Math.max(0, Math.min(1.5, opts.jitter != null ? opts.jitter : 0.5));
@@ -908,108 +1075,127 @@ const DitherAlgorithms = (() => {
     const baseLen = Math.max(5, opts.length || 22);
     const baseWidth = Math.max(0.6, opts.width || 1.1);
     const eNorm = 1 / Math.max(16, _advFieldStats(edgeMag) * 0.55);
-    const dNorm = detail ? 1 / Math.max(8, _advFieldStats(detail) * 0.55) : 0;
     const fields = analysis && analysis.fields ? analysis.fields : null;
     const gray = fields && fields.gray ? fields.gray.value : px;
 
-    // First lay in coarse construction marks from tonal masses. These are
-    // intentionally long, rough, and angular: more "where would a painter
-    // draw the apple/background boundary?" than edge-filter scratch.
-    const compSpacing = Math.max(8, Math.round(spacing * (1.65 - Math.min(0.45, structure * 0.18))));
-    const compLen = baseLen * lineScale * (1.45 + structure * 0.95);
-    for (let gy = compSpacing >> 1; gy < h - 1; gy += compSpacing) {
-      for (let gx = compSpacing >> 1; gx < w - 1; gx += compSpacing) {
-        const x = Math.max(1, Math.min(w - 2, gx + Math.round((_advHash01(seed, gx, gy, 1091) - 0.5) * compSpacing * jitter)));
-        const y = Math.max(1, Math.min(h - 2, gy + Math.round((_advHash01(seed, gx, gy, 1092) - 0.5) * compSpacing * jitter)));
-        const idx = y * w + x;
-        const xl = Math.max(0, x - compSpacing), xr = Math.min(w - 1, x + compSpacing);
-        const yu = Math.max(0, y - compSpacing), yd = Math.min(h - 1, y + compSpacing);
-        const gxv = px[y * w + xr] - px[y * w + xl];
-        const gyv = px[yd * w + x] - px[yu * w + x];
-        const grad01 = clamp01(Math.sqrt(gxv * gxv + gyv * gyv) / 160);
-        const edge01 = clamp01(edgeMag[idx] * eNorm);
-        const detail01 = detail ? shapeDetailSignal(detail[idx] * dNorm, detailDrive) : 0;
-        const importance = Math.max(grad01, edge01 * (0.72 + edgeFocus * 0.18), detail01 * 0.46);
-        if (importance < Math.max(0.05, 0.20 - strength * 0.10 - structure * 0.06)) continue;
-        if (_advHash01(seed, x, y, 1093) > Math.min(1, strength * density * (0.35 + importance * 1.20))) continue;
-        let ang = Math.atan2(gyv, gxv) + Math.PI * 0.5;
-        if (!isFinite(ang) || Math.abs(gxv) + Math.abs(gyv) < 4) {
-          ang = painterDirectionAngle(seed ^ 0xabc, x, y, idx, edgeMag, edgeAng, eNorm, {
-            cell: compSpacing * 1.4,
-            formFollow: formBias,
-            edgeFocus,
-            angularity: angular,
-            jitter
-          });
-        }
-        ang = blendAngles(
-          ang,
-          painterDirectionAngle(seed ^ 0xdef, x, y, idx, edgeMag, edgeAng, eNorm, {
-            cell: compSpacing * 1.2,
-            formFollow: formBias,
-            edgeFocus,
-            angularity: angular,
-            jitter
-          }),
-          0.28
-        );
-        ang = quantizeAngle(ang, angular, style === 'angular' ? 8 : 12);
-        const src = px[idx];
-        const mark = clamp(src + (src < 128 ? -70 : 48) * strength * (0.7 + importance * 0.6));
-        const len = compLen * (0.65 + importance * 1.35) * (0.75 + _advHash01(seed, x, y, 1094) * 0.55);
-        const width = baseWidth * (1.0 + strength * 1.2) * Math.sqrt(0.8 + structure * 0.5);
-        paintSketchLine(o, w, h, x, y, ang, len, width, mark, Math.min(1, opacity * (0.42 + importance * 0.55)), seed, 1095);
-        if (angular > 0.55 && _advHash01(seed, x, y, 1096) < 0.34 + importance * 0.26) {
-          const crossAng = quantizeAngle(ang + (Math.PI * 0.5) * (_advHash01(seed, x, y, 1097) < 0.5 ? -1 : 1), angular, 8);
-          paintSketchLine(o, w, h, x, y, crossAng, len * 0.42, width * 0.72, mark, Math.min(1, opacity * 0.46), seed, 1098);
-        }
+    // Style → line feel knob: 'angular' keeps strokes straighter (less
+    // wobble, longer chains); 'form' lets them curve more; 'hybrid' splits.
+    const lineFeel = style === 'form' ? 1.0 : (style === 'angular' ? 0.45 : 0.78);
+    // Width grows with strength but we want sketch lines THINNER than the
+    // old grid stamps (otherwise contour lines smear into block-ins).
+    const halfW = baseWidth * (0.55 + strength * 0.85) * Math.sqrt(0.7 + structure * 0.4);
+    // Maximum chain travel — long enough to cross most of an interesting
+    // contour. Scaled by lineScale + structure (more structure → longer
+    // committed lines) + a small bonus from strength.
+    const maxChainLen = Math.max(24, baseLen * lineScale * (2.8 + structure * 0.9 + strength * 0.6));
+
+    // ── PASS 1: Edge contour chains ──
+    // Sample candidate seeds on a coarse grid, sort by edge strength,
+    // greedily trace from strongest-first, using a suppression mask so
+    // we don't redraw the same contour over and over.
+    const visited = new Uint8Array(w * h);
+    const suppressR = Math.max(2, Math.round(spacing * (0.55 + (1 - lineFeel) * 0.25)));
+    const seedStride = Math.max(2, Math.round(spacing * 0.45));
+    const minSeedMag = Math.max(0.15, 0.34 - strength * 0.18 - edgeFocus * 0.04);
+
+    const seeds = [];
+    for (let y = seedStride; y < h - seedStride; y += seedStride) {
+      for (let x = seedStride; x < w - seedStride; x += seedStride) {
+        const i = y * w + x;
+        const e = edgeMag[i] * eNorm;
+        if (e < minSeedMag) continue;
+        // Tiny hash jitter so adjacent runs don't sit on a perfect grid.
+        const jx = Math.round((_advHash01(seed, x, y, 5101) - 0.5) * seedStride * jitter * 0.6);
+        const jy = Math.round((_advHash01(seed, x, y, 5102) - 0.5) * seedStride * jitter * 0.6);
+        const sx = Math.max(1, Math.min(w - 2, x + jx));
+        const sy = Math.max(1, Math.min(h - 2, y + jy));
+        const si = sy * w + sx;
+        const se = edgeMag[si] * eNorm;
+        if (se < minSeedMag * 0.85) continue;
+        seeds.push({ x: sx, y: sy, e: se, i: si });
+      }
+    }
+    seeds.sort((a, b) => b.e - a.e);
+    const maxChains = Math.max(8, Math.floor(seeds.length * Math.min(1.4, strength * density * 0.85)));
+
+    const chainOpts = {
+      maxLen: maxChainLen,
+      stepSize: 1.3,
+      minMag: Math.max(0.08, 0.16 - strength * 0.05),
+      lookAhead: 2 + (lineFeel > 0.7 ? 1 : 0)
+    };
+    let chainsDrawn = 0;
+    for (let si = 0; si < seeds.length && chainsDrawn < maxChains; si++) {
+      const s = seeds[si];
+      if (visited[s.i]) continue;
+      const chain = _traceContourChain(s.x, s.y, edgeMag, edgeAng, eNorm, w, h, chainOpts);
+      if (chain.length < 4) continue;
+      _suppressChain(visited, chain, suppressR, w, h);
+      _renderSketchChain(o, px, w, h, chain, halfW, strength, opacity * (0.65 + edgeFocus * 0.20), jitter, seed ^ (si * 0x9e37 | 0), lineFeel);
+      chainsDrawn++;
+      // Occasional cross-hatch tick when the artist commits a corner —
+      // a short perpendicular flick at the chain's midpoint when the
+      // local style favors angular construction.
+      if (angular > 0.55 && chain.length > 6 && _advHash01(seed, s.x, s.y, 5181) < 0.32 + strength * 0.18) {
+        const mid = chain[(chain.length / 2) | 0];
+        const tickAng = mid.ang + Math.PI * 0.5 * (_advHash01(seed, s.x, s.y, 5182) < 0.5 ? -1 : 1);
+        const tickLen = baseLen * lineScale * (0.32 + strength * 0.28);
+        const tickMark = clamp(px[((mid.y | 0) * w + (mid.x | 0)) | 0] + (px[((mid.y | 0) * w + (mid.x | 0)) | 0] < 128 ? -68 : 50) * strength);
+        paintSketchLine(o, w, h, mid.x, mid.y, tickAng, tickLen, halfW * 0.85, tickMark, Math.min(0.85, opacity * 0.55), seed, 5183);
       }
     }
 
-    for (let gy = 1; gy < h - 1; gy += spacing) {
-      const jy = Math.round((_advHash01(seed, gy, spacing, 1001) - 0.5) * spacing * (0.45 + jitter * 0.9));
-      const y = Math.max(1, Math.min(h - 2, gy + jy));
-      for (let gx = 1; gx < w - 1; gx += spacing) {
-        const jx = Math.round((_advHash01(seed, gx, y, 1002) - 0.5) * spacing * (0.45 + jitter * 0.9));
-        const x = Math.max(1, Math.min(w - 2, gx + jx));
-        const idx = y * w + x;
-        const edge01 = clamp01(edgeMag[idx] * eNorm);
-        const detail01 = detail ? shapeDetailSignal(detail[idx] * dNorm, detailDrive) : 0;
-        const importance = Math.max(edge01, detail01 * 0.72);
-        const threshold = 0.22 - strength * 0.10 - detailDrive * 0.04;
-        if (importance < threshold) continue;
-        const keep = strength * (0.24 + importance * 0.92);
-        if (_advHash01(seed, x, y, 1003) > keep) continue;
-        let ang = painterDirectionAngle(seed ^ 0x135, x, y, idx, edgeMag, edgeAng, eNorm, {
-          cell: spacing * 1.6,
-          formFollow: formBias,
-          edgeFocus,
-          angularity: angular,
-          jitter,
-          divisions: style === 'angular' ? 8 : 12
-        });
-        const ca = Math.cos(ang), sa = Math.sin(ang);
-        const len = baseLen * lineScale * (0.8 + importance * 1.45) * (0.75 + _advHash01(seed, x, y, 1005) * 0.7);
-        const halfLen = len * 0.5;
-        const halfW = baseWidth * (0.9 + strength * 1.4);
-        const src = px[idx];
-        const g = gray ? gray[idx] : src;
-        const mark = clamp(src + (g < 128 ? -52 : 38) * strength * (0.55 + importance * 0.65));
-        for (let t = -halfLen; t <= halfLen; t += 1) {
-          const taper = 1 - Math.abs(t) / Math.max(1, halfLen);
-          if (taper <= 0) continue;
-          for (let ww = -halfW; ww <= halfW; ww += 1) {
-            const wx = Math.round(x + ca * t - sa * ww);
-            const wy = Math.round(y + sa * t + ca * ww);
-            if (wx < 0 || wx >= w || wy < 0 || wy >= h) continue;
-            const cross = 1 - Math.abs(ww) / Math.max(1, halfW);
-            const prob = taper * cross * (0.48 + strength * 0.52);
-            if (_advHash01(seed, wx, wy, 1006 + (t | 0)) > prob) continue;
-            const oi = wy * w + wx;
-            const a = Math.min(0.94, (0.28 + strength * 0.52 + importance * 0.18) * opacity);
-            o[oi] = Math.round(mark * a + o[oi] * (1 - a));
-          }
+    // ── PASS 2: Tonal mass-boundary chains ──
+    // Compute a coarse gradient on the gray-luma field at a wider block
+    // (so we pick up where the LIT-vs-SHADOW PLANES meet, not edge-filter
+    // noise) and trace those as broader, looser sketch lines. These are
+    // the "form" lines — cheekbone arc, the back of a cup, the horizon
+    // between sky and land — that a painter draws to commit major masses.
+    if (gray && structure > 0.05) {
+      const massBlock = Math.max(3, Math.round(spacing * 0.85));
+      const grayMag = new Float32Array(w * h);
+      const grayAng = new Float32Array(w * h);
+      for (let y = massBlock; y < h - massBlock; y++) {
+        const yr = y * w;
+        for (let x = massBlock; x < w - massBlock; x++) {
+          const gxv = gray[yr + (x + massBlock)] - gray[yr + (x - massBlock)];
+          const gyv = gray[(y + massBlock) * w + x] - gray[(y - massBlock) * w + x];
+          grayMag[yr + x] = Math.sqrt(gxv * gxv + gyv * gyv);
+          grayAng[yr + x] = Math.atan2(gyv, gxv);
         }
+      }
+      const gNorm = 1 / Math.max(16, _advFieldStats(grayMag) * 0.55);
+      const massStride = Math.max(3, seedStride * 2);
+      const massMinMag = Math.max(0.22, 0.36 - strength * 0.10);
+      const massSeeds = [];
+      for (let y = massStride; y < h - massStride; y += massStride) {
+        for (let x = massStride; x < w - massStride; x += massStride) {
+          const i = y * w + x;
+          const m = grayMag[i] * gNorm;
+          if (m < massMinMag) continue;
+          massSeeds.push({ x, y, m, i });
+        }
+      }
+      massSeeds.sort((a, b) => b.m - a.m);
+      const maxMassChains = Math.max(4, Math.floor(massSeeds.length * Math.min(1, strength * structure * 0.75)));
+      const massVisited = new Uint8Array(w * h);
+      const massSuppressR = Math.max(3, Math.round(suppressR * 1.45));
+      const massHalfW = halfW * (1.05 + structure * 0.45);
+      const massChainOpts = {
+        maxLen: maxChainLen * 1.55,
+        stepSize: 1.7,
+        minMag: Math.max(0.15, massMinMag * 0.55),
+        lookAhead: 3
+      };
+      let massDrawn = 0;
+      for (let si = 0; si < massSeeds.length && massDrawn < maxMassChains; si++) {
+        const s = massSeeds[si];
+        if (massVisited[s.i]) continue;
+        const chain = _traceContourChain(s.x, s.y, grayMag, grayAng, gNorm, w, h, massChainOpts);
+        if (chain.length < 6) continue;
+        _suppressChain(massVisited, chain, massSuppressR, w, h);
+        _renderSketchChain(o, px, w, h, chain, massHalfW, strength * (0.85 + formBias * 0.25), opacity * (0.78 + formBias * 0.22), jitter * (1 + formBias * 0.4), seed ^ 0x9e37 ^ (si * 0x4cf | 0), Math.min(1.2, lineFeel + 0.18));
+        massDrawn++;
       }
     }
     return o;
