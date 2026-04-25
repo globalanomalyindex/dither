@@ -325,6 +325,8 @@ const DitherAlgorithms = (() => {
     const _detailResp     = (opts.detailResp     != null) ? opts.detailResp     : 1;
     const _angJitU        = (opts.angleJitter    != null) ? opts.angleJitter    : 0.8;
     const _strokeStrength = (opts.strokeStrength != null) ? opts.strokeStrength : 1;
+    const _edgeFocusU     = Math.max(0, Math.min(1.5, opts.edgeFocus != null ? opts.edgeFocus : 0.3));
+    const _angularityU    = clamp01(opts.angularity != null ? opts.angularity : 0.25);
     // detailPreserve: detail-gated reconstruction pressure. In busy pixels
     // it adds a small dithered tonal correction, more/smaller strokes, and
     // structural marks; it should not simply reveal the source photo.
@@ -569,14 +571,14 @@ const DitherAlgorithms = (() => {
         }
       }
     }
-    const structureStrength = clamp01(_detailPreserve * 0.85 + _effDetailResp * 0.12);
+    const structureStrength = clamp01((_detailPreserve * 0.85 + _effDetailResp * 0.12) * (0.78 + _edgeFocusU * 0.34));
     if (structureStrength > 0.03) {
       paintStructuralEdgeStrokes(o, px, w, h, opts.edgeMag || null, edgeAng, df, sh, {
         strength: structureStrength,
         detailDrive: Math.min(1, _effDetailResp / 2),
         angularity: (opts.formFollow != null && opts.formFollow < 0)
           ? Math.min(1, -opts.formFollow)
-          : 0.35,
+          : Math.max(0.35, _angularityU),
         length: block * (1.35 + structureStrength * 1.15),
         width: Math.max(0.8, block * 0.08),
         spacing: Math.max(3, block * (0.76 - structureStrength * 0.26)),
@@ -695,13 +697,13 @@ const DitherAlgorithms = (() => {
 
   function defaultPainterLayerSettings() {
     return {
-      underpaint:   { scale: 1.15, density: 0.85, opacity: 0.92, jitter: 0.45 },
-      construction: { scale: 1.00, density: 1.10, opacity: 0.80, jitter: 0.58 },
-      block:        { scale: 1.32, density: 0.82, opacity: 0.90, jitter: 0.34 },
-      forms:        { scale: 0.95, density: 1.05, opacity: 0.82, jitter: 0.28 },
-      color:        { scale: 0.74, density: 1.28, opacity: 0.82, jitter: 0.76 },
-      edges:        { scale: 0.62, density: 1.22, opacity: 0.92, jitter: 0.22 },
-      finish:       { scale: 1.00, density: 1.00, opacity: 1.00, jitter: 0.35 }
+      underpaint:   { scale: 1.15, density: 0.85, opacity: 0.92, jitter: 0.45, detail: 0.45, angularity: 0.30, form: 0.25, edge: 0.20 },
+      construction: { scale: 1.00, density: 1.16, opacity: 0.88, jitter: 0.62, detail: 0.85, angularity: 0.92, form: 0.28, edge: 0.78 },
+      block:        { scale: 1.38, density: 0.76, opacity: 0.92, jitter: 0.38, detail: 0.25, angularity: 0.72, form: 0.16, edge: 0.20 },
+      forms:        { scale: 0.95, density: 1.02, opacity: 0.84, jitter: 0.34, detail: 0.64, angularity: 0.38, form: 0.74, edge: 0.46 },
+      color:        { scale: 0.68, density: 1.35, opacity: 0.82, jitter: 0.88, detail: 0.78, angularity: 0.20, form: 0.32, edge: 0.30 },
+      edges:        { scale: 0.58, density: 1.30, opacity: 0.94, jitter: 0.24, detail: 1.10, angularity: 0.48, form: 0.86, edge: 1.10 },
+      finish:       { scale: 1.00, density: 1.00, opacity: 1.00, jitter: 0.44, detail: 0.82, angularity: 0.34, form: 0.62, edge: 0.70 }
     };
   }
 
@@ -748,7 +750,11 @@ const DitherAlgorithms = (() => {
       scale: Math.max(0.25, Math.min(3, finiteOr(merged.scale, base.scale))),
       density: Math.max(0.15, Math.min(3, finiteOr(merged.density, base.density))),
       opacity: Math.max(0, Math.min(1.5, finiteOr(merged.opacity, base.opacity))),
-      jitter: Math.max(0, Math.min(1.5, finiteOr(merged.jitter, base.jitter)))
+      jitter: Math.max(0, Math.min(1.5, finiteOr(merged.jitter, base.jitter))),
+      detail: Math.max(0, Math.min(1.5, finiteOr(merged.detail, base.detail != null ? base.detail : 0.7))),
+      angularity: Math.max(0, Math.min(1, finiteOr(merged.angularity, base.angularity != null ? base.angularity : 0.35))),
+      form: Math.max(0, Math.min(1, finiteOr(merged.form, base.form != null ? base.form : 0.5))),
+      edge: Math.max(0, Math.min(1.5, finiteOr(merged.edge, base.edge != null ? base.edge : 0.5)))
     };
   }
 
@@ -766,8 +772,73 @@ const DitherAlgorithms = (() => {
       flowMul: layer.flowMul * (1 + Math.max(0, 0.55 - jitter) * 0.10),
       pickupMul: layer.pickupMul * (0.82 + scale * 0.18),
       jitterMul: layer.jitterMul * (0.62 + jitter * 0.76),
-      opacityMul: layer.opacityMul * opacity
+      opacityMul: layer.opacityMul * opacity,
+      detailBoost: layer.detailBoost * (0.72 + (s.detail || 0.7) * 0.42),
+      edgeFloor: layer.edgeFloor * (1 - Math.min(0.42, (s.edge || 0.5) * 0.18)),
+      reconDetail: s.detail || 0,
+      reconAngularity: s.angularity || 0,
+      reconForm: s.form || 0,
+      reconEdge: s.edge || 0,
+      reconJitter: jitter
     }));
+  }
+
+  function blendAngles(a, b, t) {
+    const d = Math.atan2(Math.sin(b - a), Math.cos(b - a));
+    return a + d * clamp01(t);
+  }
+
+  function quantizeAngle(ang, amount, divisions) {
+    const amt = clamp01(amount || 0);
+    if (amt <= 0.001) return ang;
+    const qStep = Math.PI * 2 / Math.max(4, divisions || 16);
+    const snapped = Math.round(ang / qStep) * qStep;
+    return blendAngles(ang, snapped, amt);
+  }
+
+  function painterDirectionAngle(seed, x, y, idx, edgeMag, edgeAng, edgeNorm, opts) {
+    opts = opts || {};
+    const cell = Math.max(6, Math.round(opts.cell || 18));
+    const cx = Math.floor(x / cell), cy = Math.floor(y / cell);
+    const base = _advHash01(seed || 1, cx, cy, 1171) * Math.PI * 2;
+    const neighbor = _advHash01(seed || 1, cx + 7, cy - 3, 1172) * Math.PI * 2;
+    const local = _advHash01(seed || 1, x >> 2, y >> 2, 1173) * Math.PI * 2;
+    let field = blendAngles(base, neighbor, 0.36);
+    field = blendAngles(field, local, 0.18 + clamp01(opts.jitter || 0) * 0.18);
+    field += Math.sin((x + seed) * 0.031 + cy * 0.9) * 0.24;
+    field += Math.cos((y - seed) * 0.027 + cx * 0.7) * 0.18;
+
+    if (edgeAng && edgeMag && idx >= 0) {
+      const edge01 = clamp01(edgeMag[idx] * (edgeNorm || (1 / 120)));
+      const tangent = edgeAng[idx] + Math.PI * 0.5;
+      const edgeFocus = Math.max(0, opts.edgeFocus != null ? opts.edgeFocus : 0.5);
+      const formFollow = Math.max(0, opts.formFollow != null ? opts.formFollow : 0.35);
+      const edgeWeight = clamp01(Math.pow(edge01, 0.55) * (0.24 + edgeFocus * 0.54) + formFollow * 0.22);
+      field = blendAngles(field, tangent, edgeWeight);
+    }
+    return quantizeAngle(field, opts.angularity || 0, opts.divisions || 16);
+  }
+
+  function paintSketchLine(o, w, h, cx, cy, ang, len, width, mark, opacity, seed, tag) {
+    const ca = Math.cos(ang), sa = Math.sin(ang);
+    const halfLen = Math.max(1, len * 0.5);
+    const halfW = Math.max(0.5, width);
+    const aMax = Math.max(0, Math.min(1, opacity));
+    for (let t = -halfLen; t <= halfLen; t += 1) {
+      const taper = 1 - Math.abs(t) / halfLen;
+      if (taper <= 0) continue;
+      for (let ww = -halfW; ww <= halfW; ww += 1) {
+        const wx = Math.round(cx + ca * t - sa * ww);
+        const wy = Math.round(cy + sa * t + ca * ww);
+        if (wx < 0 || wx >= w || wy < 0 || wy >= h) continue;
+        const cross = 1 - Math.abs(ww) / Math.max(1, halfW);
+        const prob = taper * cross * (0.52 + aMax * 0.38);
+        if (_advHash01(seed || 1, wx, wy, (tag || 0) + (t | 0)) > prob) continue;
+        const oi = wy * w + wx;
+        const a = Math.min(0.96, aMax * (0.45 + taper * 0.35 + cross * 0.20));
+        o[oi] = Math.round(mark * a + o[oi] * (1 - a));
+      }
+    }
   }
 
   function paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, analysis, opts) {
@@ -776,11 +847,17 @@ const DitherAlgorithms = (() => {
     if (strength <= 0.01 || !edgeMag || !edgeAng) return o;
     const seed = (opts.seed | 0) || 42;
     const style = opts.style || 'hybrid';
-    const angular = style === 'angular' ? 1 : (style === 'form' ? 0 : 0.48);
-    const detailDrive = clamp01(opts.detailDrive != null ? opts.detailDrive : 0.5);
+    const angular = opts.angularity != null
+      ? clamp01(opts.angularity)
+      : (style === 'angular' ? 1 : (style === 'form' ? 0 : 0.48));
+    const detailFocus = Math.max(0, Math.min(1.5, opts.detailFocus != null ? opts.detailFocus : 0.85));
+    const detailDrive = clamp01((opts.detailDrive != null ? opts.detailDrive : 0.5) * (0.70 + detailFocus * 0.36));
     const density = Math.max(0.15, opts.density != null ? opts.density : 1);
     const opacity = Math.max(0, Math.min(1.5, opts.opacity != null ? opts.opacity : 1));
     const jitter = Math.max(0, Math.min(1.5, opts.jitter != null ? opts.jitter : 0.5));
+    const edgeFocus = Math.max(0, Math.min(1.5, opts.edgeFocus != null ? opts.edgeFocus : 0.75));
+    const formBias = clamp01(opts.form != null ? opts.form : (style === 'form' ? 0.8 : 0.28));
+    const structure = Math.max(0, Math.min(1.5, opts.structure != null ? opts.structure : 0.8));
     const lineScale = Math.max(0.5, opts.lineScale || 1);
     const spacing = Math.max(3, Math.round((opts.spacing || 10) / ((0.8 + strength * 0.55) * Math.sqrt(density))));
     const baseLen = Math.max(5, opts.length || 22);
@@ -789,6 +866,61 @@ const DitherAlgorithms = (() => {
     const dNorm = detail ? 1 / Math.max(8, _advFieldStats(detail) * 0.55) : 0;
     const fields = analysis && analysis.fields ? analysis.fields : null;
     const gray = fields && fields.gray ? fields.gray.value : px;
+
+    // First lay in coarse construction marks from tonal masses. These are
+    // intentionally long, rough, and angular: more "where would a painter
+    // draw the apple/background boundary?" than edge-filter scratch.
+    const compSpacing = Math.max(8, Math.round(spacing * (1.65 - Math.min(0.45, structure * 0.18))));
+    const compLen = baseLen * lineScale * (1.45 + structure * 0.95);
+    for (let gy = compSpacing >> 1; gy < h - 1; gy += compSpacing) {
+      for (let gx = compSpacing >> 1; gx < w - 1; gx += compSpacing) {
+        const x = Math.max(1, Math.min(w - 2, gx + Math.round((_advHash01(seed, gx, gy, 1091) - 0.5) * compSpacing * jitter)));
+        const y = Math.max(1, Math.min(h - 2, gy + Math.round((_advHash01(seed, gx, gy, 1092) - 0.5) * compSpacing * jitter)));
+        const idx = y * w + x;
+        const xl = Math.max(0, x - compSpacing), xr = Math.min(w - 1, x + compSpacing);
+        const yu = Math.max(0, y - compSpacing), yd = Math.min(h - 1, y + compSpacing);
+        const gxv = px[y * w + xr] - px[y * w + xl];
+        const gyv = px[yd * w + x] - px[yu * w + x];
+        const grad01 = clamp01(Math.sqrt(gxv * gxv + gyv * gyv) / 160);
+        const edge01 = clamp01(edgeMag[idx] * eNorm);
+        const detail01 = detail ? shapeDetailSignal(detail[idx] * dNorm, detailDrive) : 0;
+        const importance = Math.max(grad01, edge01 * (0.72 + edgeFocus * 0.18), detail01 * 0.46);
+        if (importance < Math.max(0.05, 0.20 - strength * 0.10 - structure * 0.06)) continue;
+        if (_advHash01(seed, x, y, 1093) > Math.min(1, strength * density * (0.35 + importance * 1.20))) continue;
+        let ang = Math.atan2(gyv, gxv) + Math.PI * 0.5;
+        if (!isFinite(ang) || Math.abs(gxv) + Math.abs(gyv) < 4) {
+          ang = painterDirectionAngle(seed ^ 0xabc, x, y, idx, edgeMag, edgeAng, eNorm, {
+            cell: compSpacing * 1.4,
+            formFollow: formBias,
+            edgeFocus,
+            angularity: angular,
+            jitter
+          });
+        }
+        ang = blendAngles(
+          ang,
+          painterDirectionAngle(seed ^ 0xdef, x, y, idx, edgeMag, edgeAng, eNorm, {
+            cell: compSpacing * 1.2,
+            formFollow: formBias,
+            edgeFocus,
+            angularity: angular,
+            jitter
+          }),
+          0.28
+        );
+        ang = quantizeAngle(ang, angular, style === 'angular' ? 8 : 12);
+        const src = px[idx];
+        const mark = clamp(src + (src < 128 ? -70 : 48) * strength * (0.7 + importance * 0.6));
+        const len = compLen * (0.65 + importance * 1.35) * (0.75 + _advHash01(seed, x, y, 1094) * 0.55);
+        const width = baseWidth * (1.0 + strength * 1.2) * Math.sqrt(0.8 + structure * 0.5);
+        paintSketchLine(o, w, h, x, y, ang, len, width, mark, Math.min(1, opacity * (0.42 + importance * 0.55)), seed, 1095);
+        if (angular > 0.55 && _advHash01(seed, x, y, 1096) < 0.34 + importance * 0.26) {
+          const crossAng = quantizeAngle(ang + (Math.PI * 0.5) * (_advHash01(seed, x, y, 1097) < 0.5 ? -1 : 1), angular, 8);
+          paintSketchLine(o, w, h, x, y, crossAng, len * 0.42, width * 0.72, mark, Math.min(1, opacity * 0.46), seed, 1098);
+        }
+      }
+    }
+
     for (let gy = 1; gy < h - 1; gy += spacing) {
       const jy = Math.round((_advHash01(seed, gy, spacing, 1001) - 0.5) * spacing * (0.45 + jitter * 0.9));
       const y = Math.max(1, Math.min(h - 2, gy + jy));
@@ -803,14 +935,14 @@ const DitherAlgorithms = (() => {
         if (importance < threshold) continue;
         const keep = strength * (0.24 + importance * 0.92);
         if (_advHash01(seed, x, y, 1003) > keep) continue;
-        let ang = edgeAng[idx] + Math.PI * 0.5;
-        const globalAng = _advHash01(seed, idx, 0, 1004) * Math.PI * 2;
-        ang = ang * (1 - angular * (0.25 + jitter * 0.18)) + globalAng * angular * (0.25 + jitter * 0.18);
-        if (angular > 0.02) {
-          const qStep = Math.PI * 2 / (style === 'angular' ? 8 : 12);
-          const snapped = Math.round(ang / qStep) * qStep;
-          ang = ang * (1 - angular) + snapped * angular;
-        }
+        let ang = painterDirectionAngle(seed ^ 0x135, x, y, idx, edgeMag, edgeAng, eNorm, {
+          cell: spacing * 1.6,
+          formFollow: formBias,
+          edgeFocus,
+          angularity: angular,
+          jitter,
+          divisions: style === 'angular' ? 8 : 12
+        });
         const ca = Math.cos(ang), sa = Math.sin(ang);
         const len = baseLen * lineScale * (0.8 + importance * 1.45) * (0.75 + _advHash01(seed, x, y, 1005) * 0.7);
         const halfLen = len * 0.5;
@@ -847,6 +979,9 @@ const DitherAlgorithms = (() => {
     const density = Math.max(0.15, opts.density != null ? opts.density : 1);
     const opacity = Math.max(0, Math.min(1.5, opts.opacity != null ? opts.opacity : 1));
     const jitter = Math.max(0, Math.min(1.5, opts.jitter != null ? opts.jitter : 0.5));
+    const detailFocus = Math.max(0, Math.min(1.5, opts.detailFocus != null ? opts.detailFocus : 0.75));
+    const edgeFocus = Math.max(0, Math.min(1.5, opts.edgeFocus != null ? opts.edgeFocus : 0.35));
+    const formBias = clamp01(opts.form != null ? opts.form : 0.35);
     const fields = analysis && analysis.fields ? analysis.fields : null;
     const gray = fields && fields.gray ? fields.gray : null;
     const active = fields && fields[channelHint] ? fields[channelHint] : gray;
@@ -865,11 +1000,11 @@ const DitherAlgorithms = (() => {
         const x = Math.max(1, Math.min(w - 2, gx + Math.round((_advHash01(seed, gx, y, 1032) - 0.5) * spacing * (0.45 + jitter * 0.7))));
         const idx = y * w + x;
         const sat01 = sat ? clamp01(sat[idx] / 255) : 0;
-        const detail01 = detailFieldRef ? shapeDetailSignal(detailFieldRef[idx] * dNorm, strength) : 0;
+        const detail01 = detailFieldRef ? shapeDetailSignal(detailFieldRef[idx] * dNorm, Math.min(1, strength * (0.65 + detailFocus * 0.35))) : 0;
         const edge01 = edgeRef ? clamp01(edgeRef[idx] * eNorm) : 0;
         const importance = clamp01(Math.max(
-          sat01 * 0.58 + detail01 * 0.42 + edge01 * 0.30,
-          detail01 * 0.64 + edge01 * 0.46
+          sat01 * 0.58 + detail01 * (0.30 + detailFocus * 0.16) + edge01 * (0.22 + edgeFocus * 0.14),
+          detail01 * (0.44 + detailFocus * 0.22) + edge01 * (0.32 + edgeFocus * 0.16)
         ));
         if (importance < 0.025) continue;
         if (_advHash01(seed, x, y, 1033) > Math.min(1, strength * density * (0.40 + importance * 1.28))) continue;
@@ -879,7 +1014,14 @@ const DitherAlgorithms = (() => {
         const noise = (_advHash01(seed, x, y, 1034) - 0.5) * 2;
         const delta = chroma * (0.34 + sat01 * 0.52) * strength + noise * 142 * strength * (0.30 + importance * 0.86) * (0.55 + jitter * 0.82);
         const noteV = clamp(px[idx] + delta);
-        let ang = edgeAngleRef ? edgeAngleRef[idx] + Math.PI * 0.5 : (_advHash01(seed, x, y, 1035) * Math.PI * 2);
+        let ang = painterDirectionAngle(seed ^ 0x7c1, x, y, idx, edgeRef, edgeAngleRef, eNorm, {
+          cell: Math.max(6, spacing * 2.2),
+          formFollow: formBias,
+          edgeFocus,
+          angularity: opts.angularity || 0,
+          jitter,
+          divisions: 16
+        });
         ang += (_advHash01(seed, x, y, 1036) - 0.5) * Math.PI * (0.22 + strength * 0.42 + jitter * 0.56);
         const ca = Math.cos(ang), sa = Math.sin(ang);
         const len = baseLen * (0.65 + importance * 1.45);
@@ -911,15 +1053,18 @@ const DitherAlgorithms = (() => {
     const scale = Math.max(0.25, opts.scale != null ? opts.scale : 1);
     const density = Math.max(0.15, opts.density != null ? opts.density : 1);
     const opacity = Math.max(0, Math.min(1.5, opts.opacity != null ? opts.opacity : 1));
+    const edgeFocus = Math.max(0, Math.min(1.5, opts.edge != null ? opts.edge : 0.7));
+    const detailFocus = Math.max(0, Math.min(1.5, opts.detail != null ? opts.detail : 0.8));
+    const angularity = clamp01(opts.angularity != null ? opts.angularity : 0.25);
     if (amt > 0) {
       const sh = (a, b, k) => _advHash01(seed || 1, a, b, k);
       return paintStructuralEdgeStrokes(o, px, w, h, edgeMag, edgeAng, detail, sh, {
-        strength: Math.min(1, amt * 0.95 * opacity),
-        detailDrive: 0.8,
-        angularity: 0.25,
+        strength: Math.min(1, amt * 0.95 * opacity * (0.82 + edgeFocus * 0.18)),
+        detailDrive: Math.min(1, 0.55 + detailFocus * 0.35),
+        angularity,
         length: (12 + amt * 16) * scale,
         width: (0.8 + amt * 1.2) * Math.sqrt(scale),
-        spacing: Math.max(2, 5 / Math.sqrt(density)),
+        spacing: Math.max(2, 5 / Math.sqrt(density * (0.8 + edgeFocus * 0.35))),
         seed: (seed || 1) ^ 0x6e5
       });
     }
@@ -958,32 +1103,35 @@ const DitherAlgorithms = (() => {
     const density = Math.max(0.15, opts.density != null ? opts.density : 1);
     const opacity = Math.max(0, Math.min(1.5, opts.opacity != null ? opts.opacity : 1));
     const jitter = Math.max(0, Math.min(1.5, opts.jitter != null ? opts.jitter : 0.35));
+    const edgeFocus = Math.max(0, Math.min(1.5, opts.edgeFocus != null ? opts.edgeFocus : 0.45));
+    const detailFocus = Math.max(0, Math.min(1.5, opts.detailFocus != null ? opts.detailFocus : 0.55));
     const spacing = Math.max(3, Math.round(baseSize * (0.78 - Math.min(0.28, strength * 0.12)) / Math.sqrt(density)));
     const eNorm = edgeMag ? 1 / Math.max(16, _advFieldStats(edgeMag) * 0.6) : 0;
     const dNorm = detail ? 1 / Math.max(8, _advFieldStats(detail) * 0.6) : 0;
     const fields = analysis && analysis.fields ? analysis.fields : null;
     const valueField = fields && fields.value ? fields.value.value : px;
     const satField = fields && fields.saturation ? fields.saturation.value : null;
-    const globalAng = _advHash01(seed, w, h, 1081) * Math.PI * 2;
     for (let gy = 0; gy < h; gy += spacing) {
       for (let gx = 0; gx < w; gx += spacing) {
         const x = Math.max(0, Math.min(w - 1, Math.round(gx + (_advHash01(seed, gx, gy, 1082) - 0.5) * spacing * (0.45 + jitter * 0.95))));
         const y = Math.max(0, Math.min(h - 1, Math.round(gy + (_advHash01(seed, gx, gy, 1083) - 0.5) * spacing * (0.45 + jitter * 0.95))));
         const idx = y * w + x;
         const edge01 = edgeMag ? clamp01(edgeMag[idx] * eNorm) : 0;
-        const detail01 = detail ? shapeDetailSignal(detail[idx] * dNorm, detailDrive) : 0;
+        const detail01 = detail ? shapeDetailSignal(detail[idx] * dNorm, Math.min(1, detailDrive * (0.70 + detailFocus * 0.35))) : 0;
         const sat01 = satField ? clamp01(satField[idx] / 255) : 0;
-        const subjectCue = clamp01(edge01 * 0.55 + detail01 * 0.30 + sat01 * 0.15);
+        const subjectCue = clamp01(edge01 * (0.44 + edgeFocus * 0.16) + detail01 * (0.22 + detailFocus * 0.13) + sat01 * 0.15);
         const keep = Math.min(1, 0.38 + strength * 0.42 + subjectCue * 0.28);
         if (sh(x, y, 1084) > keep) continue;
         const isSubject = subjectCue > 0.22;
-        let ang = isSubject && edgeAng ? edgeAng[idx] + Math.PI * 0.5 : globalAng;
-        if (formFollow > 0 && edgeAng) ang = ang * (1 - formFollow * 0.28) + (edgeAng[idx] + Math.PI * 0.5) * formFollow * 0.28;
-        if (angularity > 0.02) {
-          const qStep = Math.PI * 2 / (8 + Math.round((1 - angularity) * 8));
-          const snapped = Math.round(ang / qStep) * qStep;
-          ang = ang * (1 - angularity) + snapped * angularity;
-        }
+        const fieldCell = baseSize * (isSubject ? 1.15 : 1.95);
+        let ang = painterDirectionAngle(seed ^ 0x4b9, x, y, idx, edgeMag, edgeAng, eNorm, {
+          cell: fieldCell,
+          formFollow: Math.max(0, formFollow) * 0.55 + (opts.form != null ? opts.form : 0.3) * 0.45,
+          edgeFocus,
+          angularity,
+          jitter,
+          divisions: 8 + Math.round((1 - angularity) * 8)
+        });
         const ca = Math.cos(ang), sa = Math.sin(ang);
         const massSize = baseSize * (isSubject ? (1.15 - detail01 * 0.35) : 1.55);
         const halfLen = massSize * (1.15 + strength * 0.60 + (1 - detail01) * 0.35);
@@ -2836,12 +2984,14 @@ const DitherAlgorithms = (() => {
         washSmoothness: (p.underpaintSmoothness != null) ? p.underpaintSmoothness : 0,
         density:        ((p.underpaintDensity   != null) ? p.underpaintDensity    : 1) * reconUnderpaint.density,
         sizeMul:        ((p.underpaintSize      != null) ? p.underpaintSize       : 1) * reconUnderpaint.scale,
-        detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
+        detailResp:     ((p.underpaintDetail    != null) ? p.underpaintDetail     : 1) * (0.72 + reconUnderpaint.detail * 0.36),
         angleJitter:    ((p.underpaintAngle     != null) ? p.underpaintAngle      : 0.8) * (0.65 + reconUnderpaint.jitter * 0.85),
         strokeStrength: ((p.underpaintStrength  != null) ? p.underpaintStrength   : 1) * reconUnderpaint.opacity,
         detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5,
+        edgeFocus: reconUnderpaint.edge,
+        angularity: reconUnderpaint.angularity,
         edgeMag,
-        formFollow,
+        formFollow: Math.max(formFollow, reconUnderpaint.form * 0.8),
         seed: seedI
       };
       painterlyUnderpaint(o, px, w, h, underpaintBlock, sh, edgeAng, bMask, bSize, _upOpts);
@@ -2892,6 +3042,11 @@ const DitherAlgorithms = (() => {
         density: reconConstruction.density,
         opacity: reconConstruction.opacity,
         jitter: reconConstruction.jitter,
+        detailFocus: reconConstruction.detail,
+        angularity: reconConstruction.angularity,
+        form: reconConstruction.form,
+        edgeFocus: reconConstruction.edge,
+        structure: Math.max(reconConstruction.detail, reconConstruction.edge),
         seed: seedI ^ 0x3b7
       });
       yield o;
@@ -2902,11 +3057,14 @@ const DitherAlgorithms = (() => {
         strength: blockInStrength,
         size: Math.max(underpaintBlock, (p.size || 10) * canvasScale * 1.45) * reconBlock.scale,
         detailDrive: Math.min(1, detailAware / 2),
-        formFollow,
-        angularity: formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.55 : 0.22),
+        formFollow: Math.max(formFollow, reconBlock.form * 0.35),
+        angularity: Math.max(reconBlock.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.55 : 0.22)),
         density: reconBlock.density,
         opacity: reconBlock.opacity,
         jitter: reconBlock.jitter,
+        detailFocus: reconBlock.detail,
+        edgeFocus: reconBlock.edge,
+        form: reconBlock.form,
         seed: seedI ^ 0x45d
       });
       yield o;
@@ -2917,11 +3075,14 @@ const DitherAlgorithms = (() => {
       strength: Math.min(1.2, blockInStrength * 0.55 + 0.18),
       size: Math.max(5, (p.size || 10) * canvasScale * (0.82 + sizeByDetail * 0.16)) * reconForms.scale,
       detailDrive: Math.min(1, detailAware / 2),
-      formFollow: Math.max(formFollow, 0.25),
-      angularity: formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.34 : 0.10),
+      formFollow: Math.max(formFollow, 0.25, reconForms.form * 0.82),
+      angularity: Math.max(reconForms.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.34 : 0.10)),
       density: reconForms.density,
       opacity: reconForms.opacity,
       jitter: reconForms.jitter,
+      detailFocus: reconForms.detail,
+      edgeFocus: reconForms.edge,
+      form: reconForms.form,
       seed: seedI ^ 0x68d
     });
     yield o;
@@ -2937,6 +3098,10 @@ const DitherAlgorithms = (() => {
         density: reconColor.density,
         opacity: reconColor.opacity,
         jitter: reconColor.jitter,
+        detailFocus: reconColor.detail,
+        edgeFocus: reconColor.edge,
+        form: reconColor.form,
+        angularity: reconColor.angularity,
         seed: seedI ^ 0x73a
       });
       yield o;
@@ -3014,7 +3179,10 @@ const DitherAlgorithms = (() => {
         //   identical strokes (a human would just put a few big ones).
         let localDetail = 0;  // 0..1
         if (detail) {
-          localDetail = shapeDetailSignal(detail[y * w + x] * detailNorm, Math.min(1, detailAware / 2));
+          localDetail = shapeDetailSignal(
+            detail[y * w + x] * detailNorm,
+            Math.min(1, (detailAware / 2) * (0.72 + (layerSpec.reconDetail || 0.7) * 0.34))
+          );
           const phaseTag = edgeN > 0.58 ? 'edge'
             : localDetail > 0.58 ? 'detail'
             : lum < 0.38 ? 'shadow'
@@ -3100,11 +3268,19 @@ const DitherAlgorithms = (() => {
         //            (loose, scattered angular stamps).
         //   layerAng is added after so multi-layer fan-out still works.
         const detailJitDamp = detail ? (1 - localDetail * detailAware * 0.65) : 1;
+        const layerForm = clamp01(Math.max(0, formFollow) * 0.55 + (layerSpec.reconForm || 0) * 0.55);
         const formJitScale  = formFollow >= 0
-          ? (1 - formFollow * 0.75)        // +1 → ×0.25
-          : (1 + (-formFollow) * 0.8);     // -1 → ×1.80
-        const effAngleJit   = (angleJitter + slotAngJit) * detailJitDamp * formJitScale * layerSpec.jitterMul;
-        let ang = eAng + Math.PI/2 + (sh(x, y, 3) - 0.5) * effAngleJit + layerAng;
+          ? (1 - layerForm * 0.72)
+          : (1 + (-formFollow) * 0.8);
+        const effAngleJit   = (angleJitter + slotAngJit) * detailJitDamp * formJitScale * layerSpec.jitterMul * (0.72 + (layerSpec.reconJitter || 0.35) * 0.45);
+        let ang = painterDirectionAngle(seedI ^ (layer * 0x45d), x, y, eIdx, edgeMag, edgeAng, edgeNorm, {
+          cell: Math.max(baseSp * 1.8, p.size * canvasScale * (1.4 + layerSpec.broad)),
+          formFollow: layerForm,
+          edgeFocus: layerSpec.reconEdge || 0.5,
+          angularity: (layerSpec.reconAngularity || 0) * 0.55,
+          jitter: layerSpec.reconJitter || 0.35,
+          divisions: 16
+        }) + (sh(x, y, 3) - 0.5) * effAngleJit + layerAng;
 
         // Angular / painterly quantization. When formFollow is pushed
         // negative, snap the stroke angle onto one of 8 cardinal+diagonal
@@ -3112,12 +3288,11 @@ const DitherAlgorithms = (() => {
         // small negative values still feel loose and only strong negative
         // values give the woodcut / chunky-abstract read. Blends between
         // raw and snapped angle so mid values feel organic.
-        if (formFollow < -0.15) {
-          const qStrength = Math.min(1, (-formFollow - 0.15) / 0.85);
-          const qStep = Math.PI * 2 / 16; // 22.5° — 8 directions (bidirectional)
-          const snapped = Math.round(ang / qStep) * qStep;
-          ang = ang * (1 - qStrength) + snapped * qStrength;
-        }
+        const qStrength = Math.max(
+          (layerSpec.reconAngularity || 0) * 0.55,
+          formFollow < -0.15 ? Math.min(1, (-formFollow - 0.15) / 0.85) : 0
+        );
+        ang = quantizeAngle(ang, qStrength, 16);
         const dx = Math.cos(ang), dy = Math.sin(ang);
 
         // Detail-aware knife size: smooth regions → bigger strokes,
@@ -6923,12 +7098,14 @@ const DitherAlgorithms = (() => {
         washSmoothness: (p.underpaintSmoothness != null) ? p.underpaintSmoothness : 0,
         density:        ((p.underpaintDensity   != null) ? p.underpaintDensity    : 1) * reconUnderpaint.density,
         sizeMul:        ((p.underpaintSize      != null) ? p.underpaintSize       : 1) * reconUnderpaint.scale,
-        detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
+        detailResp:     ((p.underpaintDetail    != null) ? p.underpaintDetail     : 1) * (0.72 + reconUnderpaint.detail * 0.36),
         angleJitter:    ((p.underpaintAngle     != null) ? p.underpaintAngle      : 0.8) * (0.65 + reconUnderpaint.jitter * 0.85),
         strokeStrength: ((p.underpaintStrength  != null) ? p.underpaintStrength   : 1) * reconUnderpaint.opacity,
         detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5,
+        edgeFocus: reconUnderpaint.edge,
+        angularity: reconUnderpaint.angularity,
         edgeMag: edgeMagUp,
-        formFollow: (p.formFollow != null) ? p.formFollow : 0,
+        formFollow: Math.max((p.formFollow != null) ? p.formFollow : 0, reconUnderpaint.form * 0.8),
         seed: seedUnder
       };
       painterlyUnderpaint(o, px, w, h, underpaintBlock, shUnder, edgeAngUp, _upMask, _upSize, _upOpts);
@@ -7068,6 +7245,11 @@ const DitherAlgorithms = (() => {
         density: reconConstruction.density,
         opacity: reconConstruction.opacity,
         jitter: reconConstruction.jitter,
+        detailFocus: reconConstruction.detail,
+        angularity: reconConstruction.angularity,
+        form: reconConstruction.form,
+        edgeFocus: reconConstruction.edge,
+        structure: Math.max(reconConstruction.detail, reconConstruction.edge),
         seed: seedI ^ 0x4ef
       });
       yield o;
@@ -7078,11 +7260,14 @@ const DitherAlgorithms = (() => {
         strength: blockInStrength,
         size: Math.max(underpaintBlock, (p.dabLen || 8) * canvasScale * 1.55) * reconBlock.scale,
         detailDrive: Math.min(1, detailAware / 2),
-        formFollow,
-        angularity: formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.48 : 0.18),
+        formFollow: Math.max(formFollow, reconBlock.form * 0.35),
+        angularity: Math.max(reconBlock.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.48 : 0.18)),
         density: reconBlock.density,
         opacity: reconBlock.opacity,
         jitter: reconBlock.jitter,
+        detailFocus: reconBlock.detail,
+        edgeFocus: reconBlock.edge,
+        form: reconBlock.form,
         seed: seedI ^ 0x594
       });
       yield o;
@@ -7093,11 +7278,14 @@ const DitherAlgorithms = (() => {
       strength: Math.min(1.15, blockInStrength * 0.55 + 0.16),
       size: Math.max(4, (p.dabLen || 8) * canvasScale * (0.85 + sizeByDetail * 0.16)) * reconForms.scale,
       detailDrive: Math.min(1, detailAware / 2),
-      formFollow: Math.max(formFollow, 0.25),
-      angularity: formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.30 : 0.10),
+      formFollow: Math.max(formFollow, 0.25, reconForms.form * 0.82),
+      angularity: Math.max(reconForms.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.30 : 0.10)),
       density: reconForms.density,
       opacity: reconForms.opacity,
       jitter: reconForms.jitter,
+      detailFocus: reconForms.detail,
+      edgeFocus: reconForms.edge,
+      form: reconForms.form,
       seed: seedI ^ 0x6ad
     });
     yield o;
@@ -7113,6 +7301,10 @@ const DitherAlgorithms = (() => {
         density: reconColor.density,
         opacity: reconColor.opacity,
         jitter: reconColor.jitter,
+        detailFocus: reconColor.detail,
+        edgeFocus: reconColor.edge,
+        form: reconColor.form,
+        angularity: reconColor.angularity,
         seed: seedI ^ 0x7f1
       });
       yield o;
@@ -7165,7 +7357,10 @@ const DitherAlgorithms = (() => {
         //   painterly dabs are enough).
         let localDetail = 0;
         if (detail) {
-          localDetail = shapeDetailSignal(detail[y * w + x] * detailNorm, Math.min(1, detailAware / 2));
+          localDetail = shapeDetailSignal(
+            detail[y * w + x] * detailNorm,
+            Math.min(1, (detailAware / 2) * (0.72 + (layerSpec.reconDetail || 0.7) * 0.34))
+          );
           if (skipSmoothAreas > 0) {
             const keepProb = localDetail + (1 - skipSmoothAreas * 0.8);
             if (sh(strokeKey, layer, 120) > Math.min(1, keepProb)) continue;
@@ -7236,24 +7431,31 @@ const DitherAlgorithms = (() => {
           }
         }
 
-        const layerFlow = clamp01((p.flowStrength != null ? p.flowStrength : 0.85) * layerSpec.flowMul + Math.max(0, formFollow) * 0.14);
-        let dirAng = eMag > 5 ? eAng + Math.PI / 2 : sh(strokeKey, layer, 106) * Math.PI * 2;
-        dirAng = dirAng * layerFlow + (sh(strokeKey, layer, 107) * Math.PI * 2) * (1 - layerFlow);
+        const layerForm = clamp01(Math.max(0, formFollow) * 0.55 + (layerSpec.reconForm || 0) * 0.55);
+        const layerFlow = clamp01((p.flowStrength != null ? p.flowStrength : 0.85) * layerSpec.flowMul + layerForm * 0.22);
+        const guidedAng = painterDirectionAngle(seedI ^ (layer * 0x7f3), x, y, cIdx, edgeMag, edgeAng, edgeNorm, {
+          cell: Math.max(7, (p.dabLen || 8) * canvasScale * (1.8 + layerSpec.broad * 1.2)),
+          formFollow: layerForm,
+          edgeFocus: layerSpec.reconEdge || 0.5,
+          angularity: (layerSpec.reconAngularity || 0) * 0.45,
+          jitter: layerSpec.reconJitter || 0.35,
+          divisions: 16
+        });
+        let dirAng = blendAngles(sh(strokeKey, layer, 107) * Math.PI * 2, guidedAng, layerFlow);
         // Detail + formFollow shape the jitter, same as palette-knife.
         const detailJitDamp = detail ? (1 - localDetail * detailAware * 0.65) : 1;
         const formJitScale  = formFollow >= 0
-          ? (1 - formFollow * 0.75)
+          ? (1 - layerForm * 0.72)
           : (1 + (-formFollow) * 0.8);
-        const effAngleJit   = (angleJitter + slotAngJit) * detailJitDamp * formJitScale * layerSpec.jitterMul;
+        const effAngleJit   = (angleJitter + slotAngJit) * detailJitDamp * formJitScale * layerSpec.jitterMul * (0.72 + (layerSpec.reconJitter || 0.35) * 0.45);
         if (effAngleJit > 0) dirAng += (sh(strokeKey, layer, 108) - 0.5) * effAngleJit * Math.PI;
 
         // Angular quantization when formFollow is strongly negative.
-        if (formFollow < -0.15) {
-          const qStrength = Math.min(1, (-formFollow - 0.15) / 0.85);
-          const qStep = Math.PI * 2 / 16;
-          const snapped = Math.round(dirAng / qStep) * qStep;
-          dirAng = dirAng * (1 - qStrength) + snapped * qStrength;
-        }
+        const qStrength = Math.max(
+          (layerSpec.reconAngularity || 0) * 0.55,
+          formFollow < -0.15 ? Math.min(1, (-formFollow - 0.15) / 0.85) : 0
+        );
+        dirAng = quantizeAngle(dirAng, qStrength, 16);
         dirAng += layerAng;
 
         // Illusion modulation

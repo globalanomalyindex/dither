@@ -1614,11 +1614,20 @@
       params.reconstructionLayers = cloneParamValue(fallback);
     }
     for (const step of RECON_UI_STEPS) {
-      const def = fallback[step.key] || { scale: 1, density: 1, opacity: 1, jitter: 0.35 };
+      const def = fallback[step.key] || {
+        scale: 1,
+        density: 1,
+        opacity: 1,
+        jitter: 0.35,
+        detail: 0.7,
+        angularity: 0.35,
+        form: 0.5,
+        edge: 0.5
+      };
       if (!params.reconstructionLayers[step.key] || typeof params.reconstructionLayers[step.key] !== 'object') {
         params.reconstructionLayers[step.key] = cloneParamValue(def);
       } else {
-        for (const field of ['scale', 'density', 'opacity', 'jitter']) {
+        for (const field of ['scale', 'density', 'opacity', 'jitter', 'detail', 'angularity', 'form', 'edge']) {
           if (params.reconstructionLayers[step.key][field] === undefined) {
             params.reconstructionLayers[step.key][field] = def[field];
           }
@@ -1665,6 +1674,10 @@
         ${renderReconLayerSlider(sel.id, step.key, 'density', 'Stroke density', 0.15, 2.5, 0.05, layer.density)}
         ${renderReconLayerSlider(sel.id, step.key, 'opacity', 'Paint opacity', 0, 1.25, 0.05, layer.opacity)}
         ${renderReconLayerSlider(sel.id, step.key, 'jitter', 'Decision jitter', 0, 1.5, 0.05, layer.jitter)}
+        ${renderReconLayerSlider(sel.id, step.key, 'detail', 'Detail focus', 0, 1.5, 0.05, layer.detail)}
+        ${renderReconLayerSlider(sel.id, step.key, 'angularity', 'Angular construction', 0, 1, 0.05, layer.angularity)}
+        ${renderReconLayerSlider(sel.id, step.key, 'form', 'Form follow', 0, 1, 0.05, layer.form)}
+        ${renderReconLayerSlider(sel.id, step.key, 'edge', 'Edge focus', 0, 1.5, 0.05, layer.edge)}
       </div>
     `;
   }
@@ -2518,6 +2531,10 @@
           layer.density = Math.round((0.45 + Math.random() * 1.35) * 20) / 20;
           layer.opacity = Math.round((0.55 + Math.random() * 0.55) * 20) / 20;
           layer.jitter = Math.round(Math.random() * 24) / 20;
+          layer.detail = Math.round(Math.random() * 30) / 20;
+          layer.angularity = Math.round(Math.random() * 20) / 20;
+          layer.form = Math.round(Math.random() * 20) / 20;
+          layer.edge = Math.round(Math.random() * 30) / 20;
         }
         sel.params[p.id] = layers;
       } else if (p.type === 'customBrushes') {
