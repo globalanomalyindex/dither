@@ -325,15 +325,14 @@ const DitherAlgorithms = (() => {
     const _detailResp     = (opts.detailResp     != null) ? opts.detailResp     : 1;
     const _angJitU        = (opts.angleJitter    != null) ? opts.angleJitter    : 0.8;
     const _strokeStrength = (opts.strokeStrength != null) ? opts.strokeStrength : 1;
-    // detailPreserve: detail-gated version of washSmoothness. In busy
-    // pixels, blend the raw source back into the wash so subjects stay
-    // sharp while flat areas keep the broad block wash. 0 = pure wash
-    // (legacy), 1 = busy pixels read near-full source.
+    // detailPreserve: detail-gated reconstruction pressure. In busy pixels
+    // it adds a small dithered tonal correction, more/smaller strokes, and
+    // structural marks; it should not simply reveal the source photo.
     const _detailPreserve = (opts.detailPreserve != null) ? opts.detailPreserve : 0;
 
     // Build the detail field up front — the wash pass uses it for the
-    // detailPreserve modulation (busy areas bleed source back in) and the
-    // stroke pass uses it downstream for density/size.
+    // detailPreserve modulation and the stroke pass uses it downstream for
+    // density/size.
     const dfUp = (_detailPreserve > 0) ? detailField(px, w, h, 8) : null;
     let _dUpMax = 1;
     if (dfUp) {
@@ -392,13 +391,19 @@ const DitherAlgorithms = (() => {
         if (_washSmoothness > 0) {
           smooth = smooth * (1 - _washSmoothness) + px[y * w + x] * _washSmoothness;
         }
-        // detailPreserve: bleed the raw source back in DETAIL pixels
-        // (busy) while leaving FLAT pixels as the broad wash. Result:
-        // skies/walls stay loose and gradient-like, subjects stay crisp.
+        // detailPreserve used to pull the raw source almost directly back
+        // into busy pixels. That made the control feel like "reveal photo"
+        // instead of "paint more intelligently." Keep it painterly: only a
+        // small dithered tonal correction is mixed into the wash, while the
+        // actual subject reconstruction happens through smaller strokes and
+        // structural marks below.
         if (dfUp) {
           const d01u = shapeDetailSignal(dfUp[y * w + x] * dfUpNorm, _detailPreserve);
-          const mixU = d01u * _detailPreserve;
-          if (mixU > 0) smooth = smooth * (1 - mixU) + px[y * w + x] * mixU;
+          const mixU = d01u * _detailPreserve * 0.24;
+          if (mixU > 0) {
+            const paintedTight = px[y * w + x] + (sh(x, y, 606) - 0.5) * NOISE_AMP * 0.7;
+            smooth = smooth * (1 - mixU) + paintedTight * mixU;
+          }
         }
         const noise = (sh(x, y, 605) - 0.5) * NOISE_AMP * 2;
         const val = smooth + noise;
@@ -678,6 +683,37 @@ const DitherAlgorithms = (() => {
     return o;
   }
 
+  const PAINTER_RECON_STEPS = [
+    { key: 'underpaint',   label: 'Underpainting' },
+    { key: 'construction', label: 'Painterly sketch' },
+    { key: 'block',        label: 'Broad block-in' },
+    { key: 'forms',        label: 'Form masses' },
+    { key: 'color',        label: 'Color notes' },
+    { key: 'edges',        label: 'Edges + detail' },
+    { key: 'finish',       label: 'Final painting' }
+  ];
+
+  function defaultPainterLayerSettings() {
+    return {
+      underpaint:   { scale: 1.15, density: 0.85, opacity: 0.92, jitter: 0.45 },
+      construction: { scale: 1.00, density: 1.10, opacity: 0.80, jitter: 0.58 },
+      block:        { scale: 1.32, density: 0.82, opacity: 0.90, jitter: 0.34 },
+      forms:        { scale: 0.95, density: 1.05, opacity: 0.82, jitter: 0.28 },
+      color:        { scale: 0.74, density: 1.28, opacity: 0.82, jitter: 0.76 },
+      edges:        { scale: 0.62, density: 1.22, opacity: 0.92, jitter: 0.22 },
+      finish:       { scale: 1.00, density: 1.00, opacity: 1.00, jitter: 0.35 }
+    };
+  }
+
+  function clampPainterStep(v) {
+    if (!isFinite(v)) return 6;
+    return Math.max(0, Math.min(PAINTER_RECON_STEPS.length - 1, Math.round(v)));
+  }
+
+  function painterStepKey(level) {
+    return PAINTER_RECON_STEPS[clampPainterStep(level)].key;
+  }
+
   function reconstructionStageLevel(stage) {
     switch (stage || 'finish') {
       case 'underpaint': return 0;
@@ -691,6 +727,49 @@ const DitherAlgorithms = (() => {
     }
   }
 
+  function reconstructionStepLevel(p) {
+    if (p && p.reconstructionStep != null) return clampPainterStep(+p.reconstructionStep);
+    return reconstructionStageLevel(p && p.reconstructionStage);
+  }
+
+  function getPainterLayerSettings(p, keyOrLevel) {
+    const defaults = defaultPainterLayerSettings();
+    const key = typeof keyOrLevel === 'number' ? painterStepKey(keyOrLevel) : keyOrLevel;
+    const base = defaults[key] || defaults.finish;
+    const src = p && p.reconstructionLayers && typeof p.reconstructionLayers === 'object'
+      ? p.reconstructionLayers[key]
+      : null;
+    const merged = src && typeof src === 'object' ? { ...base, ...src } : { ...base };
+    const finiteOr = (value, fallback) => {
+      const n = +value;
+      return isFinite(n) ? n : fallback;
+    };
+    return {
+      scale: Math.max(0.25, Math.min(3, finiteOr(merged.scale, base.scale))),
+      density: Math.max(0.15, Math.min(3, finiteOr(merged.density, base.density))),
+      opacity: Math.max(0, Math.min(1.5, finiteOr(merged.opacity, base.opacity))),
+      jitter: Math.max(0, Math.min(1.5, finiteOr(merged.jitter, base.jitter)))
+    };
+  }
+
+  function applyPainterLayerSettingsToPlan(plan, settings) {
+    const s = settings || getPainterLayerSettings(null, 'finish');
+    const density = Math.max(0.15, s.density);
+    const opacity = Math.max(0, s.opacity);
+    const scale = Math.max(0.25, s.scale);
+    const jitter = Math.max(0, s.jitter);
+    return (plan || []).map(layer => ({
+      ...layer,
+      sizeMul: layer.sizeMul * scale,
+      lengthMul: layer.lengthMul * (0.72 + scale * 0.28),
+      densityMul: layer.densityMul * density,
+      flowMul: layer.flowMul * (1 + Math.max(0, 0.55 - jitter) * 0.10),
+      pickupMul: layer.pickupMul * (0.82 + scale * 0.18),
+      jitterMul: layer.jitterMul * (0.62 + jitter * 0.76),
+      opacityMul: layer.opacityMul * opacity
+    }));
+  }
+
   function paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, analysis, opts) {
     opts = opts || {};
     const strength = clamp01(opts.strength != null ? opts.strength : 0);
@@ -699,8 +778,11 @@ const DitherAlgorithms = (() => {
     const style = opts.style || 'hybrid';
     const angular = style === 'angular' ? 1 : (style === 'form' ? 0 : 0.48);
     const detailDrive = clamp01(opts.detailDrive != null ? opts.detailDrive : 0.5);
+    const density = Math.max(0.15, opts.density != null ? opts.density : 1);
+    const opacity = Math.max(0, Math.min(1.5, opts.opacity != null ? opts.opacity : 1));
+    const jitter = Math.max(0, Math.min(1.5, opts.jitter != null ? opts.jitter : 0.5));
     const lineScale = Math.max(0.5, opts.lineScale || 1);
-    const spacing = Math.max(3, Math.round((opts.spacing || 10) / (0.8 + strength * 0.55)));
+    const spacing = Math.max(3, Math.round((opts.spacing || 10) / ((0.8 + strength * 0.55) * Math.sqrt(density))));
     const baseLen = Math.max(5, opts.length || 22);
     const baseWidth = Math.max(0.6, opts.width || 1.1);
     const eNorm = 1 / Math.max(16, _advFieldStats(edgeMag) * 0.55);
@@ -708,10 +790,10 @@ const DitherAlgorithms = (() => {
     const fields = analysis && analysis.fields ? analysis.fields : null;
     const gray = fields && fields.gray ? fields.gray.value : px;
     for (let gy = 1; gy < h - 1; gy += spacing) {
-      const jy = Math.round((_advHash01(seed, gy, spacing, 1001) - 0.5) * spacing * 0.8);
+      const jy = Math.round((_advHash01(seed, gy, spacing, 1001) - 0.5) * spacing * (0.45 + jitter * 0.9));
       const y = Math.max(1, Math.min(h - 2, gy + jy));
       for (let gx = 1; gx < w - 1; gx += spacing) {
-        const jx = Math.round((_advHash01(seed, gx, y, 1002) - 0.5) * spacing * 0.8);
+        const jx = Math.round((_advHash01(seed, gx, y, 1002) - 0.5) * spacing * (0.45 + jitter * 0.9));
         const x = Math.max(1, Math.min(w - 2, gx + jx));
         const idx = y * w + x;
         const edge01 = clamp01(edgeMag[idx] * eNorm);
@@ -723,7 +805,7 @@ const DitherAlgorithms = (() => {
         if (_advHash01(seed, x, y, 1003) > keep) continue;
         let ang = edgeAng[idx] + Math.PI * 0.5;
         const globalAng = _advHash01(seed, idx, 0, 1004) * Math.PI * 2;
-        ang = ang * (1 - angular * 0.35) + globalAng * angular * 0.35;
+        ang = ang * (1 - angular * (0.25 + jitter * 0.18)) + globalAng * angular * (0.25 + jitter * 0.18);
         if (angular > 0.02) {
           const qStep = Math.PI * 2 / (style === 'angular' ? 8 : 12);
           const snapped = Math.round(ang / qStep) * qStep;
@@ -747,7 +829,7 @@ const DitherAlgorithms = (() => {
             const prob = taper * cross * (0.48 + strength * 0.52);
             if (_advHash01(seed, wx, wy, 1006 + (t | 0)) > prob) continue;
             const oi = wy * w + wx;
-            const a = Math.min(0.86, 0.28 + strength * 0.52 + importance * 0.18);
+            const a = Math.min(0.94, (0.28 + strength * 0.52 + importance * 0.18) * opacity);
             o[oi] = Math.round(mark * a + o[oi] * (1 - a));
           }
         }
@@ -762,6 +844,9 @@ const DitherAlgorithms = (() => {
     if (strength <= 0.01) return o;
     const seed = (opts.seed | 0) || 42;
     const channelHint = opts.channelHint || 'gray';
+    const density = Math.max(0.15, opts.density != null ? opts.density : 1);
+    const opacity = Math.max(0, Math.min(1.5, opts.opacity != null ? opts.opacity : 1));
+    const jitter = Math.max(0, Math.min(1.5, opts.jitter != null ? opts.jitter : 0.5));
     const fields = analysis && analysis.fields ? analysis.fields : null;
     const gray = fields && fields.gray ? fields.gray : null;
     const active = fields && fields[channelHint] ? fields[channelHint] : gray;
@@ -771,28 +856,31 @@ const DitherAlgorithms = (() => {
     const edgeAngleRef = edgeAng || (gray && gray.edgeAng);
     const dNorm = detailFieldRef ? 1 / Math.max(8, _advFieldStats(detailFieldRef) * 0.55) : 0;
     const eNorm = edgeRef ? 1 / Math.max(16, _advFieldStats(edgeRef) * 0.55) : 0;
-    const spacing = Math.max(2, Math.round((opts.spacing || 7) * (1 - strength * 0.28)));
+    const spacing = Math.max(2, Math.round((opts.spacing || 7) * (1 - strength * 0.38) / Math.sqrt(density * (1 + strength * 0.45))));
     const baseLen = Math.max(2, opts.length || 7);
     const baseWidth = Math.max(0.6, opts.width || 1.4);
     for (let gy = 1; gy < h - 1; gy += spacing) {
-      const y = Math.max(1, Math.min(h - 2, gy + Math.round((_advHash01(seed, gy, spacing, 1031) - 0.5) * spacing)));
+      const y = Math.max(1, Math.min(h - 2, gy + Math.round((_advHash01(seed, gy, spacing, 1031) - 0.5) * spacing * (0.45 + jitter * 0.7))));
       for (let gx = 1; gx < w - 1; gx += spacing) {
-        const x = Math.max(1, Math.min(w - 2, gx + Math.round((_advHash01(seed, gx, y, 1032) - 0.5) * spacing)));
+        const x = Math.max(1, Math.min(w - 2, gx + Math.round((_advHash01(seed, gx, y, 1032) - 0.5) * spacing * (0.45 + jitter * 0.7))));
         const idx = y * w + x;
         const sat01 = sat ? clamp01(sat[idx] / 255) : 0;
         const detail01 = detailFieldRef ? shapeDetailSignal(detailFieldRef[idx] * dNorm, strength) : 0;
         const edge01 = edgeRef ? clamp01(edgeRef[idx] * eNorm) : 0;
-        const importance = clamp01(sat01 * 0.46 + detail01 * 0.34 + edge01 * 0.20);
-        if (importance < 0.08) continue;
-        if (_advHash01(seed, x, y, 1033) > strength * (0.22 + importance * 0.95)) continue;
+        const importance = clamp01(Math.max(
+          sat01 * 0.58 + detail01 * 0.42 + edge01 * 0.30,
+          detail01 * 0.64 + edge01 * 0.46
+        ));
+        if (importance < 0.025) continue;
+        if (_advHash01(seed, x, y, 1033) > Math.min(1, strength * density * (0.40 + importance * 1.28))) continue;
         const activeV = active && active.value ? active.value[idx] : px[idx];
         const grayV = gray && gray.value ? gray.value[idx] : px[idx];
         const chroma = activeV - grayV;
         const noise = (_advHash01(seed, x, y, 1034) - 0.5) * 2;
-        const delta = chroma * (0.25 + sat01 * 0.35) * strength + noise * 72 * strength * (0.35 + importance * 0.65);
+        const delta = chroma * (0.34 + sat01 * 0.52) * strength + noise * 142 * strength * (0.30 + importance * 0.86) * (0.55 + jitter * 0.82);
         const noteV = clamp(px[idx] + delta);
         let ang = edgeAngleRef ? edgeAngleRef[idx] + Math.PI * 0.5 : (_advHash01(seed, x, y, 1035) * Math.PI * 2);
-        ang += (_advHash01(seed, x, y, 1036) - 0.5) * Math.PI * (0.35 + strength * 0.5);
+        ang += (_advHash01(seed, x, y, 1036) - 0.5) * Math.PI * (0.22 + strength * 0.42 + jitter * 0.56);
         const ca = Math.cos(ang), sa = Math.sin(ang);
         const len = baseLen * (0.65 + importance * 1.45);
         const halfLen = len * 0.5;
@@ -807,7 +895,7 @@ const DitherAlgorithms = (() => {
             const prob = taper * cross * (0.34 + strength * 0.50);
             if (_advHash01(seed, wx, wy, 1037 + (t | 0)) > prob) continue;
             const oi = wy * w + wx;
-            const a = Math.min(0.78, 0.18 + strength * 0.42 + importance * 0.20);
+            const a = Math.min(0.98, (0.22 + strength * 0.58 + importance * 0.30) * opacity);
             o[oi] = Math.round(noteV * a + o[oi] * (1 - a));
           }
         }
@@ -816,25 +904,29 @@ const DitherAlgorithms = (() => {
     return o;
   }
 
-  function finishPainterEdges(o, px, w, h, edgeMag, edgeAng, detail, seed, amount) {
+  function finishPainterEdges(o, px, w, h, edgeMag, edgeAng, detail, seed, amount, opts) {
+    opts = opts || {};
     const amt = Math.max(-1, Math.min(1, amount || 0));
     if (Math.abs(amt) <= 0.01 || !edgeMag) return o;
+    const scale = Math.max(0.25, opts.scale != null ? opts.scale : 1);
+    const density = Math.max(0.15, opts.density != null ? opts.density : 1);
+    const opacity = Math.max(0, Math.min(1.5, opts.opacity != null ? opts.opacity : 1));
     if (amt > 0) {
       const sh = (a, b, k) => _advHash01(seed || 1, a, b, k);
       return paintStructuralEdgeStrokes(o, px, w, h, edgeMag, edgeAng, detail, sh, {
-        strength: Math.min(1, amt * 0.95),
+        strength: Math.min(1, amt * 0.95 * opacity),
         detailDrive: 0.8,
         angularity: 0.25,
-        length: 12 + amt * 16,
-        width: 0.8 + amt * 1.2,
-        spacing: 5,
+        length: (12 + amt * 16) * scale,
+        width: (0.8 + amt * 1.2) * Math.sqrt(scale),
+        spacing: Math.max(2, 5 / Math.sqrt(density)),
         seed: (seed || 1) ^ 0x6e5
       });
     }
-    const soft = -amt;
+    const soft = -amt * opacity;
     const tmp = new Uint8ClampedArray(o);
     const eNorm = 1 / Math.max(16, _advFieldStats(edgeMag) * 0.55);
-    const radius = Math.max(1, Math.round(soft * 3));
+    const radius = Math.max(1, Math.round(soft * 3 * scale));
     for (let y = 1; y < h - 1; y++) {
       const yr = y * w;
       for (let x = 1; x < w - 1; x++) {
@@ -863,7 +955,10 @@ const DitherAlgorithms = (() => {
     const detailDrive = clamp01(opts.detailDrive != null ? opts.detailDrive : 0.5);
     const formFollow = Math.max(-1, Math.min(1, opts.formFollow || 0));
     const angularity = clamp01(opts.angularity != null ? opts.angularity : Math.max(0.25, -formFollow));
-    const spacing = Math.max(3, Math.round(baseSize * (0.78 - Math.min(0.28, strength * 0.12))));
+    const density = Math.max(0.15, opts.density != null ? opts.density : 1);
+    const opacity = Math.max(0, Math.min(1.5, opts.opacity != null ? opts.opacity : 1));
+    const jitter = Math.max(0, Math.min(1.5, opts.jitter != null ? opts.jitter : 0.35));
+    const spacing = Math.max(3, Math.round(baseSize * (0.78 - Math.min(0.28, strength * 0.12)) / Math.sqrt(density)));
     const eNorm = edgeMag ? 1 / Math.max(16, _advFieldStats(edgeMag) * 0.6) : 0;
     const dNorm = detail ? 1 / Math.max(8, _advFieldStats(detail) * 0.6) : 0;
     const fields = analysis && analysis.fields ? analysis.fields : null;
@@ -872,8 +967,8 @@ const DitherAlgorithms = (() => {
     const globalAng = _advHash01(seed, w, h, 1081) * Math.PI * 2;
     for (let gy = 0; gy < h; gy += spacing) {
       for (let gx = 0; gx < w; gx += spacing) {
-        const x = Math.max(0, Math.min(w - 1, Math.round(gx + (_advHash01(seed, gx, gy, 1082) - 0.5) * spacing * 0.9)));
-        const y = Math.max(0, Math.min(h - 1, Math.round(gy + (_advHash01(seed, gx, gy, 1083) - 0.5) * spacing * 0.9)));
+        const x = Math.max(0, Math.min(w - 1, Math.round(gx + (_advHash01(seed, gx, gy, 1082) - 0.5) * spacing * (0.45 + jitter * 0.95))));
+        const y = Math.max(0, Math.min(h - 1, Math.round(gy + (_advHash01(seed, gx, gy, 1083) - 0.5) * spacing * (0.45 + jitter * 0.95))));
         const idx = y * w + x;
         const edge01 = edgeMag ? clamp01(edgeMag[idx] * eNorm) : 0;
         const detail01 = detail ? shapeDetailSignal(detail[idx] * dNorm, detailDrive) : 0;
@@ -894,7 +989,7 @@ const DitherAlgorithms = (() => {
         const halfLen = massSize * (1.15 + strength * 0.60 + (1 - detail01) * 0.35);
         const halfW = Math.max(1, massSize * (0.28 + strength * 0.11));
         const valueShift = valueField ? (valueField[idx] - px[idx]) * 0.08 : 0;
-        const src = clamp(px[idx] + valueShift + (sh(x, y, 1085) - 0.5) * 20 * strength * (0.35 + sat01));
+        const src = clamp(px[idx] + valueShift + (sh(x, y, 1085) - 0.5) * 34 * strength * (0.28 + sat01 + jitter * 0.35));
         const box = Math.ceil(Math.max(halfLen, halfW)) + 1;
         for (let yy = Math.max(0, y - box); yy <= Math.min(h - 1, y + box); yy++) {
           for (let xx = Math.max(0, x - box); xx <= Math.min(w - 1, x + box); xx++) {
@@ -907,7 +1002,7 @@ const DitherAlgorithms = (() => {
             const prob = taper * Math.min(1, 0.42 + strength * 0.44);
             if (sh(xx, yy, 1086 + ((lx | 0) & 7)) > prob) continue;
             const oi = yy * w + xx;
-            const a = Math.min(0.92, 0.34 + strength * 0.42 + (isSubject ? 0.10 : 0));
+            const a = Math.min(0.95, (0.34 + strength * 0.42 + (isSubject ? 0.10 : 0)) * opacity);
             o[oi] = Math.round(src * a + o[oi] * (1 - a));
           }
         }
@@ -2417,22 +2512,16 @@ const DitherAlgorithms = (() => {
 
   A.push({ id:'palette-knife', name:'Palette Knife', category:'reconstructive', params:[
     // — Reconstruction workflow —
-    {id:'reconstructionStage',label:'Reconstruction Step',type:'select',options:[
-      {value:'finish',label:'Final painting'},
-      {value:'underpaint',label:'1 · Underpainting only'},
-      {value:'construction',label:'2 · Construction sketch'},
-      {value:'block',label:'3 · Broad block-in'},
-      {value:'forms',label:'4 · Form masses'},
-      {value:'color',label:'5 · Color notes / jitter'},
-      {value:'edges',label:'6 · Edges + detail'}
-    ],default:'finish'},
+    {id:'reconstructionStep',label:'Reconstruction Step',type:'reconstructionStep',min:0,max:6,step:1,default:6,
+     labels:['1 · Underpainting','2 · Painterly sketch','3 · Broad block-in','4 · Form masses','5 · Color notes','6 · Edges + detail','7 · Final painting']},
+    {id:'reconstructionLayers',label:'Edit Current Step',type:'reconstructionLayers',default:defaultPainterLayerSettings()},
     {id:'constructionStyle',label:'Construction Style',type:'select',options:[
       {value:'angular',label:'Angular painter sketch'},
       {value:'form',label:'Form-following sketch'},
       {value:'hybrid',label:'Hybrid sketch'}
     ],default:'angular'},
-    {id:'constructionLines',label:'Construction Lines',min:0,max:1,step:.05,default:.35},
-    {id:'blockInStrength',label:'Broad Block-In',min:0,max:1.5,step:.05,default:.65},
+    {id:'constructionLines',label:'Construction Lines',min:0,max:1,step:.05,default:.5},
+    {id:'blockInStrength',label:'Broad Block-In',min:0,max:1.5,step:.05,default:.72},
     {id:'edgeFinish',label:'Soft ↔ Hard Edges',min:-1,max:1,step:.05,default:.25},
     // — Core shape —
     {id:'size',label:'Knife Size',min:4,max:40,step:1,default:10},
@@ -2468,7 +2557,7 @@ const DitherAlgorithms = (() => {
     {id:'underpaintStrength',label:'Underpaint Stroke Strength',min:0,max:1,step:.05,default:1,
      hint:'0 = wash only · 1 = hard painterly strokes'},
     {id:'underpaintDetailPreserve',label:'Underpaint Subject Detail',min:0,max:1,step:.05,default:.5,
-     hint:'0 = broad wash everywhere · 1 = busy areas reveal source sharply'},
+     hint:'0 = broad wash everywhere · 1 = busy areas reconstruct with smaller strokes and sketch detail'},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.8,
@@ -2489,7 +2578,7 @@ const DitherAlgorithms = (() => {
     {id:'wetSmudge',label:'Wet Smudge',min:0,max:1,step:.05,default:0},
     {id:'wetStreak',label:'Wet Streak',min:0,max:1,step:.05,default:0},
     {id:'colorVariety',label:'Color Variety (multi-color stroke)',min:0,max:1,step:.05,default:.2},
-    {id:'smartColorJitter',label:'Smart Color Jitter',min:0,max:1,step:.05,default:.25,
+    {id:'smartColorJitter',label:'Smart Color Jitter',min:0,max:1,step:.05,default:.4,
      hint:'Photoshop-like color notes placed mostly in saturated/detail/edge zones'},
     // — Intensity & layering —
     {id:'intensity',label:'Intensity',min:.3,max:3,step:.05,default:1.2},
@@ -2722,6 +2811,8 @@ const DitherAlgorithms = (() => {
     // edge orientations to lay oriented strokes.
     const sf = sobelField(px, w, h);
     const edgeMag = sf.mag, edgeAng = sf.ang;
+    const stageLevel = reconstructionStepLevel(p);
+    const reconUnderpaint = getPainterLayerSettings(p, 'underpaint');
 
     // Start canvas:
     //   'underpaint' = painterly base built from a smooth tonal wash
@@ -2743,11 +2834,11 @@ const DitherAlgorithms = (() => {
       const _upOpts = {
         washNoise:      (p.underpaintNoise      != null) ? p.underpaintNoise      : 1,
         washSmoothness: (p.underpaintSmoothness != null) ? p.underpaintSmoothness : 0,
-        density:        (p.underpaintDensity    != null) ? p.underpaintDensity    : 1,
-        sizeMul:        (p.underpaintSize       != null) ? p.underpaintSize       : 1,
+        density:        ((p.underpaintDensity   != null) ? p.underpaintDensity    : 1) * reconUnderpaint.density,
+        sizeMul:        ((p.underpaintSize      != null) ? p.underpaintSize       : 1) * reconUnderpaint.scale,
         detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
-        angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
-        strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1,
+        angleJitter:    ((p.underpaintAngle     != null) ? p.underpaintAngle      : 0.8) * (0.65 + reconUnderpaint.jitter * 0.85),
+        strokeStrength: ((p.underpaintStrength  != null) ? p.underpaintStrength   : 1) * reconUnderpaint.opacity,
         detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5,
         edgeMag,
         formFollow,
@@ -2758,11 +2849,10 @@ const DitherAlgorithms = (() => {
       for (let i = 0; i < w*h; i++) o[i] = clamp(px[i]);
     }
 
-    const stageLevel = reconstructionStageLevel(p.reconstructionStage);
-    const constructionLines = (p.constructionLines != null) ? p.constructionLines : 0.35;
+    const constructionLines = (p.constructionLines != null) ? p.constructionLines : 0.5;
     const constructionStyle = p.constructionStyle || 'angular';
-    const blockInStrength = (p.blockInStrength != null) ? p.blockInStrength : 0.65;
-    const smartColorJitter = (p.smartColorJitter != null) ? p.smartColorJitter : 0.25;
+    const blockInStrength = (p.blockInStrength != null) ? p.blockInStrength : 0.72;
+    const smartColorJitter = (p.smartColorJitter != null) ? p.smartColorJitter : 0.4;
     const edgeFinish = (p.edgeFinish != null) ? p.edgeFinish : 0.25;
 
     const needDetail = detailAware > 0 || sizeByDetail > 0 || skipSmoothAreas > 0 ||
@@ -2781,6 +2871,13 @@ const DitherAlgorithms = (() => {
       : null;
     const cbGrayMap = toneGuide && toneGuide.fields && toneGuide.fields.gray ? toneGuide.fields.gray.value : null;
     const channelHint = p._advChannelHint || 'gray';
+    const reconConstruction = getPainterLayerSettings(p, 'construction');
+    const reconBlock = getPainterLayerSettings(p, 'block');
+    const reconForms = getPainterLayerSettings(p, 'forms');
+    const reconColor = getPainterLayerSettings(p, 'color');
+    const reconEdges = getPainterLayerSettings(p, 'edges');
+    const reconFinish = getPainterLayerSettings(p, 'finish');
+    const reconPaint = stageLevel >= 6 ? reconFinish : reconEdges;
 
     if (stageLevel <= 0) return o;
     if (constructionLines > 0) {
@@ -2788,10 +2885,13 @@ const DitherAlgorithms = (() => {
         strength: constructionLines,
         style: constructionStyle,
         detailDrive: Math.min(1, detailAware / 2),
-        lineScale: 0.9 + canvasScale * 0.2,
+        lineScale: (0.9 + canvasScale * 0.2) * reconConstruction.scale,
         spacing: Math.max(5, underpaintBlock * 0.52),
-        length: Math.max(12, underpaintBlock * 1.05),
-        width: 0.9 + constructionLines * 1.1,
+        length: Math.max(12, underpaintBlock * 1.05) * reconConstruction.scale,
+        width: (0.9 + constructionLines * 1.1) * Math.sqrt(reconConstruction.scale),
+        density: reconConstruction.density,
+        opacity: reconConstruction.opacity,
+        jitter: reconConstruction.jitter,
         seed: seedI ^ 0x3b7
       });
       yield o;
@@ -2800,10 +2900,13 @@ const DitherAlgorithms = (() => {
     if (blockInStrength > 0) {
       paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
         strength: blockInStrength,
-        size: Math.max(underpaintBlock, (p.size || 10) * canvasScale * 1.45),
+        size: Math.max(underpaintBlock, (p.size || 10) * canvasScale * 1.45) * reconBlock.scale,
         detailDrive: Math.min(1, detailAware / 2),
         formFollow,
         angularity: formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.55 : 0.22),
+        density: reconBlock.density,
+        opacity: reconBlock.opacity,
+        jitter: reconBlock.jitter,
         seed: seedI ^ 0x45d
       });
       yield o;
@@ -2812,10 +2915,13 @@ const DitherAlgorithms = (() => {
 
     paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
       strength: Math.min(1.2, blockInStrength * 0.55 + 0.18),
-      size: Math.max(5, (p.size || 10) * canvasScale * (0.82 + sizeByDetail * 0.16)),
+      size: Math.max(5, (p.size || 10) * canvasScale * (0.82 + sizeByDetail * 0.16)) * reconForms.scale,
       detailDrive: Math.min(1, detailAware / 2),
       formFollow: Math.max(formFollow, 0.25),
       angularity: formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.34 : 0.10),
+      density: reconForms.density,
+      opacity: reconForms.opacity,
+      jitter: reconForms.jitter,
       seed: seedI ^ 0x68d
     });
     yield o;
@@ -2826,8 +2932,11 @@ const DitherAlgorithms = (() => {
         strength: smartColorJitter,
         channelHint,
         spacing: Math.max(3, (p.size || 10) * canvasScale * 0.75),
-        length: Math.max(4, (p.size || 10) * canvasScale * 0.9),
-        width: Math.max(0.8, (p.size || 10) * canvasScale * 0.16),
+        length: Math.max(4, (p.size || 10) * canvasScale * 0.9) * reconColor.scale,
+        width: Math.max(0.8, (p.size || 10) * canvasScale * 0.16) * Math.sqrt(reconColor.scale),
+        density: reconColor.density,
+        opacity: reconColor.opacity,
+        jitter: reconColor.jitter,
         seed: seedI ^ 0x73a
       });
       yield o;
@@ -2835,15 +2944,17 @@ const DitherAlgorithms = (() => {
     if (stageLevel <= 4) return o;
 
     const renderLayers = layers;
+    const mainLayerPlan = applyPainterLayerSettingsToPlan(layerPlan, reconPaint);
 
     // Stride between strokes. PREVIEW widens stride (~1.5×) so the preview
     // runs on roughly half as many strokes — quality drops slightly but
     // the user can still read stroke direction + color while dragging.
     // Stroke spacing tracks effective (canvas-scaled) knife width so the
     // coverage density stays consistent across canvas sizes.
+    const strokeDensityMul = Math.max(0.15, reconPaint.density);
     const baseSp = PREVIEW
-      ? Math.max(3, Math.round(p.size * canvasScale * 0.8 * 1.5))
-      : Math.max(2, Math.round(p.size * canvasScale * 0.8));
+      ? Math.max(3, Math.round(p.size * canvasScale * 0.8 * 1.5 / Math.sqrt(strokeDensityMul)))
+      : Math.max(2, Math.round(p.size * canvasScale * 0.8 / Math.sqrt(strokeDensityMul)));
 
     // Stamp-pixel budget cap. Brush-shape mode does a (2*stampSz+1)^2 inner
     // loop PER smear step, so this is the single biggest knob for preview
@@ -2871,9 +2982,9 @@ const DitherAlgorithms = (() => {
     let strokesSinceYield = 0;
 
     for (let layer = 0; layer < renderLayers; layer++) {
-      const layerSpec = layerPlan[Math.min(layerPlan.length - 1, layer)];
+      const layerSpec = mainLayerPlan[Math.min(mainLayerPlan.length - 1, layer)];
       const layerAng = (layers > 1)
-        ? (((layerSpec.index / Math.max(1, layerPlan.length - 1)) - 0.5) * Math.PI * 0.32 * (0.4 + layerSpec.t * 0.6))
+        ? (((layerSpec.index / Math.max(1, mainLayerPlan.length - 1)) - 0.5) * Math.PI * 0.32 * (0.4 + layerSpec.t * 0.6))
         : 0;
       const ox = (layer * (baseSp >> 1)) % baseSp;
       const oy = (layer * (baseSp >> 2)) % baseSp;
@@ -3239,7 +3350,12 @@ const DitherAlgorithms = (() => {
               const sYi = Math.max(0, Math.min(h-1, Math.round(sOrigY + jy + vy)));
               let src2 = clamp(px[sYi * w + sXi]);
               if (impurityShift !== 0) src2 = clamp(src2 + impurityShift);
-              o[wy2 * w + wx2] = src2;
+              const oi = wy2 * w + wx2;
+              if (effSlotOpacity >= 0.999) {
+                o[oi] = src2;
+              } else {
+                o[oi] = Math.round(src2 * effSlotOpacity + o[oi] * (1 - effSlotOpacity));
+              }
             }
           }
         }
@@ -3254,7 +3370,8 @@ const DitherAlgorithms = (() => {
     }
 
     if (edgeFinish !== 0 && stageLevel >= 5) {
-      finishPainterEdges(o, px, w, h, edgeMag, edgeAng, detail, seedI ^ 0x52c, edgeFinish);
+      const edgeLayer = stageLevel >= 6 ? reconFinish : reconEdges;
+      finishPainterEdges(o, px, w, h, edgeMag, edgeAng, detail, seedI ^ 0x52c, edgeFinish, edgeLayer);
       yield o;
     }
     if (stageLevel <= 5) return o;
@@ -6598,22 +6715,16 @@ const DitherAlgorithms = (() => {
   // produce Riley-style op-art or subtle chromatic-aberration feel.
   A.push({ id:'impressionism', name:'Impressionism / Op-Art', category:'artistic', params:[
     // — Reconstruction workflow —
-    {id:'reconstructionStage',label:'Reconstruction Step',type:'select',options:[
-      {value:'finish',label:'Final painting'},
-      {value:'underpaint',label:'1 · Underpainting only'},
-      {value:'construction',label:'2 · Construction sketch'},
-      {value:'block',label:'3 · Broad block-in'},
-      {value:'forms',label:'4 · Form masses'},
-      {value:'color',label:'5 · Color notes / jitter'},
-      {value:'edges',label:'6 · Edges + detail'}
-    ],default:'finish'},
+    {id:'reconstructionStep',label:'Reconstruction Step',type:'reconstructionStep',min:0,max:6,step:1,default:6,
+     labels:['1 · Underpainting','2 · Painterly sketch','3 · Broad block-in','4 · Form masses','5 · Color notes','6 · Edges + detail','7 · Final painting']},
+    {id:'reconstructionLayers',label:'Edit Current Step',type:'reconstructionLayers',default:defaultPainterLayerSettings()},
     {id:'constructionStyle',label:'Construction Style',type:'select',options:[
       {value:'angular',label:'Angular painter sketch'},
       {value:'form',label:'Form-following sketch'},
       {value:'hybrid',label:'Hybrid sketch'}
     ],default:'angular'},
-    {id:'constructionLines',label:'Construction Lines',min:0,max:1,step:.05,default:.35},
-    {id:'blockInStrength',label:'Broad Block-In',min:0,max:1.5,step:.05,default:.6},
+    {id:'constructionLines',label:'Construction Lines',min:0,max:1,step:.05,default:.5},
+    {id:'blockInStrength',label:'Broad Block-In',min:0,max:1.5,step:.05,default:.68},
     {id:'edgeFinish',label:'Soft ↔ Hard Edges',min:-1,max:1,step:.05,default:.2},
     // — Core (same defaults as legacy) —
     {id:'dabCount',label:'Dab Count',min:500,max:40000,step:100,default:4000},
@@ -6649,7 +6760,7 @@ const DitherAlgorithms = (() => {
     {id:'underpaintStrength',label:'Underpaint Stroke Strength',min:0,max:1,step:.05,default:1,
      hint:'0 = wash only · 1 = hard painterly strokes'},
     {id:'underpaintDetailPreserve',label:'Underpaint Subject Detail',min:0,max:1,step:.05,default:.5,
-     hint:'0 = broad wash everywhere · 1 = busy areas reveal source sharply'},
+     hint:'0 = broad wash everywhere · 1 = busy areas reconstruct with smaller strokes and sketch detail'},
     // — Detail awareness (human-like placement) —
     {id:'detailAware',label:'Detail Awareness',min:0,max:2,step:.05,default:1},
     {id:'sizeByDetail',label:'Size by Detail',min:0,max:1.5,step:.05,default:.7,
@@ -6662,7 +6773,7 @@ const DitherAlgorithms = (() => {
     {id:'wetSmudge',label:'Wet Smudge',min:0,max:1,step:.05,default:0},
     {id:'wetStreak',label:'Wet Streak',min:0,max:1,step:.05,default:0},
     {id:'colorVariety',label:'Color Variety (multi-color stroke)',min:0,max:1,step:.05,default:.25},
-    {id:'smartColorJitter',label:'Smart Color Jitter',min:0,max:1,step:.05,default:.25,
+    {id:'smartColorJitter',label:'Smart Color Jitter',min:0,max:1,step:.05,default:.4,
      hint:'Photoshop-like color notes placed mostly in saturated/detail/edge zones'},
     // — Intensity & adaptive —
     {id:'intensity',label:'Intensity',min:.3,max:3,step:.05,default:1},
@@ -6762,6 +6873,8 @@ const DitherAlgorithms = (() => {
     // produce sensible values.
     const canvasScale = Math.max(0.5, Math.min(3.0, Math.sqrt(w * h) / 720));
     const underpaintBlock = Math.max(2, Math.round(((p.underpaintBlock != null) ? p.underpaintBlock : 14) * canvasScale));
+    const stageLevel = reconstructionStepLevel(p);
+    const reconUnderpaint = getPainterLayerSettings(p, 'underpaint');
     const seedUnder          = (p.seed|0) || 42;
     function shUnder(a, b, k) {
       let h = Math.imul((a|0) + 374761393, 0x9E3779B1) ^
@@ -6808,11 +6921,11 @@ const DitherAlgorithms = (() => {
       const _upOpts = {
         washNoise:      (p.underpaintNoise      != null) ? p.underpaintNoise      : 1,
         washSmoothness: (p.underpaintSmoothness != null) ? p.underpaintSmoothness : 0,
-        density:        (p.underpaintDensity    != null) ? p.underpaintDensity    : 1,
-        sizeMul:        (p.underpaintSize       != null) ? p.underpaintSize       : 1,
+        density:        ((p.underpaintDensity   != null) ? p.underpaintDensity    : 1) * reconUnderpaint.density,
+        sizeMul:        ((p.underpaintSize      != null) ? p.underpaintSize       : 1) * reconUnderpaint.scale,
         detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
-        angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
-        strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1,
+        angleJitter:    ((p.underpaintAngle     != null) ? p.underpaintAngle      : 0.8) * (0.65 + reconUnderpaint.jitter * 0.85),
+        strokeStrength: ((p.underpaintStrength  != null) ? p.underpaintStrength   : 1) * reconUnderpaint.opacity,
         detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5,
         edgeMag: edgeMagUp,
         formFollow: (p.formFollow != null) ? p.formFollow : 0,
@@ -6850,11 +6963,10 @@ const DitherAlgorithms = (() => {
     const wetSmudge        = (p.wetSmudge        != null) ? p.wetSmudge        : 0;
     const wetStreak        = (p.wetStreak        != null) ? p.wetStreak        : 0;
     const colorVariety     = (p.colorVariety     != null) ? p.colorVariety     : 0.25;
-    const stageLevel       = reconstructionStageLevel(p.reconstructionStage);
-    const constructionLines= (p.constructionLines != null) ? p.constructionLines : 0.35;
+    const constructionLines= (p.constructionLines != null) ? p.constructionLines : 0.5;
     const constructionStyle= p.constructionStyle || 'angular';
-    const blockInStrength  = (p.blockInStrength != null) ? p.blockInStrength : 0.6;
-    const smartColorJitter = (p.smartColorJitter != null) ? p.smartColorJitter : 0.25;
+    const blockInStrength  = (p.blockInStrength != null) ? p.blockInStrength : 0.68;
+    const smartColorJitter = (p.smartColorJitter != null) ? p.smartColorJitter : 0.4;
     const edgeFinish       = (p.edgeFinish != null) ? p.edgeFinish : 0.2;
     const brushShape       = p.brushShape || 'default';
     const seedI            = (p.seed|0) || 42;
@@ -6935,6 +7047,13 @@ const DitherAlgorithms = (() => {
       : null;
     const cbGrayMap = toneGuide && toneGuide.fields && toneGuide.fields.gray ? toneGuide.fields.gray.value : null;
     const channelHint = p._advChannelHint || 'gray';
+    const reconConstruction = getPainterLayerSettings(p, 'construction');
+    const reconBlock = getPainterLayerSettings(p, 'block');
+    const reconForms = getPainterLayerSettings(p, 'forms');
+    const reconColor = getPainterLayerSettings(p, 'color');
+    const reconEdges = getPainterLayerSettings(p, 'edges');
+    const reconFinish = getPainterLayerSettings(p, 'finish');
+    const reconPaint = stageLevel >= 6 ? reconFinish : reconEdges;
 
     if (stageLevel <= 0) return o;
     if (constructionLines > 0) {
@@ -6942,10 +7061,13 @@ const DitherAlgorithms = (() => {
         strength: constructionLines,
         style: constructionStyle,
         detailDrive: Math.min(1, detailAware / 2),
-        lineScale: 0.85 + canvasScale * 0.18,
+        lineScale: (0.85 + canvasScale * 0.18) * reconConstruction.scale,
         spacing: Math.max(5, underpaintBlock * 0.50),
-        length: Math.max(10, underpaintBlock * 0.96),
-        width: 0.75 + constructionLines,
+        length: Math.max(10, underpaintBlock * 0.96) * reconConstruction.scale,
+        width: (0.75 + constructionLines) * Math.sqrt(reconConstruction.scale),
+        density: reconConstruction.density,
+        opacity: reconConstruction.opacity,
+        jitter: reconConstruction.jitter,
         seed: seedI ^ 0x4ef
       });
       yield o;
@@ -6954,10 +7076,13 @@ const DitherAlgorithms = (() => {
     if (blockInStrength > 0) {
       paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
         strength: blockInStrength,
-        size: Math.max(underpaintBlock, (p.dabLen || 8) * canvasScale * 1.55),
+        size: Math.max(underpaintBlock, (p.dabLen || 8) * canvasScale * 1.55) * reconBlock.scale,
         detailDrive: Math.min(1, detailAware / 2),
         formFollow,
         angularity: formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.48 : 0.18),
+        density: reconBlock.density,
+        opacity: reconBlock.opacity,
+        jitter: reconBlock.jitter,
         seed: seedI ^ 0x594
       });
       yield o;
@@ -6966,10 +7091,13 @@ const DitherAlgorithms = (() => {
 
     paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
       strength: Math.min(1.15, blockInStrength * 0.55 + 0.16),
-      size: Math.max(4, (p.dabLen || 8) * canvasScale * (0.85 + sizeByDetail * 0.16)),
+      size: Math.max(4, (p.dabLen || 8) * canvasScale * (0.85 + sizeByDetail * 0.16)) * reconForms.scale,
       detailDrive: Math.min(1, detailAware / 2),
       formFollow: Math.max(formFollow, 0.25),
       angularity: formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.30 : 0.10),
+      density: reconForms.density,
+      opacity: reconForms.opacity,
+      jitter: reconForms.jitter,
       seed: seedI ^ 0x6ad
     });
     yield o;
@@ -6980,21 +7108,25 @@ const DitherAlgorithms = (() => {
         strength: smartColorJitter,
         channelHint,
         spacing: Math.max(3, (p.dabLen || 8) * canvasScale * 0.72),
-        length: Math.max(3, (p.dabLen || 8) * canvasScale * 0.95),
-        width: Math.max(0.7, (p.dabWidth || 2) * canvasScale * 0.8),
+        length: Math.max(3, (p.dabLen || 8) * canvasScale * 0.95) * reconColor.scale,
+        width: Math.max(0.7, (p.dabWidth || 2) * canvasScale * 0.8) * Math.sqrt(reconColor.scale),
+        density: reconColor.density,
+        opacity: reconColor.opacity,
+        jitter: reconColor.jitter,
         seed: seedI ^ 0x7f1
       });
       yield o;
     }
     if (stageLevel <= 4) return o;
 
-    const renderLayerPlan = layerPlan;
+    const renderLayerPlan = applyPainterLayerSettingsToPlan(layerPlan, reconPaint);
 
     // When detail-awareness is active, reduce total dabs (a human would
     // not paint 4000 strokes in a flat sky; we redistribute them).
     if (detailAware > 0) {
       totalDabs = Math.round(totalDabs * (1 - detailAware * 0.15));
     }
+    totalDabs = Math.max(80, Math.round(totalDabs * Math.sqrt(Math.max(0.15, reconPaint.density))));
 
     // Preview-tier: roughly halve dab count so drag-interactive re-renders
     // stay snappy. Quality gap vs final is small — the image still reads
@@ -7019,7 +7151,7 @@ const DitherAlgorithms = (() => {
       const layerShare = layerSpec.densityMul / layerDensitySum;
       const layerDabs = Math.max(80, Math.round(totalDabs * layerShare));
       const layerAng = renderLayerPlan.length > 1
-        ? (((layerSpec.index / Math.max(1, layerPlan.length - 1)) - 0.5) * Math.PI * 0.18)
+        ? (((layerSpec.index / Math.max(1, renderLayerPlan.length - 1)) - 0.5) * Math.PI * 0.18)
         : 0;
       for (let li = 0; li < layerDabs; li++, globalDab++) {
         if (globalDab > 0 && (globalDab % DAB_CHUNK) === 0) yield o;
@@ -7262,7 +7394,8 @@ const DitherAlgorithms = (() => {
     }
 
     if (edgeFinish !== 0 && stageLevel >= 5) {
-      finishPainterEdges(o, px, w, h, edgeMag, edgeAng, detail, seedI ^ 0x637, edgeFinish);
+      const edgeLayer = stageLevel >= 6 ? reconFinish : reconEdges;
+      finishPainterEdges(o, px, w, h, edgeMag, edgeAng, detail, seedI ^ 0x637, edgeFinish, edgeLayer);
       yield o;
     }
     if (stageLevel <= 5) return o;

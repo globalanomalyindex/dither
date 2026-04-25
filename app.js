@@ -1577,6 +1577,98 @@
     return value;
   }
 
+  const RECON_UI_STEPS = [
+    { key: 'underpaint', label: '1 - Underpainting' },
+    { key: 'construction', label: '2 - Painterly sketch' },
+    { key: 'block', label: '3 - Broad block-in' },
+    { key: 'forms', label: '4 - Form masses' },
+    { key: 'color', label: '5 - Color notes' },
+    { key: 'edges', label: '6 - Edges + detail' },
+    { key: 'finish', label: '7 - Final painting' }
+  ];
+
+  function reconstructionStepFromStage(stage) {
+    switch (stage || 'finish') {
+      case 'underpaint': return 0;
+      case 'construction': return 1;
+      case 'block': return 2;
+      case 'forms': return 3;
+      case 'color': return 4;
+      case 'edges': return 5;
+      case 'finish':
+      default: return 6;
+    }
+  }
+
+  function activeReconstructionStep(params) {
+    if (params && params.reconstructionStep !== undefined) {
+      const v = parseInt(params.reconstructionStep, 10);
+      if (Number.isFinite(v)) return Math.max(0, Math.min(RECON_UI_STEPS.length - 1, v));
+    }
+    return reconstructionStepFromStage(params && params.reconstructionStage);
+  }
+
+  function normalizeReconLayers(params, defaults) {
+    const fallback = defaults && typeof defaults === 'object' ? defaults : {};
+    if (!params.reconstructionLayers || typeof params.reconstructionLayers !== 'object') {
+      params.reconstructionLayers = cloneParamValue(fallback);
+    }
+    for (const step of RECON_UI_STEPS) {
+      const def = fallback[step.key] || { scale: 1, density: 1, opacity: 1, jitter: 0.35 };
+      if (!params.reconstructionLayers[step.key] || typeof params.reconstructionLayers[step.key] !== 'object') {
+        params.reconstructionLayers[step.key] = cloneParamValue(def);
+      } else {
+        for (const field of ['scale', 'density', 'opacity', 'jitter']) {
+          if (params.reconstructionLayers[step.key][field] === undefined) {
+            params.reconstructionLayers[step.key][field] = def[field];
+          }
+        }
+      }
+    }
+    return params.reconstructionLayers;
+  }
+
+  function formatReconValue(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '0';
+    const s = n.toFixed(2);
+    if (s.endsWith('.00')) return String(Math.round(n));
+    return s.replace(/(\.\d)0$/, '$1');
+  }
+
+  function renderReconLayerSlider(algoId, key, field, label, min, max, step, value) {
+    return `
+      <label class="recon-layer-row">
+        <span class="recon-layer-label">${label}</span>
+        <div class="slider-row">
+          <input type="range" class="recon-layer-input" data-algo="${algoId}" data-recon-path="${key}.${field}"
+            min="${min}" max="${max}" step="${step}" value="${value}">
+          <span class="param-value">${formatReconValue(value)}</span>
+        </div>
+      </label>
+    `;
+  }
+
+  function renderReconstructionLayerPanel(sel, paramDef) {
+    const layers = normalizeReconLayers(sel.params, paramDef.default);
+    const stepIndex = activeReconstructionStep(sel.params);
+    const step = RECON_UI_STEPS[stepIndex] || RECON_UI_STEPS[RECON_UI_STEPS.length - 1];
+    const layer = layers[step.key];
+    return `
+      <div class="param-group recon-layer-panel" data-algo="${sel.id}" data-param="${paramDef.id}">
+        <div class="recon-layer-head">
+          <span class="recon-layer-kicker">${paramDef.label}</span>
+          <strong>${step.label}</strong>
+        </div>
+        <div class="recon-layer-note">These controls belong only to this reconstruction step. Scrub to another step and they swap, but each step keeps its own edits.</div>
+        ${renderReconLayerSlider(sel.id, step.key, 'scale', 'Stroke scale', 0.35, 2.5, 0.05, layer.scale)}
+        ${renderReconLayerSlider(sel.id, step.key, 'density', 'Stroke density', 0.15, 2.5, 0.05, layer.density)}
+        ${renderReconLayerSlider(sel.id, step.key, 'opacity', 'Paint opacity', 0, 1.25, 0.05, layer.opacity)}
+        ${renderReconLayerSlider(sel.id, step.key, 'jitter', 'Decision jitter', 0, 1.5, 0.05, layer.jitter)}
+      </div>
+    `;
+  }
+
   function randomSeedForParam(param) {
     const min = typeof param.min === 'number' ? Math.floor(param.min) : 1;
     const max = 999999;
@@ -1652,6 +1744,11 @@
       `;
 
       for (const p of algo.params) {
+        if (sel.params[p.id] === undefined) {
+          sel.params[p.id] = p.id === 'reconstructionStep'
+            ? reconstructionStepFromStage(sel.params.reconstructionStage)
+            : cloneParamValue(p.default);
+        }
         if (p.id === 'seed') {
           // Seed: number input + a dice button that picks a new random seed
           // (previously a "Random every render" checkbox — user feedback:
@@ -1698,6 +1795,28 @@
               <select data-algo="${sel.id}" data-param="${p.id}"${disAttr}>${opts}</select>
             </div>
           `;
+        } else if (p.type === 'reconstructionStep') {
+          const stepIndex = activeReconstructionStep(sel.params);
+          const labels = p.labels || RECON_UI_STEPS.map(step => step.label);
+          const label = labels[stepIndex] || labels[labels.length - 1] || `${stepIndex}`;
+          html += `
+            <div class="param-group recon-step-group">
+              <div class="recon-step-head">
+                <span class="param-label">${p.label}</span>
+                <strong class="recon-step-current">${label}</strong>
+              </div>
+              <div class="slider-row">
+                <input type="range" class="recon-step-input" data-algo="${sel.id}" data-param="${p.id}"
+                  min="${p.min}" max="${p.max}" step="${p.step}" value="${stepIndex}">
+                <span class="param-value">${stepIndex + 1}/7</span>
+              </div>
+              <div class="recon-step-ticks">
+                ${RECON_UI_STEPS.map((step, idx) => `<span class="${idx === stepIndex ? 'active' : ''}" title="${step.label}">${idx + 1}</span>`).join('')}
+              </div>
+            </div>
+          `;
+        } else if (p.type === 'reconstructionLayers') {
+          html += renderReconstructionLayerPanel(sel, p);
         } else if (p.type === 'customBrushes') {
           // Ensure the param has the full default shape (in case a preset
           // or older state snapshot left gaps). Fills in missing slot fields
@@ -1978,14 +2097,24 @@
         hi.addEventListener('input', updateDualRange);
       });
 
-      // Regular range slider events — exclude .cb-input so the custom-brush
+      // Regular range slider events — exclude nested editors so their
+      // data-path handlers don't double-fire.
+      //
+      // Exclude .cb-input so the custom-brush
       // panel's nested paths don't double-fire (their values live under
       // sel.params.customBrushes.*, reached via data-cb-path not data-param).
-      section.querySelectorAll('input[type="range"]:not(.dual-range-lo):not(.dual-range-hi):not(.cb-input)').forEach(input => {
+      section.querySelectorAll('input[type="range"]:not(.dual-range-lo):not(.dual-range-hi):not(.cb-input):not(.recon-layer-input)').forEach(input => {
         input.addEventListener('input', e => {
           const s = state.selectedAlgorithms.find(a => a.id === e.target.dataset.algo);
-          if (s) s.params[e.target.dataset.param] = parseFloat(e.target.value);
-          e.target.closest('.slider-row').querySelector('.param-value').textContent = e.target.value;
+          const param = e.target.dataset.param;
+          if (s) s.params[param] = parseFloat(e.target.value);
+          const valueEl = e.target.closest('.slider-row').querySelector('.param-value');
+          if (valueEl) valueEl.textContent = param === 'reconstructionStep' ? `${parseInt(e.target.value, 10) + 1}/7` : e.target.value;
+          if (param === 'reconstructionStep') {
+            buildParamPanels();
+            scheduleProcess();
+            return;
+          }
           scheduleProcess();
         });
       });
@@ -2002,6 +2131,25 @@
         select.addEventListener('change', e => {
           const s = state.selectedAlgorithms.find(a => a.id === e.target.dataset.algo);
           if (s) s.params[e.target.dataset.param] = e.target.value;
+          scheduleProcess();
+        });
+      });
+
+      // Reconstruction layer editor. The scrubber picks which step is being
+      // edited; these range inputs write to that step only, so users can move
+      // back and forth without losing layer-specific choices.
+      section.querySelectorAll('.recon-layer-input').forEach(input => {
+        input.addEventListener('input', e => {
+          const s = state.selectedAlgorithms.find(a => a.id === e.target.dataset.algo);
+          if (!s) return;
+          const algoDef = DitherAlgorithms.find(a => a.id === s.id);
+          const pDef = algoDef && algoDef.params.find(p => p.type === 'reconstructionLayers');
+          const layers = normalizeReconLayers(s.params, pDef && pDef.default);
+          const [stepKey, field] = (e.target.dataset.reconPath || '').split('.');
+          if (!stepKey || !field || !layers[stepKey]) return;
+          layers[stepKey][field] = parseFloat(e.target.value);
+          const pv = e.target.closest('.slider-row') && e.target.closest('.slider-row').querySelector('.param-value');
+          if (pv) pv.textContent = formatReconValue(e.target.value);
           scheduleProcess();
         });
       });
@@ -2357,6 +2505,21 @@
       } else if (p.type === 'select') {
         const opts = p.options;
         sel.params[p.id] = opts[randomInt(0, opts.length - 1)].value;
+      } else if (p.type === 'reconstructionStep') {
+        // Keep dice renders on the final painting instead of randomly
+        // stopping at an in-progress layer.
+        sel.params[p.id] = p.default != null ? p.default : p.max;
+      } else if (p.type === 'reconstructionLayers') {
+        const layers = cloneParamValue(p.default);
+        for (const step of RECON_UI_STEPS) {
+          const layer = layers[step.key];
+          if (!layer) continue;
+          layer.scale = Math.round((0.6 + Math.random() * 1.25) * 20) / 20;
+          layer.density = Math.round((0.45 + Math.random() * 1.35) * 20) / 20;
+          layer.opacity = Math.round((0.55 + Math.random() * 0.55) * 20) / 20;
+          layer.jitter = Math.round(Math.random() * 24) / 20;
+        }
+        sel.params[p.id] = layers;
       } else if (p.type === 'customBrushes') {
         // Dice only the numeric routing fields — brush specs (which point
         // into the session library) and enabled-state are deliberately
@@ -2469,6 +2632,8 @@
         if (p.id === 'seed') continue;
         if (p.type === 'checkbox') params[p.id] = Math.random() > 0.5;
         else if (p.type === 'select') params[p.id] = p.options[randomInt(0, p.options.length - 1)].value;
+        else if (p.type === 'reconstructionStep') params[p.id] = p.default != null ? p.default : p.max;
+        else if (p.type === 'reconstructionLayers') params[p.id] = cloneParamValue(p.default);
         else if (p.type === 'customBrushes' || p.type === 'rules') params[p.id] = cloneParamValue(p.default);
         else {
           const steps = (p.max - p.min) / p.step;
