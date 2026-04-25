@@ -182,67 +182,84 @@ const DitherAlgorithms = (() => {
     if (!agenda.includes('detail')) agenda.push('detail');
     return agenda;
   }
-  function buildPainterLayerPasses(passCount, seed) {
+  function buildPainterLayerPasses(passCount, seed, opts) {
+    opts = opts || {};
     const count = Math.max(1, Math.min(6, passCount | 0 || 1));
+    const detailDrive = clamp01(((opts.detailAware != null ? opts.detailAware : 1) / 2) * 0.65 + ((opts.sizeByDetail != null ? opts.sizeByDetail : 0.8) / 1.5) * 0.35);
+    const skipDrive = clamp01(opts.skipSmooth != null ? opts.skipSmooth : 0);
+    const preserveDrive = clamp01(opts.detailPreserve != null ? opts.detailPreserve : 0);
     const rnd = mkRand(((Math.imul((seed | 0) || 1, 1103515245) ^ 0x5f3759df) >>> 0) || 1);
     const passes = [];
     for (let i = 0; i < count; i++) {
-      const t = count <= 1 ? 1 : i / (count - 1);
+      const t = count <= 1 ? 0 : i / (count - 1);
       const broad = 1 - t;
       passes.push({
         index: i,
         t,
         broad,
-        detailMin: i === 0 ? 0 : Math.max(0, t * 0.42 - 0.16),
-        detailMax: Math.min(1, 0.36 + t * 0.72),
-        edgeFloor: 0.10 + t * 0.46,
-        sizeMul: 1.62 - t * 0.84 + rnd() * 0.08,
-        lengthMul: 1.26 - t * 0.34 + rnd() * 0.05,
-        densityMul: 0.50 + t * 0.96 + rnd() * 0.08,
-        flowMul: 0.58 + t * 0.42,
-        pickupMul: 1.18 - t * 0.46,
-        jitterMul: 1.16 - t * 0.48,
-        opacityMul: 0.86 + t * 0.20,
-        smoothBoost: 0.56 + broad * 0.82,
-        detailBoost: 0.50 + t * 1.18
+        detailDrive,
+        skipDrive,
+        preserveDrive,
+        detailMin: i === 0 ? 0 : Math.max(0, t * (0.48 + detailDrive * 0.20) - 0.16),
+        detailMax: Math.min(1, 0.30 + t * 0.66 + detailDrive * 0.18 + preserveDrive * 0.10),
+        edgeFloor: Math.max(0.04, 0.18 + t * 0.38 - detailDrive * 0.10 - preserveDrive * 0.06),
+        sizeMul: 1.72 - t * (0.80 + detailDrive * 0.38) + rnd() * 0.08,
+        lengthMul: 1.32 - t * (0.30 + detailDrive * 0.16) + rnd() * 0.05,
+        densityMul: 0.48 + t * (0.82 + detailDrive * 0.62) + rnd() * 0.08,
+        flowMul: 0.52 + t * 0.48 + preserveDrive * 0.08,
+        pickupMul: 1.22 - t * (0.42 + detailDrive * 0.18),
+        jitterMul: 1.22 - t * (0.42 + detailDrive * 0.20),
+        opacityMul: 0.82 + t * 0.22 + preserveDrive * 0.08,
+        smoothBoost: 0.68 + broad * (0.34 - skipDrive * 0.16),
+        detailBoost: 0.58 + t * (1.16 + detailDrive * 0.58) + preserveDrive * 0.34
       });
     }
     return passes;
   }
   function keepPainterLayerStroke(layerSpec, detail01, edge01, lum01, hash01, phaseTag) {
     if (!layerSpec) return true;
+    const detailDrive = layerSpec.detailDrive || 0;
+    const skipDrive = layerSpec.skipDrive || 0;
+    const preserveDrive = layerSpec.preserveDrive || 0;
     let keep;
     switch (phaseTag) {
       case 'block':
+        keep = 0.72 - skipDrive * 0.20 + edge01 * 0.16 + preserveDrive * Math.max(detail01, edge01) * 0.24;
+        break;
       case 'flat':
-        keep = 0.24 + (1 - detail01) * layerSpec.smoothBoost + edge01 * 0.20;
+        keep = 0.30 + (1 - detail01) * (0.44 - skipDrive * 0.34) + edge01 * 0.22;
         break;
       case 'detail':
-        keep = 0.12 + Math.max(detail01, edge01) * layerSpec.detailBoost;
+        keep = 0.04 + Math.pow(Math.max(detail01, edge01 * 0.9), Math.max(0.42, 0.86 - detailDrive * 0.28)) * layerSpec.detailBoost;
         break;
       case 'edge':
-        keep = 0.10 + edge01 * 1.05 + detail01 * 0.30;
+        keep = 0.03 + Math.pow(edge01, Math.max(0.44, 0.82 - preserveDrive * 0.30)) * (0.90 + detailDrive * 0.48 + preserveDrive * 0.35) + detail01 * 0.18;
         break;
       case 'shadow':
-        keep = 0.18 + (1 - lum01) * 0.82 + detail01 * 0.18;
+        keep = 0.18 + (1 - lum01) * 0.72 + Math.max(detail01, edge01) * (0.18 + preserveDrive * 0.22);
         break;
       case 'highlight':
-        keep = 0.14 + lum01 * 0.78 + edge01 * 0.22;
+        keep = 0.14 + lum01 * 0.68 + Math.max(detail01, edge01) * (0.22 + preserveDrive * 0.20);
         break;
       default: {
         const target = (layerSpec.detailMin + layerSpec.detailMax) * 0.5;
         const width = Math.max(0.12, (layerSpec.detailMax - layerSpec.detailMin) * 0.7 + 0.2);
         const band = Math.max(0, 1 - Math.abs(detail01 - target) / width);
-        keep = 0.18 + band * 0.84 + edge01 * 0.14;
+        keep = 0.14 + band * (0.56 + detailDrive * 0.36) + edge01 * (0.18 + preserveDrive * 0.20);
         break;
       }
     }
-    if (detail01 < layerSpec.detailMin && phaseTag !== 'flat' && phaseTag !== 'block' && edge01 < layerSpec.edgeFloor) keep *= 0.14;
-    if (detail01 > layerSpec.detailMax && phaseTag === 'flat') keep *= 0.08;
-    if (phaseTag === 'detail' && detail01 < Math.max(0.08, layerSpec.detailMin * 0.7) && edge01 < layerSpec.edgeFloor) keep *= 0.10;
-    if (phaseTag === 'edge' && edge01 < layerSpec.edgeFloor * 0.72) keep *= 0.08;
+    if (detail01 < layerSpec.detailMin && phaseTag !== 'flat' && phaseTag !== 'block' && edge01 < layerSpec.edgeFloor) keep *= 0.10 + preserveDrive * 0.12;
+    if (detail01 > layerSpec.detailMax && phaseTag === 'flat') keep *= 0.06 + (1 - skipDrive) * 0.12;
+    if (phaseTag === 'detail' && detail01 < Math.max(0.06, layerSpec.detailMin * 0.65) && edge01 < layerSpec.edgeFloor) keep *= 0.06 + detailDrive * 0.08;
+    if (phaseTag === 'edge' && edge01 < layerSpec.edgeFloor * 0.72) keep *= 0.05 + preserveDrive * 0.08;
     keep = clamp01(keep);
     return hash01 <= Math.max(0.04, keep);
+  }
+  function shapeDetailSignal(v, drive) {
+    const d = clamp01(v);
+    const pow = 0.92 - clamp01(drive || 0) * 0.38;
+    return Math.pow(d, Math.max(0.48, pow));
   }
 
   // Simple edge detection helper
@@ -400,7 +417,7 @@ const DitherAlgorithms = (() => {
         // (busy) while leaving FLAT pixels as the broad wash. Result:
         // skies/walls stay loose and gradient-like, subjects stay crisp.
         if (dfUp) {
-          const d01u = Math.min(1, dfUp[y * w + x] * dfUpNorm);
+          const d01u = shapeDetailSignal(dfUp[y * w + x] * dfUpNorm, _detailPreserve);
           const mixU = d01u * _detailPreserve;
           if (mixU > 0) smooth = smooth * (1 - mixU) + px[y * w + x] * mixU;
         }
@@ -477,7 +494,7 @@ const DitherAlgorithms = (() => {
       // Detail at candidate center. Used for both density rejection and
       // stroke size. Sampling once keeps the two responses in lockstep —
       // a flat region gets both bigger strokes AND fewer of them.
-      const d01 = Math.min(1, df[sampleIdx] * dNorm);
+      const d01 = shapeDetailSignal(df[sampleIdx] * dNorm, Math.min(1, _effDetailResp / 2));
       const keepP = _KEEP_MIN2 + _KEEP_RANGE2 * d01;
       if (sh(i, 0, 706) > keepP) continue;
       const sampleVal = px[sampleIdx];
@@ -567,6 +584,20 @@ const DitherAlgorithms = (() => {
           }
         }
       }
+    }
+    const structureStrength = clamp01(_detailPreserve * 0.85 + _effDetailResp * 0.12);
+    if (structureStrength > 0.03) {
+      paintStructuralEdgeStrokes(o, px, w, h, opts.edgeMag || null, edgeAng, df, sh, {
+        strength: structureStrength,
+        detailDrive: Math.min(1, _effDetailResp / 2),
+        angularity: (opts.formFollow != null && opts.formFollow < 0)
+          ? Math.min(1, -opts.formFollow)
+          : 0.35,
+        length: block * (1.35 + structureStrength * 1.15),
+        width: Math.max(0.8, block * 0.08),
+        spacing: Math.max(3, block * (0.76 - structureStrength * 0.26)),
+        seed: opts.seed || 1
+      });
     }
   }
 
@@ -690,6 +721,63 @@ const DitherAlgorithms = (() => {
     return d;
   }
 
+  function paintStructuralEdgeStrokes(o, px, w, h, edgeMag, edgeAng, detail, sh, opts) {
+    opts = opts || {};
+    const strength = clamp01(opts.strength || 0);
+    if (strength <= 0.01 || !edgeAng) return o;
+    if (!edgeMag) edgeMag = sobelField(px, w, h).mag;
+    const detailDrive = clamp01(opts.detailDrive != null ? opts.detailDrive : strength);
+    const angularity = clamp01(opts.angularity != null ? opts.angularity : 0.35);
+    const baseLen = Math.max(4, opts.length || 16);
+    const baseWidth = Math.max(0.6, opts.width || 1.4);
+    const spacing = Math.max(2, Math.round((opts.spacing || 8) * (1 - strength * 0.35)));
+    const eNorm = 1 / Math.max(16, _advFieldStats(edgeMag) * 0.55);
+    let dNorm = 1 / 32;
+    if (detail) dNorm = 1 / Math.max(8, _advFieldStats(detail) * 0.55);
+    const threshold = Math.max(0.08, 0.32 - strength * 0.18 - detailDrive * 0.08);
+    for (let gy = 1; gy < h - 1; gy += spacing) {
+      const jitterY = Math.round((_advHash01(opts.seed || 1, gy, spacing, 971) - 0.5) * spacing * 0.7);
+      const y = Math.max(1, Math.min(h - 2, gy + jitterY));
+      for (let gx = 1; gx < w - 1; gx += spacing) {
+        const jitterX = Math.round((_advHash01(opts.seed || 1, gx, y, 972) - 0.5) * spacing * 0.7);
+        const x = Math.max(1, Math.min(w - 2, gx + jitterX));
+        const idx = y * w + x;
+        const edge01 = clamp01(edgeMag[idx] * eNorm);
+        const detail01 = detail ? shapeDetailSignal(detail[idx] * dNorm, detailDrive) : edge01;
+        const importance = Math.max(edge01, detail01 * 0.62);
+        if (importance < threshold) continue;
+        const keep = Math.min(1, strength * (0.22 + importance * 1.05));
+        if (sh(x, y, 970) > keep) continue;
+        let ang = edgeAng[idx] + Math.PI * 0.5;
+        if (angularity > 0.02) {
+          const qStep = Math.PI * 2 / (8 + Math.round((1 - angularity) * 8));
+          const snapped = Math.round(ang / qStep) * qStep;
+          ang = ang * (1 - angularity) + snapped * angularity;
+        }
+        const ca = Math.cos(ang), sa = Math.sin(ang);
+        const len = baseLen * (0.72 + importance * (0.85 + strength * 0.9));
+        const halfLen = len * 0.5;
+        const halfW = baseWidth * (0.85 + strength * 1.35);
+        for (let t = -halfLen; t <= halfLen; t += 1) {
+          const taper = 1 - Math.abs(t) / Math.max(1, halfLen);
+          if (taper <= 0) continue;
+          for (let ww = -halfW; ww <= halfW; ww += 1) {
+            const wx = Math.round(x + ca * t - sa * ww);
+            const wy = Math.round(y + sa * t + ca * ww);
+            if (wx < 0 || wx >= w || wy < 0 || wy >= h) continue;
+            const cross = 1 - Math.abs(ww) / Math.max(1, halfW);
+            const prob = taper * cross * (0.42 + strength * 0.58);
+            if (sh(wx, wy, 973 + (t | 0)) > prob) continue;
+            const back = Math.max(0, Math.min(w - 1, Math.round(wx - ca * strength * 2)));
+            const bay = Math.max(0, Math.min(h - 1, Math.round(wy - sa * strength * 2)));
+            o[wy * w + wx] = px[bay * w + back];
+          }
+        }
+      }
+    }
+    return o;
+  }
+
   // ── ADVANCED PAINTING ENGINE (path-based, Bayer-dithered) ──
   // Fundamentally different from the normal stroke loop:
   //   1. Strokes are PATHS — the brush travels across the canvas, curving,
@@ -782,7 +870,12 @@ const DitherAlgorithms = (() => {
     const analysis      = cfg.analysis || buildAdvancedSourceAnalysis(w, h, px);
     const channelHint   = cfg.channelHint || p._advChannelHint || 'gray';
     const agenda        = buildAdvancedAgenda(seed, channelHint);
-    const layerPlan     = buildPainterLayerPasses(layerPasses, seed ^ ((channelHint.charCodeAt(0) || 0) << 6));
+    const layerPlan     = buildPainterLayerPasses(layerPasses, seed ^ ((channelHint.charCodeAt(0) || 0) << 6), {
+      detailAware,
+      sizeByDetail,
+      skipSmooth,
+      detailPreserve: cfg.detailPreserve != null ? cfg.detailPreserve : 0
+    });
 
     let eMax = 1;
     const poolStride = Math.max(1, ((w * h) / 2048) | 0);
@@ -852,13 +945,14 @@ const DitherAlgorithms = (() => {
         fieldFull.edgeMag[i] * fieldFull.edgeNorm * 0.9,
         colorEdge
       );
-      const d01 = Math.max(
+      const d01Raw = Math.max(
         Math.min(1, detail[i] * dNorm),
         fieldGray.detail[i] * fieldGray.detailNorm,
         fieldFull.detail[i] * fieldFull.detailNorm * 0.9,
         fieldDetail.value[i] / 255,
         colorDetail
       );
+      const d01 = shapeDetailSignal(d01Raw, Math.min(1, detailAware / 2));
       const v0  = clamp(px[i] * 0.42 + fieldGray.value[i] * 0.23 + fieldFull.value[i] * 0.20 + fieldDetail.value[i] * 0.15);
       if (fieldAlpha && fieldAlpha.value[i] < 4) continue;
       if (em >= 0.25)        pEdgeHard.push(i);
@@ -1144,13 +1238,14 @@ const DitherAlgorithms = (() => {
           supportField.edgeMag[idx] * supportField.edgeNorm * 0.82,
           tertiaryField.edgeMag[idx] * tertiaryField.edgeNorm * 0.72
         );
-        const d01 = Math.max(
+        const d01Raw = Math.max(
           Math.min(1, detail[idx] * dNorm),
           fieldGray.detail[idx] * fieldGray.detailNorm,
           primaryField.detail[idx] * primaryField.detailNorm,
           supportField.detail[idx] * supportField.detailNorm * 0.75,
           tertiaryField.detail[idx] * tertiaryField.detailNorm * 0.62
         );
+        const d01 = shapeDetailSignal(d01Raw, Math.min(1, detailAware / 2));
         const lum01 = clamp(
           px[idx] * 0.38 +
           primaryField.value[idx] * 0.30 +
@@ -3063,7 +3158,10 @@ const DitherAlgorithms = (() => {
         detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
         angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
         strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1,
-        detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
+        detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5,
+        edgeMag,
+        formFollow,
+        seed: seedI
       };
       painterlyUnderpaint(o, px, w, h, underpaintBlock, sh, edgeAng, bMask, bSize, _upOpts);
     } else {
@@ -3074,7 +3172,12 @@ const DitherAlgorithms = (() => {
     const detail = needDetail ? detailField(px, w, h, 8) : null;
     const detailNorm = detail ? 1 / Math.max(8, _advFieldStats(detail) * 0.6) : 0;
     const edgeNorm = 1 / Math.max(16, _advFieldStats(edgeMag) * 0.6);
-    const layerPlan = buildPainterLayerPasses(layers, seedI ^ 0x31c3);
+    const layerPlan = buildPainterLayerPasses(layers, seedI ^ 0x31c3, {
+      detailAware,
+      sizeByDetail,
+      skipSmooth: skipSmoothAreas,
+      detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
+    });
     const toneGuide = (cbEnabled || p.advancedEngine) ? buildAdvancedSourceAnalysis(w, h, px) : null;
     const cbGrayMap = toneGuide && toneGuide.fields && toneGuide.fields.gray ? toneGuide.fields.gray.value : null;
     const advAnalysis = p.advancedEngine ? toneGuide : null;
@@ -3084,6 +3187,7 @@ const DitherAlgorithms = (() => {
     // See impressionism for the full rationale. When on, replaces the smear
     // loop with advancedPaintPass.
     if (p.advancedEngine) {
+      const advLineSize = (p.size != null ? p.size : 10) * canvasScale;
       // Advanced-mode underpaint: Bayer-dithered value study. Replaces the
       // soft painterly wash used by the normal engine. Number of bands is
       // derived from underpaintBlock (inverse — smaller block → more bands,
@@ -3094,12 +3198,21 @@ const DitherAlgorithms = (() => {
         const advBands = Math.max(3, Math.min(9, Math.round(12 - (p.underpaintBlock || 14) * 0.3)));
         const advGrain = Math.max(0, Math.min(1, (p.underpaintAngle != null ? p.underpaintAngle : 0.8) * 0.6));
         advancedUnderpaint(o, px, w, h, advBands, advGrain, edgeMag, edgeAng, advAnalysis, seedI, advChannelHint);
+        paintStructuralEdgeStrokes(o, px, w, h, edgeMag, edgeAng, detail, sh, {
+          strength: clamp01(((p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5) * 0.76 + detailAware * 0.11 + sizeByDetail * 0.06),
+          detailDrive: Math.min(1, detailAware / 2),
+          angularity: formFollow < 0 ? Math.min(1, -formFollow) : 0.42,
+          length: advLineSize * (1.8 + sizeByDetail * 0.35),
+          width: Math.max(0.8, advLineSize * 0.12),
+          spacing: Math.max(3, underpaintBlock * (0.58 - Math.min(0.25, detailAware * 0.06))),
+          seed: seedI ^ 0x51f
+        });
         yield o;
       }
       // — Palette-knife → advanced engine config —
       // Every slider on the algo page gets re-interpreted through the
       // phase paradigm below. See advancedPaintPass for the full mapping.
-      const knifeSz = (p.size != null ? p.size : 10) * canvasScale;
+      const knifeSz = advLineSize;
       const advCfg = {
         baseSz:        knifeSz,
         baseW:         Math.max(2, knifeSz * 0.5),
@@ -3114,6 +3227,7 @@ const DitherAlgorithms = (() => {
         detailAware:   p.detailAware != null ? p.detailAware : 1,
         sizeByDetail:  Math.max(0, Math.min(1.5, p.sizeByDetail != null ? p.sizeByDetail : 0.8)),
         skipSmooth:    p.skipSmoothAreas != null ? p.skipSmoothAreas : 0.5,
+        detailPreserve:p.underpaintDetailPreserve != null ? p.underpaintDetailPreserve : 0.5,
         lumModulation: Math.max(0, Math.min(2, p.lightShadowBias != null ? Math.abs(p.lightShadowBias) + 1 : 1)),
         lengthByEdge:  p.lengthByEdge != null ? p.lengthByEdge : 0.6,
         pressureByEdge:p.pressureByEdge != null ? p.pressureByEdge : 0.5,
@@ -3236,7 +3350,7 @@ const DitherAlgorithms = (() => {
         //   identical strokes (a human would just put a few big ones).
         let localDetail = 0;  // 0..1
         if (detail) {
-          localDetail = Math.min(1, detail[y * w + x] * detailNorm);
+          localDetail = shapeDetailSignal(detail[y * w + x] * detailNorm, Math.min(1, detailAware / 2));
           const phaseTag = edgeN > 0.58 ? 'edge'
             : localDetail > 0.58 ? 'detail'
             : lum < 0.38 ? 'shadow'
@@ -7125,7 +7239,10 @@ const DitherAlgorithms = (() => {
         detailResp:     (p.underpaintDetail     != null) ? p.underpaintDetail     : 1,
         angleJitter:    (p.underpaintAngle      != null) ? p.underpaintAngle      : 0.8,
         strokeStrength: (p.underpaintStrength   != null) ? p.underpaintStrength   : 1,
-        detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
+        detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5,
+        edgeMag: edgeMagUp,
+        formFollow: (p.formFollow != null) ? p.formFollow : 0,
+        seed: seedUnder
       };
       painterlyUnderpaint(o, px, w, h, underpaintBlock, shUnder, edgeAngUp, _upMask, _upSize, _upOpts);
     } else {
@@ -7227,7 +7344,12 @@ const DitherAlgorithms = (() => {
     const detail = needDetail ? detailField(px, w, h, 8) : null;
     const detailNorm = detail ? 1 / Math.max(8, _advFieldStats(detail) * 0.6) : 0;
     const edgeNorm = 1 / Math.max(16, _advFieldStats(edgeMag) * 0.6);
-    const layerPlan = buildPainterLayerPasses(layers, seedI ^ 0x7a3b);
+    const layerPlan = buildPainterLayerPasses(layers, seedI ^ 0x7a3b, {
+      detailAware,
+      sizeByDetail,
+      skipSmooth: skipSmoothAreas,
+      detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
+    });
     const toneGuide = (cbEnabled || p.advancedEngine || p.illusion === 'colorJitterDetail')
       ? buildAdvancedSourceAnalysis(w, h, px)
       : null;
@@ -7241,18 +7363,29 @@ const DitherAlgorithms = (() => {
     // detail-busy, detail-flat, shadows, highlights, wash, cross-grain),
     // each with its own brush profile and stroke density.
     if (p.advancedEngine) {
+      const advDabL = (p.dabLen != null ? p.dabLen : 8) * canvasScale;
+      const advDabW = (p.dabWidth != null ? p.dabWidth : 2) * canvasScale;
       if (canvasStart !== 'clean') {
         const advBands = Math.max(3, Math.min(9, Math.round(12 - (p.underpaintBlock || 14) * 0.3)));
         const advGrain = Math.max(0, Math.min(1, (p.underpaintAngle != null ? p.underpaintAngle : 0.8) * 0.6));
         advancedUnderpaint(o, px, w, h, advBands, advGrain, edgeMagUp, edgeAngUp, advAnalysis, seedI, advChannelHint);
+        paintStructuralEdgeStrokes(o, px, w, h, edgeMagUp, edgeAngUp, detail, sh, {
+          strength: clamp01(((p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5) * 0.74 + detailAware * 0.12 + sizeByDetail * 0.05),
+          detailDrive: Math.min(1, detailAware / 2),
+          angularity: formFollow < 0 ? Math.min(1, -formFollow) : 0.36,
+          length: Math.max(advDabL * 2.2, underpaintBlock * 0.85),
+          width: Math.max(0.7, advDabW * 0.75),
+          spacing: Math.max(3, underpaintBlock * (0.56 - Math.min(0.22, detailAware * 0.05))),
+          seed: seedI ^ 0x8c7
+        });
         yield o;
       }
       // — Impressionism → advanced engine config —
       // dabLen × dabWidth drives base geometry; dabCount sets global density
       // (normalized against the 4000 default); flowStrength/formFollow shape
       // orientation; wet* params are still applied as post-passes below.
-      const dabL = (p.dabLen != null ? p.dabLen : 8) * canvasScale;
-      const dabW = (p.dabWidth != null ? p.dabWidth : 2) * canvasScale;
+      const dabL = advDabL;
+      const dabW = advDabW;
       const advCfg = {
         baseSz:        Math.max(3, dabL * 0.6),
         baseW:         Math.max(1, dabW),
@@ -7267,6 +7400,7 @@ const DitherAlgorithms = (() => {
         detailAware:   p.detailAware != null ? p.detailAware : 1,
         sizeByDetail:  p.sizeByDetail != null ? p.sizeByDetail : 0.7,
         skipSmooth:    p.skipSmoothAreas != null ? p.skipSmoothAreas : 0.5,
+        detailPreserve:p.underpaintDetailPreserve != null ? p.underpaintDetailPreserve : 0.5,
         lumModulation: p.lumModulation != null ? p.lumModulation : 1,
         lengthByEdge:  0.5,
         pressureByEdge:0.3,
@@ -7373,7 +7507,7 @@ const DitherAlgorithms = (() => {
         //   painterly dabs are enough).
         let localDetail = 0;
         if (detail) {
-          localDetail = Math.min(1, detail[y * w + x] * detailNorm);
+          localDetail = shapeDetailSignal(detail[y * w + x] * detailNorm, Math.min(1, detailAware / 2));
           if (skipSmoothAreas > 0) {
             const keepProb = localDetail + (1 - skipSmoothAreas * 0.8);
             if (sh(strokeKey, layer, 120) > Math.min(1, keepProb)) continue;
