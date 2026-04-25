@@ -1280,6 +1280,376 @@ const DitherAlgorithms = (() => {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // REGION-AWARE ADAPTIVE PAINTER
+  // ═══════════════════════════════════════════════════════════════════════
+  // The step system (underpaint → construction → block → forms → ...) applies
+  // the same painter logic everywhere with cascading numeric knobs. That
+  // produces uniform-looking strokes on every part of the image. A real
+  // painter doesn't do that — they look at the image, identify regions
+  // (background wall vs. cockatiel body vs. crest vs. eye), and CHOOSE a
+  // different stroke vocabulary for each region:
+  //   - Big flat backgrounds → 2-4 sweeping strokes
+  //   - Subject mass → medium broken-color blobs
+  //   - Thin elongated features (crest, fingers) → directional line strokes
+  //   - Tiny accents (eye, beak tip) → single precise dabs
+  //   - Then refine boundaries by smudging neighbor colors at borders
+  //
+  // This builds a downsampled segmentation of the gray-luma field, classifies
+  // each connected region by area + aspect ratio, plans a paint agenda
+  // (ordered by area with seed-driven shuffle within size buckets), and
+  // executes the appropriate stroke vocabulary for each region.
+  //
+  // Per-channel safety: segmentation is on `gray` (same for R/G/B passes),
+  // anchor positions are seeded from p.seed (not the channel-shuffled seed),
+  // so all three channels paint the same regions in the same order — only
+  // the deposited color differs per channel.
+
+  // Quick capsule brush stamp — half-length × half-width capsule rotated to
+  // `ang`, with radial falloff and end taper. Single-channel alpha blend.
+  function _ditherCapsule(o, w, h, cx, cy, hl, hw, ang, sampleV, alpha) {
+    if (alpha <= 0.02 || hw < 0.4) return;
+    const cosA = Math.cos(ang), sinA = Math.sin(ang);
+    const ext = Math.ceil(Math.max(hl, hw)) + 1;
+    for (let dy = -ext; dy <= ext; dy++) {
+      const ny = Math.round(cy + dy);
+      if (ny < 0 || ny >= h) continue;
+      for (let dx = -ext; dx <= ext; dx++) {
+        const nx = Math.round(cx + dx);
+        if (nx < 0 || nx >= w) continue;
+        const lt = dx * cosA + dy * sinA;
+        const ln = -dx * sinA + dy * cosA;
+        const clT = lt < -hl ? -hl : (lt > hl ? hl : lt);
+        const ddx = lt - clT;
+        const distSq = ddx * ddx + ln * ln;
+        if (distSq > hw * hw) continue;
+        const dist = Math.sqrt(distSq);
+        let fall = 1 - dist / hw;
+        const aAbs = Math.abs(lt);
+        if (aAbs > hl * 0.7) {
+          const endF = 1 - (aAbs - hl * 0.7) / (hl * 0.3 + 0.01);
+          fall *= Math.max(0, endF);
+        }
+        const a = fall * alpha;
+        if (a <= 0.02) continue;
+        const oi = ny * w + nx;
+        o[oi] = Math.round(sampleV * a + o[oi] * (1 - a));
+      }
+    }
+  }
+
+  // Downsampled connected-component segmentation on the gray-luma field.
+  // Returns regions[] with bbox, area, centroid, mean luma + the labels
+  // grid + scale factor for converting to/from full-canvas coords.
+  function _ditherRegionSegment(gray, w, h, bands) {
+    bands = Math.max(3, Math.min(10, bands || 6));
+    // Cap the segmentation grid at ~150px max dimension. BFS work is
+    // O(dw*dh); we want it negligible vs the actual painting cost.
+    const target = 150;
+    const scale = Math.max(1, Math.ceil(Math.max(w, h) / target));
+    const dw = Math.max(2, Math.floor(w / scale));
+    const dh = Math.max(2, Math.floor(h / scale));
+    const N = dw * dh;
+    // Downsampled luma — average over scale × scale block.
+    const dgray = new Uint8Array(N);
+    for (let dy = 0; dy < dh; dy++) {
+      const y0 = dy * scale, y1 = Math.min(h, y0 + scale);
+      for (let dx = 0; dx < dw; dx++) {
+        const x0 = dx * scale, x1 = Math.min(w, x0 + scale);
+        let sum = 0, n = 0;
+        for (let y = y0; y < y1; y++) {
+          for (let x = x0; x < x1; x++) { sum += gray[y * w + x]; n++; }
+        }
+        dgray[dy * dw + dx] = Math.round(sum / Math.max(1, n));
+      }
+    }
+    // Quantize to value bands.
+    const banded = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      banded[i] = Math.min(bands - 1, Math.floor(dgray[i] * bands / 256));
+    }
+    // BFS connected component labelling.
+    const labels = new Int32Array(N);
+    const regions = [null]; // labels start at 1
+    const qX = new Int32Array(N), qY = new Int32Array(N);
+    for (let y = 0; y < dh; y++) {
+      for (let x = 0; x < dw; x++) {
+        const i = y * dw + x;
+        if (labels[i] !== 0) continue;
+        const band = banded[i];
+        const id = regions.length;
+        const r = {
+          id, band,
+          area: 0,
+          minX: x, maxX: x, minY: y, maxY: y,
+          sumX: 0, sumY: 0, sumLuma: 0
+        };
+        regions.push(r);
+        let qH = 0, qT = 0;
+        qX[qT] = x; qY[qT] = y; qT++;
+        labels[i] = id;
+        while (qH < qT) {
+          const cx = qX[qH], cy = qY[qH]; qH++;
+          const ci = cy * dw + cx;
+          r.area++;
+          r.sumX += cx; r.sumY += cy;
+          r.sumLuma += dgray[ci];
+          if (cx < r.minX) r.minX = cx;
+          if (cx > r.maxX) r.maxX = cx;
+          if (cy < r.minY) r.minY = cy;
+          if (cy > r.maxY) r.maxY = cy;
+          if (cx > 0)      { const ni = ci - 1;  if (labels[ni] === 0 && banded[ni] === band) { labels[ni] = id; qX[qT] = cx - 1; qY[qT] = cy; qT++; } }
+          if (cx < dw - 1) { const ni = ci + 1;  if (labels[ni] === 0 && banded[ni] === band) { labels[ni] = id; qX[qT] = cx + 1; qY[qT] = cy; qT++; } }
+          if (cy > 0)      { const ni = ci - dw; if (labels[ni] === 0 && banded[ni] === band) { labels[ni] = id; qX[qT] = cx; qY[qT] = cy - 1; qT++; } }
+          if (cy < dh - 1) { const ni = ci + dw; if (labels[ni] === 0 && banded[ni] === band) { labels[ni] = id; qX[qT] = cx; qY[qT] = cy + 1; qT++; } }
+        }
+        r.cx = r.sumX / r.area;
+        r.cy = r.sumY / r.area;
+        r.meanLuma = r.sumLuma / r.area;
+      }
+    }
+    return { labels, regions, banded, scale, dw, dh, w, h };
+  }
+
+  // Classify each region into a stroke vocabulary and order the agendas:
+  // background first (largest), then mid-size blobs/thins, then accents.
+  // Within each size tier the order is seed-shuffled so seed varies
+  // painting order without breaking "big things first" intuition.
+  function _ditherRegionPlan(seg, seed) {
+    const { regions, dw, dh } = seg;
+    const total = dw * dh;
+    const agendas = [];
+    for (let i = 1; i < regions.length; i++) {
+      const r = regions[i];
+      if (r.area < 6) continue;
+      const areaFrac = r.area / total;
+      const bw = r.maxX - r.minX + 1;
+      const bh = r.maxY - r.minY + 1;
+      const aspect = Math.max(bw, bh) / Math.max(1, Math.min(bw, bh));
+      let kind;
+      if (areaFrac > 0.18)                               kind = 'background';
+      else if (aspect > 3.0 && r.area > 28)              kind = 'thin';
+      else if (r.area < 28)                              kind = 'accent';
+      else                                               kind = 'blob';
+      agendas.push({ region: r, kind, areaFrac, aspect, bw, bh });
+    }
+    agendas.sort((a, b) => b.region.area - a.region.area);
+    // Seed-shuffle within size tiers (within ~60% of each other).
+    for (let i = 0; i < agendas.length; ) {
+      const aSize = agendas[i].region.area;
+      let j = i + 1;
+      while (j < agendas.length && agendas[j].region.area > aSize * 0.6) j++;
+      // Fisher-Yates within [i, j-1]
+      for (let k = j - 1; k > i; k--) {
+        const m = i + Math.floor(_advHash01(seed, i, k, 7411) * (k - i + 1));
+        const tmp = agendas[k]; agendas[k] = agendas[m]; agendas[m] = tmp;
+      }
+      i = j;
+    }
+    return agendas;
+  }
+
+  // Pick K anchor pixels uniformly from within a region (downsampled
+  // coords). Uses bbox + label-membership rejection sampling — fine for
+  // any reasonable region density.
+  function _ditherRegionAnchors(region, labels, dw, count, seed, salt) {
+    const out = [];
+    const bw = region.maxX - region.minX + 1;
+    const bh = region.maxY - region.minY + 1;
+    let attempts = 0;
+    const maxAttempts = count * 60 + 30;
+    while (out.length < count && attempts < maxAttempts) {
+      const x = region.minX + Math.floor(_advHash01(seed, region.id, attempts + (salt|0), 7301) * bw);
+      const y = region.minY + Math.floor(_advHash01(seed, region.id, attempts + (salt|0), 7302) * bh);
+      const i = y * dw + x;
+      if (i >= 0 && i < labels.length && labels[i] === region.id) out.push({ dx: x, dy: y });
+      attempts++;
+    }
+    return out;
+  }
+
+  // Convert downsampled (dx, dy) → full-canvas (fx, fy), centered in the
+  // scale × scale source block.
+  function _ditherFull(seg, dx, dy) {
+    const half = seg.scale >> 1;
+    return { fx: dx * seg.scale + half, fy: dy * seg.scale + half };
+  }
+
+  // Background: 2-4 long sweeping strokes spanning the bbox along its
+  // major axis. Each stroke samples luma from a different anchor within
+  // the region, so big flat-but-not-uniform regions (skies, walls) get
+  // subtle color variation across the sweeps.
+  function _ditherAgendaBackground(o, px, region, seg, w, h, opts) {
+    const seed = opts.seed | 0;
+    const { fx: cfx, fy: cfy } = _ditherFull(seg, region.cx, region.cy);
+    const fbw = (region.maxX - region.minX + 1) * seg.scale;
+    const fbh = (region.maxY - region.minY + 1) * seg.scale;
+    const horizontal = fbw >= fbh;
+    const sweepLen = (horizontal ? fbw : fbh);
+    const stripWidth = (horizontal ? fbh : fbw) / 3.2;
+    const strokeCount = 2 + Math.floor(_advHash01(seed, region.id, 0, 7501) * 3); // 2..4
+    const anchors = _ditherRegionAnchors(region, seg.labels, seg.dw, strokeCount, seed, 1);
+    for (let s = 0; s < strokeCount; s++) {
+      const t = strokeCount === 1 ? 0.5 : (s + 0.5) / strokeCount;
+      let cx, cy, ang;
+      if (horizontal) {
+        cx = cfx;
+        cy = (region.minY * seg.scale) + fbh * t;
+        ang = (_advHash01(seed, region.id, s, 7502) - 0.5) * 0.16;
+      } else {
+        cx = (region.minX * seg.scale) + fbw * t;
+        cy = cfy;
+        ang = Math.PI * 0.5 + (_advHash01(seed, region.id, s, 7502) - 0.5) * 0.16;
+      }
+      const a = anchors[s] || { dx: region.cx | 0, dy: region.cy | 0 };
+      const { fx, fy } = _ditherFull(seg, a.dx, a.dy);
+      const sx = Math.max(0, Math.min(w - 1, fx | 0));
+      const sy = Math.max(0, Math.min(h - 1, fy | 0));
+      const sampleV = px[sy * w + sx];
+      _ditherCapsule(o, w, h, cx, cy, sweepLen * 0.55, stripWidth, ang, sampleV, opts.opacity * 0.92);
+    }
+  }
+
+  // Blob: scattered medium dabs, form-following angle. Density scales
+  // with sqrt(area) so big blobs get many dabs and small ones get a
+  // handful — feels like a painter laying in a color mass.
+  function _ditherAgendaBlob(o, px, region, seg, w, h, edgeAng, opts) {
+    const seed = opts.seed | 0;
+    const dabSize = Math.max(3, Math.round(Math.sqrt(region.area * seg.scale * seg.scale) * 0.07));
+    const dabCount = Math.max(3, Math.round(Math.sqrt(region.area) * 1.4 * (opts.density || 1)));
+    const anchors = _ditherRegionAnchors(region, seg.labels, seg.dw, dabCount, seed, 2);
+    for (let d = 0; d < anchors.length; d++) {
+      const a = anchors[d];
+      const subX = Math.floor(_advHash01(seed, region.id, d, 7603) * seg.scale);
+      const subY = Math.floor(_advHash01(seed, region.id, d, 7604) * seg.scale);
+      const fx = Math.max(0, Math.min(w - 1, a.dx * seg.scale + subX));
+      const fy = Math.max(0, Math.min(h - 1, a.dy * seg.scale + subY));
+      const sampleV = px[fy * w + fx];
+      const ang = edgeAng[fy * w + fx] + Math.PI * 0.5
+        + (_advHash01(seed, region.id, d, 7605) - 0.5) * 0.6;
+      const sz = dabSize * (0.6 + _advHash01(seed, region.id, d, 7606) * 0.85);
+      _ditherCapsule(o, w, h, fx, fy, sz * 1.4, sz * 0.55, ang, sampleV, opts.opacity);
+    }
+  }
+
+  // Thin region: directional strokes along the bbox major axis. Stroke
+  // count scales with the long-axis length; minor axis sets stroke width.
+  // Form-following nudge per stroke so a curved thin region (a crest, a
+  // finger) gets organic angle variation as it traverses.
+  function _ditherAgendaThin(o, px, region, seg, w, h, edgeAng, opts) {
+    const seed = opts.seed | 0;
+    const bw = region.maxX - region.minX + 1;
+    const bh = region.maxY - region.minY + 1;
+    const horizontal = bw >= bh;
+    const longSpan = (horizontal ? bw : bh) * seg.scale;
+    const shortSpan = (horizontal ? bh : bw) * seg.scale;
+    const strokeCount = Math.max(2, Math.round(longSpan / Math.max(4, shortSpan * 1.2)));
+    const stepLong = longSpan / Math.max(1, strokeCount);
+    for (let s = 0; s < strokeCount; s++) {
+      const t = (s + 0.5) / strokeCount;
+      const dx = horizontal
+        ? region.minX + bw * t
+        : region.minX + bw * 0.5;
+      const dy = horizontal
+        ? region.minY + bh * 0.5
+        : region.minY + bh * t;
+      const idx = (dy | 0) * seg.dw + (dx | 0);
+      if (idx < 0 || idx >= seg.labels.length || seg.labels[idx] !== region.id) continue;
+      const { fx, fy } = _ditherFull(seg, dx, dy);
+      const sx = Math.max(0, Math.min(w - 1, fx | 0));
+      const sy = Math.max(0, Math.min(h - 1, fy | 0));
+      const sampleV = px[sy * w + sx];
+      // Use the form-following angle at the sample so curved thin
+      // features bend naturally with the gradient.
+      const formAng = edgeAng[sy * w + sx] + Math.PI * 0.5;
+      const targetAng = horizontal ? 0 : Math.PI * 0.5;
+      const ang = formAng * 0.55 + targetAng * 0.45
+        + (_advHash01(seed, region.id, s, 7702) - 0.5) * 0.18;
+      const hl = stepLong * 0.6;
+      const hw = Math.max(1.5, shortSpan * 0.45);
+      _ditherCapsule(o, w, h, fx, fy, hl, hw, ang, sampleV, opts.opacity * 0.95);
+    }
+  }
+
+  // Accent: 1-2 small dabs near the centroid. Used for tiny features
+  // (eye highlight, beak tip, small color note).
+  function _ditherAgendaAccent(o, px, region, seg, w, h, edgeAng, opts) {
+    const seed = opts.seed | 0;
+    const { fx, fy } = _ditherFull(seg, region.cx, region.cy);
+    const sx = Math.max(0, Math.min(w - 1, Math.round(fx)));
+    const sy = Math.max(0, Math.min(h - 1, Math.round(fy)));
+    const sampleV = px[sy * w + sx];
+    const sz = Math.max(2, Math.round(Math.sqrt(region.area * seg.scale * seg.scale) * 0.18));
+    const ang = edgeAng[sy * w + sx] + Math.PI * 0.5
+      + (_advHash01(seed, region.id, 0, 7703) - 0.5) * 0.5;
+    _ditherCapsule(o, w, h, fx, fy, sz * 1.1, sz * 0.7, ang, sampleV, opts.opacity);
+    // Optional second tick for energy.
+    if (_advHash01(seed, region.id, 0, 7704) < 0.4) {
+      const offX = (_advHash01(seed, region.id, 0, 7705) - 0.5) * sz * 1.4;
+      const offY = (_advHash01(seed, region.id, 0, 7706) - 0.5) * sz * 1.4;
+      _ditherCapsule(o, w, h, fx + offX, fy + offY, sz * 0.7, sz * 0.5, ang + Math.PI * 0.5, sampleV, opts.opacity * 0.65);
+    }
+  }
+
+  // Refinement pass: walk the downsampled label grid, find pixels on
+  // region borders, occasionally blend a small "wet" stroke straddling
+  // the border using the AVERAGE of both regions' colors. This gives
+  // the "the painter pulls background color and refines the form" look
+  // without softening the whole canvas.
+  function _ditherRefineRegionEdges(o, px, seg, w, h, opts) {
+    const seed = (opts.seed | 0) ^ 0x4242;
+    const { dw, dh, scale, labels } = seg;
+    const refineRate = Math.max(0, Math.min(1, opts.refineRate != null ? opts.refineRate : 0.35));
+    if (refineRate <= 0.01) return;
+    for (let y = 1; y < dh - 1; y++) {
+      for (let x = 1; x < dw - 1; x++) {
+        const i = y * dw + x;
+        const myL = labels[i];
+        const rL = labels[i + 1];
+        const dL = labels[i + dw];
+        if (myL === rL && myL === dL) continue;
+        if (_advHash01(seed, x, y, 7801) > refineRate) continue;
+        const otherIdx = (myL !== rL) ? (i + 1) : (i + dw);
+        const ofx = (otherIdx % dw) * scale + (scale >> 1);
+        const ofy = ((otherIdx / dw) | 0) * scale + (scale >> 1);
+        const fx = x * scale + (scale >> 1);
+        const fy = y * scale + (scale >> 1);
+        const sx1 = Math.max(0, Math.min(w - 1, fx | 0));
+        const sy1 = Math.max(0, Math.min(h - 1, fy | 0));
+        const sx2 = Math.max(0, Math.min(w - 1, ofx | 0));
+        const sy2 = Math.max(0, Math.min(h - 1, ofy | 0));
+        const myC = px[sy1 * w + sx1];
+        const otherC = px[sy2 * w + sx2];
+        const blend = Math.round((myC + otherC) * 0.5);
+        const ang = Math.atan2(ofy - fy, ofx - fx) + Math.PI * 0.5
+          + (_advHash01(seed, x, y, 7802) - 0.5) * 0.6;
+        const sz = Math.max(2, Math.round(scale * 0.85));
+        _ditherCapsule(o, w, h, (fx + ofx) * 0.5, (fy + ofy) * 0.5, sz * 1.3, sz * 0.55, ang, blend, 0.55);
+      }
+    }
+  }
+
+  // Top-level orchestrator. Run after the underpaint base is laid down.
+  // gray must be the luminance map (single Uint8Array); on a per-channel
+  // pipeline, pass toneGuide.fields.gray.value so all three channels
+  // segment + plan identically.
+  function paintRegionAware(o, px, w, h, gray, edgeAng, sh, opts) {
+    opts = opts || {};
+    const seg = _ditherRegionSegment(gray, w, h, opts.bands || 6);
+    const agendas = _ditherRegionPlan(seg, opts.seed | 0);
+    for (let a = 0; a < agendas.length; a++) {
+      const ag = agendas[a];
+      switch (ag.kind) {
+        case 'background': _ditherAgendaBackground(o, px, ag.region, seg, w, h, opts); break;
+        case 'blob':       _ditherAgendaBlob(o, px, ag.region, seg, w, h, edgeAng, opts); break;
+        case 'thin':       _ditherAgendaThin(o, px, ag.region, seg, w, h, edgeAng, opts); break;
+        case 'accent':     _ditherAgendaAccent(o, px, ag.region, seg, w, h, edgeAng, opts); break;
+      }
+    }
+    if (opts.refineEdges !== false) _ditherRefineRegionEdges(o, px, seg, w, h, opts);
+    return o;
+  }
+
   function paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, analysis, opts) {
     opts = opts || {};
     const strength = clamp01(opts.strength != null ? opts.strength : 0);
@@ -3149,6 +3519,9 @@ const DitherAlgorithms = (() => {
     {id:'reconstructionStep',label:'Reconstruction Step',type:'reconstructionStep',min:0,max:6,step:1,default:6,
      labels:['1 · Underpainting','2 · Painterly sketch','3 · Broad block-in','4 · Form masses','5 · Color notes','6 · Edges + detail','7 · Final painting']},
     {id:'reconstructionLayers',label:'Edit Current Step',type:'reconstructionLayers',default:defaultPainterLayerSettings()},
+    {id:'useRegionBuilder',label:'Region Builder (recommended)',type:'checkbox',default:true},
+    {id:'regionBands',label:'Region Tonal Bands',min:3,max:9,step:1,default:6},
+    {id:'regionRefine',label:'Edge Refinement',min:0,max:1,step:.05,default:.35},
     {id:'constructionStyle',label:'Construction Style',type:'select',options:[
       {value:'angular',label:'Angular painter sketch'},
       {value:'form',label:'Form-following sketch'},
@@ -3519,7 +3892,7 @@ const DitherAlgorithms = (() => {
       skipSmooth: skipSmoothAreas,
       detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
     });
-    const toneGuide = (cbEnabled || constructionLines > 0 || blockInStrength > 0 || smartColorJitter > 0)
+    const toneGuide = (p.useRegionBuilder || cbEnabled || constructionLines > 0 || blockInStrength > 0 || smartColorJitter > 0)
       ? buildAdvancedSourceAnalysis(w, h, px)
       : null;
     const cbGrayMap = toneGuide && toneGuide.fields && toneGuide.fields.gray ? toneGuide.fields.gray.value : null;
@@ -3533,6 +3906,28 @@ const DitherAlgorithms = (() => {
     const reconPaint = stageLevel >= 6 ? reconFinish : reconEdges;
 
     if (stageLevel <= 0) return o;
+
+    // ── REGION BUILDER (replaces step pipeline when on) ──
+    // Segments the image into tonal regions, classifies each by area/shape,
+    // and paints with a vocabulary appropriate to the region (background
+    // sweeps / blob mass / thin-form lines / tiny accents) — instead of
+    // applying the same generic strokes uniformly across every step.
+    if (p.useRegionBuilder) {
+      const grayBuf = (toneGuide && toneGuide.fields && toneGuide.fields.gray && toneGuide.fields.gray.value)
+        ? toneGuide.fields.gray.value
+        : px;
+      paintRegionAware(o, px, w, h, grayBuf, edgeAng, sh, {
+        seed: seedI,
+        bands: (p.regionBands != null) ? p.regionBands : 6,
+        opacity: 0.92,
+        density: 1.0,
+        refineEdges: true,
+        refineRate: (p.regionRefine != null) ? p.regionRefine : 0.35
+      });
+      yield o;
+      return o; // skip the legacy step pipeline below
+    }
+
     if (constructionLines > 0) {
       _runPainterStep(o, px, w, h, reconConstruction, edgeMag, detail, (r) => {
         paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, {
@@ -7408,6 +7803,9 @@ const DitherAlgorithms = (() => {
     {id:'reconstructionStep',label:'Reconstruction Step',type:'reconstructionStep',min:0,max:6,step:1,default:6,
      labels:['1 · Underpainting','2 · Painterly sketch','3 · Broad block-in','4 · Form masses','5 · Color notes','6 · Edges + detail','7 · Final painting']},
     {id:'reconstructionLayers',label:'Edit Current Step',type:'reconstructionLayers',default:defaultPainterLayerSettings()},
+    {id:'useRegionBuilder',label:'Region Builder (recommended)',type:'checkbox',default:true},
+    {id:'regionBands',label:'Region Tonal Bands',min:3,max:9,step:1,default:6},
+    {id:'regionRefine',label:'Edge Refinement',min:0,max:1,step:.05,default:.35},
     {id:'constructionStyle',label:'Construction Style',type:'select',options:[
       {value:'angular',label:'Angular painter sketch'},
       {value:'form',label:'Form-following sketch'},
@@ -7751,7 +8149,7 @@ const DitherAlgorithms = (() => {
       skipSmooth: skipSmoothAreas,
       detailPreserve: (p.underpaintDetailPreserve != null) ? p.underpaintDetailPreserve : 0.5
     });
-    const toneGuide = (cbEnabled || constructionLines > 0 || blockInStrength > 0 || smartColorJitter > 0 || p.illusion === 'colorJitterDetail')
+    const toneGuide = (p.useRegionBuilder || cbEnabled || constructionLines > 0 || blockInStrength > 0 || smartColorJitter > 0 || p.illusion === 'colorJitterDetail')
       ? buildAdvancedSourceAnalysis(w, h, px)
       : null;
     const cbGrayMap = toneGuide && toneGuide.fields && toneGuide.fields.gray ? toneGuide.fields.gray.value : null;
@@ -7765,6 +8163,24 @@ const DitherAlgorithms = (() => {
     const reconPaint = stageLevel >= 6 ? reconFinish : reconEdges;
 
     if (stageLevel <= 0) return o;
+
+    // ── REGION BUILDER (replaces step pipeline when on) ──
+    if (p.useRegionBuilder) {
+      const grayBuf = (toneGuide && toneGuide.fields && toneGuide.fields.gray && toneGuide.fields.gray.value)
+        ? toneGuide.fields.gray.value
+        : px;
+      paintRegionAware(o, px, w, h, grayBuf, edgeAng, sh, {
+        seed: seedI,
+        bands: (p.regionBands != null) ? p.regionBands : 6,
+        opacity: 0.90,
+        density: 1.0,
+        refineEdges: true,
+        refineRate: (p.regionRefine != null) ? p.regionRefine : 0.35
+      });
+      yield o;
+      return o; // skip the legacy step pipeline below
+    }
+
     if (constructionLines > 0) {
       _runPainterStep(o, px, w, h, reconConstruction, edgeMag, detail, (r) => {
         paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, {
