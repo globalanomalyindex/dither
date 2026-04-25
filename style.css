@@ -1097,6 +1097,43 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
   margin-bottom: 3px;
 }
 
+.recon-layer-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 14px 0 10px;
+  opacity: 0.55;
+}
+
+.recon-layer-subhead {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.recon-layer-subnote {
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.55;
+  font-size: 9.5px;
+  margin-left: 4px;
+}
+
+select.recon-layer-input {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  font-size: 11px;
+}
+select.recon-layer-input:focus {
+  border-color: var(--fun);
+  outline: none;
+}
+
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

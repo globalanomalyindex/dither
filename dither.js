@@ -695,8 +695,19 @@ const DitherAlgorithms = (() => {
     { key: 'finish',       label: 'Final painting' }
   ];
 
+  // Per-step "behavior" defaults — these are CATEGORICAL extensions to the
+  // numeric knobs. They don't cascade through the pipeline (each step picks
+  // its own technique/blending) but they enormously expand what the step can
+  // do without rewriting every painter:
+  //   direction  — overrides stroke orientation for this step (stroke smear)
+  //   blend      — how this step composites onto the previous accumulation
+  //   repeat     — passes (1..3); the painter draws its strokes N times with
+  //                seed-offset for variation
+  //   restrict   — gates this step's paint to a tonal/structural zone
+  const PAINTER_STEP_BEHAVIOR_DEFAULTS = { direction: 'auto', blend: 'normal', repeat: 1, restrict: 'all' };
+
   function defaultPainterLayerSettings() {
-    return {
+    const numeric = {
       underpaint:   { scale: 1.15, density: 0.85, opacity: 0.92, jitter: 0.45, detail: 0.45, angularity: 0.30, form: 0.25, edge: 0.20 },
       construction: { scale: 1.00, density: 1.16, opacity: 0.88, jitter: 0.62, detail: 0.85, angularity: 0.92, form: 0.28, edge: 0.78 },
       block:        { scale: 1.38, density: 0.76, opacity: 0.92, jitter: 0.38, detail: 0.25, angularity: 0.72, form: 0.16, edge: 0.20 },
@@ -705,6 +716,11 @@ const DitherAlgorithms = (() => {
       edges:        { scale: 0.58, density: 1.30, opacity: 0.94, jitter: 0.24, detail: 1.10, angularity: 0.48, form: 0.86, edge: 1.10 },
       finish:       { scale: 1.00, density: 1.00, opacity: 1.00, jitter: 0.44, detail: 0.82, angularity: 0.34, form: 0.62, edge: 0.70 }
     };
+    const out = {};
+    for (const k in numeric) {
+      out[k] = Object.assign({}, numeric[k], PAINTER_STEP_BEHAVIOR_DEFAULTS);
+    }
+    return out;
   }
 
   function clampPainterStep(v) {
@@ -791,6 +807,19 @@ const DitherAlgorithms = (() => {
     const baseAngularity = base.angularity != null ? base.angularity : 0.35;
     const baseForm       = base.form       != null ? base.form       : 0.5;
     const baseEdge       = base.edge       != null ? base.edge       : 0.5;
+
+    // Categorical behaviors: read target-step's saved value only (no cascade).
+    // Each step picks its own technique/composite without bleeding into others.
+    const targetSrc = (layers && targetIdx >= 0) ? layers[targetKey] : null;
+    const pickStr = (field) => {
+      const v = targetSrc && typeof targetSrc[field] === 'string' ? targetSrc[field] : null;
+      return v || PAINTER_STEP_BEHAVIOR_DEFAULTS[field];
+    };
+    let repeat = 1;
+    if (targetSrc && targetSrc.repeat != null) {
+      const r = +targetSrc.repeat;
+      if (isFinite(r)) repeat = Math.max(1, Math.min(3, Math.round(r)));
+    }
     return {
       scale:      Math.max(0.25, Math.min(3,   base.scale      + accum.scale)),
       density:    Math.max(0.15, Math.min(3,   base.density    + accum.density)),
@@ -799,8 +828,150 @@ const DitherAlgorithms = (() => {
       detail:     Math.max(0,    Math.min(1.5, baseDetail      + accum.detail)),
       angularity: Math.max(0,    Math.min(1,   baseAngularity  + accum.angularity)),
       form:       Math.max(0,    Math.min(1,   baseForm        + accum.form)),
-      edge:       Math.max(0,    Math.min(1.5, baseEdge        + accum.edge))
+      edge:       Math.max(0,    Math.min(1.5, baseEdge        + accum.edge)),
+      direction:  pickStr('direction'),
+      blend:      pickStr('blend'),
+      restrict:   pickStr('restrict'),
+      repeat
     };
+  }
+
+  // ── Single-channel blend math ──
+  // a = before-step pixel, b = after-step pixel. Each mode is the standard
+  // Photoshop-style operator on a single 8-bit channel; runs per-channel of
+  // the multi-channel pipeline so the resulting RGB still composites cleanly.
+  function _blendPxOp(mode, a, b) {
+    switch (mode) {
+      case 'multiply':   return Math.round((a * b) / 255);
+      case 'screen':     return Math.round(255 - ((255 - a) * (255 - b)) / 255);
+      case 'overlay':    return a < 128
+        ? Math.round((2 * a * b) / 255)
+        : Math.round(255 - (2 * (255 - a) * (255 - b)) / 255);
+      case 'soft-light': {
+        const aN = a / 255, bN = b / 255;
+        return Math.round(((1 - 2 * bN) * aN * aN + 2 * bN * aN) * 255);
+      }
+      // "Glaze" — a thin transparent oil/watercolor layer sitting on top of
+      // the previous accumulation. Biased toward the new mark but never
+      // fully opaque, so the underlying paint shows through.
+      case 'glaze':      return Math.round(a * 0.45 + b * 0.55);
+      case 'darken':     return Math.min(a, b);
+      case 'lighten':    return Math.max(a, b);
+      case 'normal':
+      default:           return b;
+    }
+  }
+
+  // Build a 0/1 mask (Uint8Array) restricting where this step is allowed
+  // to leave paint. Returns null for 'all' (no restriction).
+  function _buildRestrictMask(px, w, h, scope, edgeMag, detail) {
+    if (!scope || scope === 'all') return null;
+    const N = w * h;
+    const mask = new Uint8Array(N);
+    let dNorm = 0, eNorm = 0;
+    if (detail) dNorm = 1 / Math.max(8, _advFieldStats(detail) * 0.6);
+    if (edgeMag) eNorm = 1 / 120; // edgeMag is roughly 0..~255; /120 ≈ 0..1
+    for (let i = 0; i < N; i++) {
+      const v = px[i];
+      let allow = false;
+      switch (scope) {
+        case 'shadows':    allow = v <= 92; break;
+        case 'highlights': allow = v >= 168; break;
+        case 'midtones':   allow = v > 92 && v < 168; break;
+        case 'detail':     allow = detail ? (Math.min(1, detail[i] * dNorm) >= 0.40) : true; break;
+        case 'flats':      allow = detail ? (Math.min(1, detail[i] * dNorm) <= 0.22) : true; break;
+        case 'edges':      allow = edgeMag ? ((edgeMag[i] * eNorm) >= 0.25) : true; break;
+        default: allow = true;
+      }
+      if (allow) mask[i] = 1;
+    }
+    return mask;
+  }
+
+  // Per-pixel direction angle for the directional smear post-pass. 'auto'
+  // returns null (no smear); the rest pin a direction either globally
+  // (horizontal/vertical/diagonals) or as a function of canvas position
+  // (radial / tangent / cross).
+  function _stepDirAngleAt(mode, x, y, w, h) {
+    switch (mode) {
+      case 'horizontal': return 0;
+      case 'vertical':   return Math.PI * 0.5;
+      case 'diag-down':  return Math.PI * 0.25;
+      case 'diag-up':    return -Math.PI * 0.25;
+      case 'radial':     return Math.atan2(y - h * 0.5, x - w * 0.5);
+      case 'tangent':    return Math.atan2(y - h * 0.5, x - w * 0.5) + Math.PI * 0.5;
+      case 'cross':      return ((x + y) % 8 < 4) ? 0 : Math.PI * 0.5;
+      default:           return null;
+    }
+  }
+
+  // Smear only the pixels that this step actually changed, oriented along
+  // _stepDirAngleAt. Length scales with the step's stroke scale; bigger
+  // strokes get longer smears so the directional energy matches the brush.
+  function _applyStepDirectionalSmear(o, before, w, h, mode, len) {
+    if (!mode || mode === 'auto') return;
+    const sample = new Uint8ClampedArray(o);
+    const N = w * h;
+    const ext = Math.max(1, Math.round(len));
+    for (let y = 0; y < h; y++) {
+      const yr = y * w;
+      for (let x = 0; x < w; x++) {
+        const i = yr + x;
+        if (sample[i] === before[i]) continue; // unchanged this step → leave alone
+        const ang = _stepDirAngleAt(mode, x, y, w, h);
+        if (ang === null) continue;
+        const dx = Math.cos(ang), dy = Math.sin(ang);
+        let sum = 0, n = 0;
+        for (let t = -ext; t <= ext; t++) {
+          const sx = Math.round(x + dx * t);
+          const sy = Math.round(y + dy * t);
+          if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+          sum += sample[sy * w + sx];
+          n++;
+        }
+        if (n > 0) o[i] = Math.round(sum / n);
+      }
+    }
+  }
+
+  // ── STEP WRAPPER ──
+  // Snapshots `o` before the step, runs the step painter `repeat` times
+  // (with seed offsets for variation), then composites the changed pixels
+  // via the chosen blend mode + restrict mask + directional smear. This is
+  // what unlocks "more capable" painterly behavior without per-painter
+  // rewrites — every step gets the wrapper treatment.
+  //
+  // runFn(repeatIdx) is called once per repeat with the 0-based pass index
+  // (so the painter can offset its seed for variation across repeats).
+  function _runPainterStep(o, px, w, h, settings, edgeMag, detail, runFn) {
+    if (!settings) { runFn(0); return o; }
+    const before = new Uint8ClampedArray(o);
+    const repeat = Math.max(1, Math.min(3, settings.repeat | 0 || 1));
+    for (let r = 0; r < repeat; r++) runFn(r);
+    const restrict = _buildRestrictMask(px, w, h, settings.restrict, edgeMag, detail);
+    const blendMode = settings.blend || 'normal';
+    if (blendMode !== 'normal' || restrict) {
+      const N = w * h;
+      for (let i = 0; i < N; i++) {
+        const a = before[i], b = o[i];
+        if (a === b) continue;
+        if (restrict && !restrict[i]) {
+          o[i] = a; // step tried to paint but zone is gated — revert
+          continue;
+        }
+        if (blendMode !== 'normal') {
+          o[i] = _blendPxOp(blendMode, a, b);
+        }
+      }
+    }
+    if (settings.direction && settings.direction !== 'auto') {
+      // Smear length scales with the step's effective stroke scale so big
+      // strokes get longer directional streaks (and small accents barely
+      // smear at all).
+      const sLen = Math.max(2, Math.round(3.5 * (settings.scale || 1)));
+      _applyStepDirectionalSmear(o, before, w, h, settings.direction, sLen);
+    }
+    return o;
   }
 
   function applyPainterLayerSettingsToPlan(plan, settings) {
@@ -3363,82 +3534,90 @@ const DitherAlgorithms = (() => {
 
     if (stageLevel <= 0) return o;
     if (constructionLines > 0) {
-      paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, {
-        strength: constructionLines,
-        style: constructionStyle,
-        scope: p.constructionScope || 'both',
-        colorMode: p.constructionLineColor || 'auto',
-        detailLevel: (p.constructionDetail != null) ? p.constructionDetail : 0.5,
-        angularOutline: !!p.constructionAngularOutline,
-        detailDrive: Math.min(1, detailAware / 2),
-        lineScale: (0.9 + canvasScale * 0.2) * reconConstruction.scale,
-        spacing: Math.max(5, underpaintBlock * 0.52),
-        length: Math.max(12, underpaintBlock * 1.05) * reconConstruction.scale,
-        width: (0.9 + constructionLines * 1.1) * Math.sqrt(reconConstruction.scale),
-        density: reconConstruction.density,
-        opacity: reconConstruction.opacity,
-        jitter: reconConstruction.jitter,
-        detailFocus: reconConstruction.detail,
-        angularity: reconConstruction.angularity,
-        form: reconConstruction.form,
-        edgeFocus: reconConstruction.edge,
-        structure: Math.max(reconConstruction.detail, reconConstruction.edge),
-        seed: seedI ^ 0x3b7
+      _runPainterStep(o, px, w, h, reconConstruction, edgeMag, detail, (r) => {
+        paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, {
+          strength: constructionLines,
+          style: constructionStyle,
+          scope: p.constructionScope || 'both',
+          colorMode: p.constructionLineColor || 'auto',
+          detailLevel: (p.constructionDetail != null) ? p.constructionDetail : 0.5,
+          angularOutline: !!p.constructionAngularOutline,
+          detailDrive: Math.min(1, detailAware / 2),
+          lineScale: (0.9 + canvasScale * 0.2) * reconConstruction.scale,
+          spacing: Math.max(5, underpaintBlock * 0.52),
+          length: Math.max(12, underpaintBlock * 1.05) * reconConstruction.scale,
+          width: (0.9 + constructionLines * 1.1) * Math.sqrt(reconConstruction.scale),
+          density: reconConstruction.density,
+          opacity: reconConstruction.opacity,
+          jitter: reconConstruction.jitter,
+          detailFocus: reconConstruction.detail,
+          angularity: reconConstruction.angularity,
+          form: reconConstruction.form,
+          edgeFocus: reconConstruction.edge,
+          structure: Math.max(reconConstruction.detail, reconConstruction.edge),
+          seed: (seedI ^ 0x3b7) ^ (r * 0xb14d)
+        });
       });
       yield o;
       if (stageLevel <= 1) return o;
     }
     if (blockInStrength > 0) {
-      paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
-        strength: blockInStrength,
-        size: Math.max(underpaintBlock, (p.size || 10) * canvasScale * 1.45) * reconBlock.scale,
-        detailDrive: Math.min(1, detailAware / 2),
-        formFollow: Math.max(formFollow, reconBlock.form * 0.35),
-        angularity: Math.max(reconBlock.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.55 : 0.22)),
-        density: reconBlock.density,
-        opacity: reconBlock.opacity,
-        jitter: reconBlock.jitter,
-        detailFocus: reconBlock.detail,
-        edgeFocus: reconBlock.edge,
-        form: reconBlock.form,
-        seed: seedI ^ 0x45d
+      _runPainterStep(o, px, w, h, reconBlock, edgeMag, detail, (r) => {
+        paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
+          strength: blockInStrength,
+          size: Math.max(underpaintBlock, (p.size || 10) * canvasScale * 1.45) * reconBlock.scale,
+          detailDrive: Math.min(1, detailAware / 2),
+          formFollow: Math.max(formFollow, reconBlock.form * 0.35),
+          angularity: Math.max(reconBlock.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.55 : 0.22)),
+          density: reconBlock.density,
+          opacity: reconBlock.opacity,
+          jitter: reconBlock.jitter,
+          detailFocus: reconBlock.detail,
+          edgeFocus: reconBlock.edge,
+          form: reconBlock.form,
+          seed: (seedI ^ 0x45d) ^ (r * 0xb14d)
+        });
       });
       yield o;
       if (stageLevel <= 2) return o;
     }
 
-    paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
-      strength: Math.min(1.2, blockInStrength * 0.55 + 0.18),
-      size: Math.max(5, (p.size || 10) * canvasScale * (0.82 + sizeByDetail * 0.16)) * reconForms.scale,
-      detailDrive: Math.min(1, detailAware / 2),
-      formFollow: Math.max(formFollow, 0.25, reconForms.form * 0.82),
-      angularity: Math.max(reconForms.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.34 : 0.10)),
-      density: reconForms.density,
-      opacity: reconForms.opacity,
-      jitter: reconForms.jitter,
-      detailFocus: reconForms.detail,
-      edgeFocus: reconForms.edge,
-      form: reconForms.form,
-      seed: seedI ^ 0x68d
+    _runPainterStep(o, px, w, h, reconForms, edgeMag, detail, (r) => {
+      paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
+        strength: Math.min(1.2, blockInStrength * 0.55 + 0.18),
+        size: Math.max(5, (p.size || 10) * canvasScale * (0.82 + sizeByDetail * 0.16)) * reconForms.scale,
+        detailDrive: Math.min(1, detailAware / 2),
+        formFollow: Math.max(formFollow, 0.25, reconForms.form * 0.82),
+        angularity: Math.max(reconForms.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.34 : 0.10)),
+        density: reconForms.density,
+        opacity: reconForms.opacity,
+        jitter: reconForms.jitter,
+        detailFocus: reconForms.detail,
+        edgeFocus: reconForms.edge,
+        form: reconForms.form,
+        seed: (seedI ^ 0x68d) ^ (r * 0xb14d)
+      });
     });
     yield o;
     if (stageLevel <= 3) return o;
 
     if (smartColorJitter > 0) {
-      paintIntelligentColorJitter(o, px, w, h, toneGuide, edgeMag, edgeAng, detail, {
-        strength: smartColorJitter,
-        channelHint,
-        spacing: Math.max(3, (p.size || 10) * canvasScale * 0.75),
-        length: Math.max(4, (p.size || 10) * canvasScale * 0.9) * reconColor.scale,
-        width: Math.max(0.8, (p.size || 10) * canvasScale * 0.16) * Math.sqrt(reconColor.scale),
-        density: reconColor.density,
-        opacity: reconColor.opacity,
-        jitter: reconColor.jitter,
-        detailFocus: reconColor.detail,
-        edgeFocus: reconColor.edge,
-        form: reconColor.form,
-        angularity: reconColor.angularity,
-        seed: seedI ^ 0x73a
+      _runPainterStep(o, px, w, h, reconColor, edgeMag, detail, (r) => {
+        paintIntelligentColorJitter(o, px, w, h, toneGuide, edgeMag, edgeAng, detail, {
+          strength: smartColorJitter,
+          channelHint,
+          spacing: Math.max(3, (p.size || 10) * canvasScale * 0.75),
+          length: Math.max(4, (p.size || 10) * canvasScale * 0.9) * reconColor.scale,
+          width: Math.max(0.8, (p.size || 10) * canvasScale * 0.16) * Math.sqrt(reconColor.scale),
+          density: reconColor.density,
+          opacity: reconColor.opacity,
+          jitter: reconColor.jitter,
+          detailFocus: reconColor.detail,
+          edgeFocus: reconColor.edge,
+          form: reconColor.form,
+          angularity: reconColor.angularity,
+          seed: (seedI ^ 0x73a) ^ (r * 0xb14d)
+        });
       });
       yield o;
     }
@@ -7587,82 +7766,90 @@ const DitherAlgorithms = (() => {
 
     if (stageLevel <= 0) return o;
     if (constructionLines > 0) {
-      paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, {
-        strength: constructionLines,
-        style: constructionStyle,
-        scope: p.constructionScope || 'both',
-        colorMode: p.constructionLineColor || 'auto',
-        detailLevel: (p.constructionDetail != null) ? p.constructionDetail : 0.5,
-        angularOutline: !!p.constructionAngularOutline,
-        detailDrive: Math.min(1, detailAware / 2),
-        lineScale: (0.85 + canvasScale * 0.18) * reconConstruction.scale,
-        spacing: Math.max(5, underpaintBlock * 0.50),
-        length: Math.max(10, underpaintBlock * 0.96) * reconConstruction.scale,
-        width: (0.75 + constructionLines) * Math.sqrt(reconConstruction.scale),
-        density: reconConstruction.density,
-        opacity: reconConstruction.opacity,
-        jitter: reconConstruction.jitter,
-        detailFocus: reconConstruction.detail,
-        angularity: reconConstruction.angularity,
-        form: reconConstruction.form,
-        edgeFocus: reconConstruction.edge,
-        structure: Math.max(reconConstruction.detail, reconConstruction.edge),
-        seed: seedI ^ 0x4ef
+      _runPainterStep(o, px, w, h, reconConstruction, edgeMag, detail, (r) => {
+        paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, {
+          strength: constructionLines,
+          style: constructionStyle,
+          scope: p.constructionScope || 'both',
+          colorMode: p.constructionLineColor || 'auto',
+          detailLevel: (p.constructionDetail != null) ? p.constructionDetail : 0.5,
+          angularOutline: !!p.constructionAngularOutline,
+          detailDrive: Math.min(1, detailAware / 2),
+          lineScale: (0.85 + canvasScale * 0.18) * reconConstruction.scale,
+          spacing: Math.max(5, underpaintBlock * 0.50),
+          length: Math.max(10, underpaintBlock * 0.96) * reconConstruction.scale,
+          width: (0.75 + constructionLines) * Math.sqrt(reconConstruction.scale),
+          density: reconConstruction.density,
+          opacity: reconConstruction.opacity,
+          jitter: reconConstruction.jitter,
+          detailFocus: reconConstruction.detail,
+          angularity: reconConstruction.angularity,
+          form: reconConstruction.form,
+          edgeFocus: reconConstruction.edge,
+          structure: Math.max(reconConstruction.detail, reconConstruction.edge),
+          seed: (seedI ^ 0x4ef) ^ (r * 0xb14d)
+        });
       });
       yield o;
       if (stageLevel <= 1) return o;
     }
     if (blockInStrength > 0) {
-      paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
-        strength: blockInStrength,
-        size: Math.max(underpaintBlock, (p.dabLen || 8) * canvasScale * 1.55) * reconBlock.scale,
-        detailDrive: Math.min(1, detailAware / 2),
-        formFollow: Math.max(formFollow, reconBlock.form * 0.35),
-        angularity: Math.max(reconBlock.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.48 : 0.18)),
-        density: reconBlock.density,
-        opacity: reconBlock.opacity,
-        jitter: reconBlock.jitter,
-        detailFocus: reconBlock.detail,
-        edgeFocus: reconBlock.edge,
-        form: reconBlock.form,
-        seed: seedI ^ 0x594
+      _runPainterStep(o, px, w, h, reconBlock, edgeMag, detail, (r) => {
+        paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
+          strength: blockInStrength,
+          size: Math.max(underpaintBlock, (p.dabLen || 8) * canvasScale * 1.55) * reconBlock.scale,
+          detailDrive: Math.min(1, detailAware / 2),
+          formFollow: Math.max(formFollow, reconBlock.form * 0.35),
+          angularity: Math.max(reconBlock.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.48 : 0.18)),
+          density: reconBlock.density,
+          opacity: reconBlock.opacity,
+          jitter: reconBlock.jitter,
+          detailFocus: reconBlock.detail,
+          edgeFocus: reconBlock.edge,
+          form: reconBlock.form,
+          seed: (seedI ^ 0x594) ^ (r * 0xb14d)
+        });
       });
       yield o;
       if (stageLevel <= 2) return o;
     }
 
-    paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
-      strength: Math.min(1.15, blockInStrength * 0.55 + 0.16),
-      size: Math.max(4, (p.dabLen || 8) * canvasScale * (0.85 + sizeByDetail * 0.16)) * reconForms.scale,
-      detailDrive: Math.min(1, detailAware / 2),
-      formFollow: Math.max(formFollow, 0.25, reconForms.form * 0.82),
-      angularity: Math.max(reconForms.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.30 : 0.10)),
-      density: reconForms.density,
-      opacity: reconForms.opacity,
-      jitter: reconForms.jitter,
-      detailFocus: reconForms.detail,
-      edgeFocus: reconForms.edge,
-      form: reconForms.form,
-      seed: seedI ^ 0x6ad
+    _runPainterStep(o, px, w, h, reconForms, edgeMag, detail, (r) => {
+      paintBroadMassStrokes(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, sh, {
+        strength: Math.min(1.15, blockInStrength * 0.55 + 0.16),
+        size: Math.max(4, (p.dabLen || 8) * canvasScale * (0.85 + sizeByDetail * 0.16)) * reconForms.scale,
+        detailDrive: Math.min(1, detailAware / 2),
+        formFollow: Math.max(formFollow, 0.25, reconForms.form * 0.82),
+        angularity: Math.max(reconForms.angularity, formFollow < 0 ? Math.min(1, -formFollow) : (constructionStyle === 'angular' ? 0.30 : 0.10)),
+        density: reconForms.density,
+        opacity: reconForms.opacity,
+        jitter: reconForms.jitter,
+        detailFocus: reconForms.detail,
+        edgeFocus: reconForms.edge,
+        form: reconForms.form,
+        seed: (seedI ^ 0x6ad) ^ (r * 0xb14d)
+      });
     });
     yield o;
     if (stageLevel <= 3) return o;
 
     if (smartColorJitter > 0) {
-      paintIntelligentColorJitter(o, px, w, h, toneGuide, edgeMag, edgeAng, detail, {
-        strength: smartColorJitter,
-        channelHint,
-        spacing: Math.max(3, (p.dabLen || 8) * canvasScale * 0.72),
-        length: Math.max(3, (p.dabLen || 8) * canvasScale * 0.95) * reconColor.scale,
-        width: Math.max(0.7, (p.dabWidth || 2) * canvasScale * 0.8) * Math.sqrt(reconColor.scale),
-        density: reconColor.density,
-        opacity: reconColor.opacity,
-        jitter: reconColor.jitter,
-        detailFocus: reconColor.detail,
-        edgeFocus: reconColor.edge,
-        form: reconColor.form,
-        angularity: reconColor.angularity,
-        seed: seedI ^ 0x7f1
+      _runPainterStep(o, px, w, h, reconColor, edgeMag, detail, (r) => {
+        paintIntelligentColorJitter(o, px, w, h, toneGuide, edgeMag, edgeAng, detail, {
+          strength: smartColorJitter,
+          channelHint,
+          spacing: Math.max(3, (p.dabLen || 8) * canvasScale * 0.72),
+          length: Math.max(3, (p.dabLen || 8) * canvasScale * 0.95) * reconColor.scale,
+          width: Math.max(0.7, (p.dabWidth || 2) * canvasScale * 0.8) * Math.sqrt(reconColor.scale),
+          density: reconColor.density,
+          opacity: reconColor.opacity,
+          jitter: reconColor.jitter,
+          detailFocus: reconColor.detail,
+          edgeFocus: reconColor.edge,
+          form: reconColor.form,
+          angularity: reconColor.angularity,
+          seed: (seedI ^ 0x7f1) ^ (r * 0xb14d)
+        });
       });
       yield o;
     }

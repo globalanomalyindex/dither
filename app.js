@@ -1633,9 +1633,49 @@
           }
         }
       }
+      // Behavior defaults (categorical extensions added in v56). These don't
+      // cascade — each step picks its own technique/composite without
+      // bleeding into other steps.
+      const layer = params.reconstructionLayers[step.key];
+      if (layer.direction === undefined) layer.direction = (def.direction != null) ? def.direction : 'auto';
+      if (layer.blend === undefined)     layer.blend     = (def.blend     != null) ? def.blend     : 'normal';
+      if (layer.repeat === undefined)    layer.repeat    = (def.repeat    != null) ? def.repeat    : 1;
+      if (layer.restrict === undefined)  layer.restrict  = (def.restrict  != null) ? def.restrict  : 'all';
     }
     return params.reconstructionLayers;
   }
+
+  // Behavior dropdown options — labels match dither.js's _runPainterStep
+  // and the underlying blend / restrict helpers.
+  const RECON_DIRECTION_OPTS = [
+    { value: 'auto',       label: 'Follow form (default)' },
+    { value: 'horizontal', label: 'Horizontal' },
+    { value: 'vertical',   label: 'Vertical' },
+    { value: 'diag-down',  label: 'Diagonal down' },
+    { value: 'diag-up',    label: 'Diagonal up' },
+    { value: 'radial',     label: 'Radial (from center)' },
+    { value: 'tangent',    label: 'Tangential (around center)' },
+    { value: 'cross',      label: 'Cross-hatch' }
+  ];
+  const RECON_BLEND_OPTS = [
+    { value: 'normal',     label: 'Normal (paint over)' },
+    { value: 'multiply',   label: 'Multiply (deepen)' },
+    { value: 'screen',     label: 'Screen (lighten)' },
+    { value: 'overlay',    label: 'Overlay (contrast)' },
+    { value: 'soft-light', label: 'Soft light' },
+    { value: 'glaze',      label: 'Glaze (thin layer)' },
+    { value: 'darken',     label: 'Darken only' },
+    { value: 'lighten',    label: 'Lighten only' }
+  ];
+  const RECON_RESTRICT_OPTS = [
+    { value: 'all',        label: 'Anywhere' },
+    { value: 'shadows',    label: 'Shadows only' },
+    { value: 'highlights', label: 'Highlights only' },
+    { value: 'midtones',   label: 'Midtones only' },
+    { value: 'detail',     label: 'High-detail areas' },
+    { value: 'flats',      label: 'Flat areas' },
+    { value: 'edges',      label: 'Edge zones' }
+  ];
 
   function formatReconValue(v) {
     const n = Number(v);
@@ -1654,6 +1694,22 @@
             min="${min}" max="${max}" step="${step}" value="${value}">
           <span class="param-value">${formatReconValue(value)}</span>
         </div>
+      </label>
+    `;
+  }
+
+  // Categorical behavior dropdown — same data-recon-path scheme so the input
+  // handler routes the choice to layers[step][field] without parsing as a
+  // float. The handler already handles selects by reading value as a string
+  // when the input element is a <select>.
+  function renderReconLayerSelect(algoId, key, field, label, options, value) {
+    const opts = options.map(o =>
+      `<option value="${o.value}" ${o.value === value ? 'selected' : ''}>${o.label}</option>`
+    ).join('');
+    return `
+      <label class="recon-layer-row">
+        <span class="recon-layer-label">${label}</span>
+        <select class="recon-layer-input" data-algo="${algoId}" data-recon-path="${key}.${field}">${opts}</select>
       </label>
     `;
   }
@@ -1678,6 +1734,12 @@
         ${renderReconLayerSlider(sel.id, step.key, 'angularity', 'Angular construction', 0, 1, 0.05, layer.angularity)}
         ${renderReconLayerSlider(sel.id, step.key, 'form', 'Form follow', 0, 1, 0.05, layer.form)}
         ${renderReconLayerSlider(sel.id, step.key, 'edge', 'Edge focus', 0, 1.5, 0.05, layer.edge)}
+        <div class="recon-layer-divider"></div>
+        <div class="recon-layer-subhead">Step behavior <span class="recon-layer-subnote">(per-step, no cascade)</span></div>
+        ${renderReconLayerSelect(sel.id, step.key, 'direction', 'Stroke direction', RECON_DIRECTION_OPTS, layer.direction || 'auto')}
+        ${renderReconLayerSelect(sel.id, step.key, 'blend',     'Blend onto canvas', RECON_BLEND_OPTS,    layer.blend     || 'normal')}
+        ${renderReconLayerSelect(sel.id, step.key, 'restrict',  'Paint zone',        RECON_RESTRICT_OPTS, layer.restrict  || 'all')}
+        ${renderReconLayerSlider(sel.id, step.key, 'repeat', 'Pass count', 1, 3, 1, layer.repeat || 1)}
       </div>
     `;
   }
@@ -2149,22 +2211,29 @@
       });
 
       // Reconstruction layer editor. The scrubber picks which step is being
-      // edited; these range inputs write to that step only, so users can move
-      // back and forth without losing layer-specific choices.
+      // edited; these inputs write to that step only, so users can move back
+      // and forth without losing layer-specific choices. Behavior selects
+      // (direction/blend/restrict) carry strings and don't cascade through
+      // the pipeline; numeric inputs (the 8 cascading knobs + repeat) parse
+      // as floats. Both the 'input' and 'change' events fire so dropdowns
+      // (which only fire 'change') still trigger a re-render.
+      const reconHandler = (e) => {
+        const s = state.selectedAlgorithms.find(a => a.id === e.target.dataset.algo);
+        if (!s) return;
+        const algoDef = DitherAlgorithms.find(a => a.id === s.id);
+        const pDef = algoDef && algoDef.params.find(p => p.type === 'reconstructionLayers');
+        const layers = normalizeReconLayers(s.params, pDef && pDef.default);
+        const [stepKey, field] = (e.target.dataset.reconPath || '').split('.');
+        if (!stepKey || !field || !layers[stepKey]) return;
+        const isSelect = e.target.tagName === 'SELECT';
+        layers[stepKey][field] = isSelect ? e.target.value : parseFloat(e.target.value);
+        const pv = e.target.closest('.slider-row') && e.target.closest('.slider-row').querySelector('.param-value');
+        if (pv) pv.textContent = formatReconValue(e.target.value);
+        scheduleProcess();
+      };
       section.querySelectorAll('.recon-layer-input').forEach(input => {
-        input.addEventListener('input', e => {
-          const s = state.selectedAlgorithms.find(a => a.id === e.target.dataset.algo);
-          if (!s) return;
-          const algoDef = DitherAlgorithms.find(a => a.id === s.id);
-          const pDef = algoDef && algoDef.params.find(p => p.type === 'reconstructionLayers');
-          const layers = normalizeReconLayers(s.params, pDef && pDef.default);
-          const [stepKey, field] = (e.target.dataset.reconPath || '').split('.');
-          if (!stepKey || !field || !layers[stepKey]) return;
-          layers[stepKey][field] = parseFloat(e.target.value);
-          const pv = e.target.closest('.slider-row') && e.target.closest('.slider-row').querySelector('.param-value');
-          if (pv) pv.textContent = formatReconValue(e.target.value);
-          scheduleProcess();
-        });
+        input.addEventListener('input', reconHandler);
+        input.addEventListener('change', reconHandler);
       });
 
       // ── Custom-brushes panel wiring ──
