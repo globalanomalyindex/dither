@@ -1669,7 +1669,7 @@
           <span class="recon-layer-kicker">${paramDef.label}</span>
           <strong>${step.label}</strong>
         </div>
-        <div class="recon-layer-note">These controls belong only to this reconstruction step. Scrub to another step and they swap, but each step keeps its own edits.</div>
+        <div class="recon-layer-note">Edits to this step cascade forward into every later step (with diminishing strength), so tweaks here reshape construction → block → forms → color → edges → finish on the fly. Each step still keeps its own overrides.</div>
         ${renderReconLayerSlider(sel.id, step.key, 'scale', 'Stroke scale', 0.35, 2.5, 0.05, layer.scale)}
         ${renderReconLayerSlider(sel.id, step.key, 'density', 'Stroke density', 0.15, 2.5, 0.05, layer.density)}
         ${renderReconLayerSlider(sel.id, step.key, 'opacity', 'Paint opacity', 0, 1.25, 0.05, layer.opacity)}

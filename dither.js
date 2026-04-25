@@ -734,27 +734,72 @@ const DitherAlgorithms = (() => {
     return reconstructionStageLevel(p && p.reconstructionStage);
   }
 
+  // Step keys in pipeline order. The cascade in getPainterLayerSettings
+  // walks this list — every step's edits affect itself AND every step
+  // downstream (with exponential distance damping).
+  const PAINTER_STEP_ORDER = ['underpaint', 'construction', 'block', 'forms', 'color', 'edges', 'finish'];
+  // 0.78 ≈ 1.0 → 0.78 → 0.61 → 0.47 → 0.37 → 0.29 → 0.23 over 6 hops.
+  // Strong enough that edits to underpaint visibly carry into the finish,
+  // gentle enough that each step still feels distinct.
+  const PAINTER_CASCADE_DAMP = 0.78;
+  const _PAINTER_FIELDS = ['scale', 'density', 'opacity', 'jitter', 'detail', 'angularity', 'form', 'edge'];
+
+  // Returns the effective per-step settings for the painter, with edits
+  // cascaded forward through the pipeline. Each upstream step's deviation
+  // from its own defaults is added to the current step's base, weighted by
+  // PAINTER_CASCADE_DAMP^distance. So editing underpaint at runtime ripples
+  // through construction/block/forms/.../finish in real time — including
+  // on-the-fly scrubbing — while still letting each step have its own
+  // signature and overrides.
+  //
+  // Backward compatible: if no reconstructionLayers edits exist, the
+  // accumulator is zero and the result is identical to the previous
+  // single-step lookup.
   function getPainterLayerSettings(p, keyOrLevel) {
     const defaults = defaultPainterLayerSettings();
-    const key = typeof keyOrLevel === 'number' ? painterStepKey(keyOrLevel) : keyOrLevel;
-    const base = defaults[key] || defaults.finish;
-    const src = p && p.reconstructionLayers && typeof p.reconstructionLayers === 'object'
-      ? p.reconstructionLayers[key]
+    const targetKey = typeof keyOrLevel === 'number' ? painterStepKey(keyOrLevel) : keyOrLevel;
+    const targetIdx = PAINTER_STEP_ORDER.indexOf(targetKey);
+    const base = defaults[targetKey] || defaults.finish;
+    const layers = (p && p.reconstructionLayers && typeof p.reconstructionLayers === 'object')
+      ? p.reconstructionLayers
       : null;
-    const merged = src && typeof src === 'object' ? { ...base, ...src } : { ...base };
-    const finiteOr = (value, fallback) => {
-      const n = +value;
-      return isFinite(n) ? n : fallback;
-    };
+
+    // Accumulate (userValue − stepBase) × dampingWeight across every step
+    // up to and including the target. The target step's own delta lands
+    // at full weight (distance 0); each upstream step is weaker.
+    const accum = { scale:0, density:0, opacity:0, jitter:0, detail:0, angularity:0, form:0, edge:0 };
+    if (layers && targetIdx >= 0) {
+      for (let i = 0; i <= targetIdx; i++) {
+        const k = PAINTER_STEP_ORDER[i];
+        const src = layers[k];
+        if (!src || typeof src !== 'object') continue;
+        const kBase = defaults[k] || defaults.finish;
+        const distance = targetIdx - i;
+        const weight = Math.pow(PAINTER_CASCADE_DAMP, distance);
+        for (let f = 0; f < _PAINTER_FIELDS.length; f++) {
+          const field = _PAINTER_FIELDS[f];
+          const userVal = +src[field];
+          if (!isFinite(userVal)) continue;
+          const baseVal = +kBase[field];
+          if (!isFinite(baseVal)) continue;
+          accum[field] += (userVal - baseVal) * weight;
+        }
+      }
+    }
+
+    const baseDetail     = base.detail     != null ? base.detail     : 0.7;
+    const baseAngularity = base.angularity != null ? base.angularity : 0.35;
+    const baseForm       = base.form       != null ? base.form       : 0.5;
+    const baseEdge       = base.edge       != null ? base.edge       : 0.5;
     return {
-      scale: Math.max(0.25, Math.min(3, finiteOr(merged.scale, base.scale))),
-      density: Math.max(0.15, Math.min(3, finiteOr(merged.density, base.density))),
-      opacity: Math.max(0, Math.min(1.5, finiteOr(merged.opacity, base.opacity))),
-      jitter: Math.max(0, Math.min(1.5, finiteOr(merged.jitter, base.jitter))),
-      detail: Math.max(0, Math.min(1.5, finiteOr(merged.detail, base.detail != null ? base.detail : 0.7))),
-      angularity: Math.max(0, Math.min(1, finiteOr(merged.angularity, base.angularity != null ? base.angularity : 0.35))),
-      form: Math.max(0, Math.min(1, finiteOr(merged.form, base.form != null ? base.form : 0.5))),
-      edge: Math.max(0, Math.min(1.5, finiteOr(merged.edge, base.edge != null ? base.edge : 0.5)))
+      scale:      Math.max(0.25, Math.min(3,   base.scale      + accum.scale)),
+      density:    Math.max(0.15, Math.min(3,   base.density    + accum.density)),
+      opacity:    Math.max(0,    Math.min(1.5, base.opacity    + accum.opacity)),
+      jitter:     Math.max(0,    Math.min(1.5, base.jitter     + accum.jitter)),
+      detail:     Math.max(0,    Math.min(1.5, baseDetail      + accum.detail)),
+      angularity: Math.max(0,    Math.min(1,   baseAngularity  + accum.angularity)),
+      form:       Math.max(0,    Math.min(1,   baseForm        + accum.form)),
+      edge:       Math.max(0,    Math.min(1.5, baseEdge        + accum.edge))
     };
   }
 
