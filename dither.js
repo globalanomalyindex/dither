@@ -985,26 +985,81 @@ const DitherAlgorithms = (() => {
       }
     }
   }
+  // Resolve the per-sample mark value based on the user-selected color mode.
+  // The mark is what the brush "deposits" — different modes give the line
+  // different media feel. Pure 'source' is a no-op (transparent), so it's
+  // intentionally biased toward darker/lighter to remain visible.
+  function _resolveSketchMark(srcV, strength, taper, colorMode) {
+    switch (colorMode) {
+      case 'dark':
+        // Constant deep tone — charcoal/graphite. Slight strength response
+        // so weaker chains aren't pitch-black.
+        return clamp(22 + (1 - strength) * 28 - taper * 6);
+      case 'light':
+        // Chalk on dark canvas — bright constant tone.
+        return clamp(228 + strength * 22 - (1 - taper) * 14);
+      case 'source':
+        // Pick up the source value at this sample point — barely visible
+        // unless the underlying canvas is far from source. Useful when the
+        // sketch is meant as a subtle structural guide rather than a mark.
+        return srcV;
+      case 'complement':
+        // Push to the value-complement (255-src). Reads as a bright
+        // "negative" tracing — strong contrast vs the canvas wherever
+        // source isn't already mid-gray.
+        return clamp(srcV + (255 - 2 * srcV) * (0.55 + strength * 0.45));
+      case 'ink':
+        // Pure black/white — woodcut/scratchboard feel.
+        return srcV < 128 ? 0 : 255;
+      case 'auto':
+      default:
+        // Adaptive contrast: dark on bright, light on dark — the "charcoal
+        // that knows the canvas" default.
+        return clamp(srcV + (srcV < 128 ? -72 : 56) * strength * (0.55 + taper * 0.55));
+    }
+  }
+
   // Walk a polyline as a continuous brushy stroke — tapered at both ends,
   // wobble accumulating along the path so the line feels hand-drawn.
-  function _renderSketchChain(o, px, w, h, chain, halfW, strength, opacity, jitter, seed, lineFeel) {
+  // colorMode controls the deposited mark (see _resolveSketchMark).
+  // angularOutline collapses the wobble + decimates the chain to a few
+  // straight segments (cubist / woodcut / blocked-out look).
+  function _renderSketchChain(o, px, w, h, chain, halfW, strength, opacity, jitter, seed, lineFeel, colorMode, angularOutline) {
     if (!chain || chain.length < 2) return;
+    // Optional decimation for "angular outline" mode — sample ~6-10 points
+    // along the chain and treat the polyline between them as straight
+    // segments. The render loop below still steps along each segment, but
+    // with the decimated points the long edges read as flat planes.
+    let activeChain = chain;
+    if (angularOutline && chain.length > 6) {
+      const targetPts = Math.max(4, Math.min(10, Math.round(chain.length / 6)));
+      const step = chain.length / targetPts;
+      const reduced = [];
+      for (let i = 0; i < targetPts; i++) {
+        const idx = Math.min(chain.length - 1, Math.round(i * step));
+        reduced.push(chain[idx]);
+      }
+      // Always keep last sample so the chain ends where it should.
+      if (reduced[reduced.length - 1] !== chain[chain.length - 1]) reduced.push(chain[chain.length - 1]);
+      activeChain = reduced;
+    }
     let totalLen = 0;
     const segLens = [];
-    for (let i = 0; i < chain.length - 1; i++) {
-      const dx = chain[i + 1].x - chain[i].x;
-      const dy = chain[i + 1].y - chain[i].y;
+    for (let i = 0; i < activeChain.length - 1; i++) {
+      const dx = activeChain[i + 1].x - activeChain[i].x;
+      const dy = activeChain[i + 1].y - activeChain[i].y;
       const l = Math.sqrt(dx * dx + dy * dy);
       segLens.push(l);
       totalLen += l;
     }
     if (totalLen < 1.5) return;
     const taperLen = Math.min(totalLen * 0.18, halfW * 6);
-    const stepSize = 0.7;
-    const wobAmp = Math.max(0, jitter) * (0.8 + lineFeel * 0.7);
+    const stepSize = angularOutline ? Math.max(0.9, halfW * 0.6) : 0.7;
+    // No wobble in angular mode (clean straight segments).
+    const wobAmp = angularOutline ? 0 : Math.max(0, jitter) * (0.8 + lineFeel * 0.7);
     let traveled = 0;
-    for (let i = 0; i < chain.length - 1; i++) {
-      const p1 = chain[i], p2 = chain[i + 1];
+    for (let i = 0; i < activeChain.length - 1; i++) {
+      const p1 = activeChain[i], p2 = activeChain[i + 1];
       const segLen = segLens[i];
       if (segLen < 0.1) { traveled += segLen; continue; }
       const dx = p2.x - p1.x, dy = p2.y - p1.y;
@@ -1020,15 +1075,13 @@ const DitherAlgorithms = (() => {
         taper = Math.max(0, Math.min(1, taper));
         // Two layered sines for organic wobble (not a clean sinewave).
         const phase = lt * 0.18 + (seed | 0) * 0.0017;
-        const wob = (Math.sin(phase) + Math.sin(phase * 1.7 + 0.4) * 0.42) * wobAmp;
+        const wob = wobAmp === 0 ? 0 : (Math.sin(phase) + Math.sin(phase * 1.7 + 0.4) * 0.42) * wobAmp;
         const cx = p1.x + dx * f + perpX * wob;
         const cy = p1.y + dy * f + perpY * wob;
         const ix = Math.max(0, Math.min(w - 1, Math.round(cx)));
         const iy = Math.max(0, Math.min(h - 1, Math.round(cy)));
         const src = px[iy * w + ix];
-        // Dark on bright, light on dark — like a charcoal/conté line that
-        // adapts to the subject's local value.
-        const mark = clamp(src + (src < 128 ? -72 : 56) * strength * (0.55 + taper * 0.55));
+        const mark = _resolveSketchMark(src, strength, taper, colorMode);
         const dotR = Math.max(0.7, halfW * (0.55 + taper * 0.6));
         const opa = opacity * taper * (0.48 + strength * 0.52);
         _stampSketchDot(o, w, h, cx, cy, dotR, mark, opa, seed + (i & 31), jitter);
@@ -1071,7 +1124,32 @@ const DitherAlgorithms = (() => {
     const formBias = clamp01(opts.form != null ? opts.form : (style === 'form' ? 0.8 : 0.28));
     const structure = Math.max(0, Math.min(1.5, opts.structure != null ? opts.structure : 0.8));
     const lineScale = Math.max(0.5, opts.lineScale || 1);
-    const spacing = Math.max(3, Math.round((opts.spacing || 10) / ((0.8 + strength * 0.55) * Math.sqrt(density))));
+
+    // ── User-facing options ──
+    const scope = opts.scope || 'both';
+    const colorMode = opts.colorMode || 'auto';
+    const angularOutline = !!opts.angularOutline;
+    // detailLevel ∈ [0.1..1] — low = few long bold chains (loose sketch),
+    // high = many short fine chains (tight sketch).
+    const detailLevel = Math.max(0.05, Math.min(1.5, opts.detailLevel != null ? opts.detailLevel : 0.5));
+    // Per-pass density multipliers based on scope. Pass 1 = edge contours
+    // (silhouettes), Pass 2 = tonal mass boundaries (form lines).
+    let pass1Mul = 1, pass2Mul = 1;
+    if (scope === 'external')      { pass1Mul = 1.0; pass2Mul = 0.0; }
+    else if (scope === 'internal') { pass1Mul = 0.0; pass2Mul = 1.0; }
+    else if (scope === 'outline-bias') { pass1Mul = 1.0; pass2Mul = 0.35; }
+    else if (scope === 'form-bias')    { pass1Mul = 0.35; pass2Mul = 1.0; }
+
+    // detailLevel reshapes: spacing density / threshold / chain length /
+    // chain count. Low detail → bigger spacing, higher threshold, longer
+    // chains, fewer of them. High detail → smaller spacing, lower
+    // threshold, shorter chains, many more of them.
+    const detailSpacingMul = 1.5 - detailLevel * 0.95;          // 0.1→1.4 ... 1.0→0.55
+    const detailThreshMul  = 1.55 - detailLevel * 1.20;         // 0.1→1.43 ... 1.0→0.35
+    const detailLenMul     = 1.45 - detailLevel * 0.78;         // 0.1→1.37 ... 1.0→0.67
+    const detailCountMul   = 0.55 + detailLevel * 1.25;         // 0.1→0.68 ... 1.0→1.80
+
+    const spacing = Math.max(3, Math.round((opts.spacing || 10) * detailSpacingMul / ((0.8 + strength * 0.55) * Math.sqrt(density))));
     const baseLen = Math.max(5, opts.length || 22);
     const baseWidth = Math.max(0.6, opts.width || 1.1);
     const eNorm = 1 / Math.max(16, _advFieldStats(edgeMag) * 0.55);
@@ -1080,23 +1158,21 @@ const DitherAlgorithms = (() => {
 
     // Style → line feel knob: 'angular' keeps strokes straighter (less
     // wobble, longer chains); 'form' lets them curve more; 'hybrid' splits.
-    const lineFeel = style === 'form' ? 1.0 : (style === 'angular' ? 0.45 : 0.78);
-    // Width grows with strength but we want sketch lines THINNER than the
-    // old grid stamps (otherwise contour lines smear into block-ins).
+    // angularOutline overrides toward fully straight regardless of style.
+    const lineFeel = angularOutline
+      ? 0.1
+      : (style === 'form' ? 1.0 : (style === 'angular' ? 0.45 : 0.78));
     const halfW = baseWidth * (0.55 + strength * 0.85) * Math.sqrt(0.7 + structure * 0.4);
-    // Maximum chain travel — long enough to cross most of an interesting
-    // contour. Scaled by lineScale + structure (more structure → longer
-    // committed lines) + a small bonus from strength.
-    const maxChainLen = Math.max(24, baseLen * lineScale * (2.8 + structure * 0.9 + strength * 0.6));
-
-    // ── PASS 1: Edge contour chains ──
-    // Sample candidate seeds on a coarse grid, sort by edge strength,
-    // greedily trace from strongest-first, using a suppression mask so
-    // we don't redraw the same contour over and over.
-    const visited = new Uint8Array(w * h);
+    const maxChainLen = Math.max(24, baseLen * lineScale * (2.8 + structure * 0.9 + strength * 0.6) * detailLenMul);
+    // Hoisted so both passes can use the shared seed grid + suppression
+    // radius. (Previously these only existed inside pass 1.)
     const suppressR = Math.max(2, Math.round(spacing * (0.55 + (1 - lineFeel) * 0.25)));
     const seedStride = Math.max(2, Math.round(spacing * 0.45));
-    const minSeedMag = Math.max(0.15, 0.34 - strength * 0.18 - edgeFocus * 0.04);
+
+    // ── PASS 1: Edge contour chains (silhouette / outline) ──
+    if (pass1Mul > 0.01) {
+    const visited = new Uint8Array(w * h);
+    const minSeedMag = Math.max(0.10, (0.34 - strength * 0.18 - edgeFocus * 0.04) * detailThreshMul);
 
     const seeds = [];
     for (let y = seedStride; y < h - seedStride; y += seedStride) {
@@ -1116,12 +1192,12 @@ const DitherAlgorithms = (() => {
       }
     }
     seeds.sort((a, b) => b.e - a.e);
-    const maxChains = Math.max(8, Math.floor(seeds.length * Math.min(1.4, strength * density * 0.85)));
+    const maxChains = Math.max(8, Math.floor(seeds.length * Math.min(1.4, strength * density * 0.85) * detailCountMul * pass1Mul));
 
     const chainOpts = {
       maxLen: maxChainLen,
       stepSize: 1.3,
-      minMag: Math.max(0.08, 0.16 - strength * 0.05),
+      minMag: Math.max(0.06, (0.16 - strength * 0.05) * detailThreshMul),
       lookAhead: 2 + (lineFeel > 0.7 ? 1 : 0)
     };
     let chainsDrawn = 0;
@@ -1131,27 +1207,26 @@ const DitherAlgorithms = (() => {
       const chain = _traceContourChain(s.x, s.y, edgeMag, edgeAng, eNorm, w, h, chainOpts);
       if (chain.length < 4) continue;
       _suppressChain(visited, chain, suppressR, w, h);
-      _renderSketchChain(o, px, w, h, chain, halfW, strength, opacity * (0.65 + edgeFocus * 0.20), jitter, seed ^ (si * 0x9e37 | 0), lineFeel);
+      _renderSketchChain(o, px, w, h, chain, halfW, strength, opacity * (0.65 + edgeFocus * 0.20), jitter, seed ^ (si * 0x9e37 | 0), lineFeel, colorMode, angularOutline);
       chainsDrawn++;
       // Occasional cross-hatch tick when the artist commits a corner —
       // a short perpendicular flick at the chain's midpoint when the
-      // local style favors angular construction.
-      if (angular > 0.55 && chain.length > 6 && _advHash01(seed, s.x, s.y, 5181) < 0.32 + strength * 0.18) {
+      // local style favors angular construction. Skipped under angular-
+      // outline mode (we already get that geometric energy from the
+      // decimated polyline).
+      if (!angularOutline && angular > 0.55 && chain.length > 6 && _advHash01(seed, s.x, s.y, 5181) < 0.32 + strength * 0.18) {
         const mid = chain[(chain.length / 2) | 0];
         const tickAng = mid.ang + Math.PI * 0.5 * (_advHash01(seed, s.x, s.y, 5182) < 0.5 ? -1 : 1);
         const tickLen = baseLen * lineScale * (0.32 + strength * 0.28);
-        const tickMark = clamp(px[((mid.y | 0) * w + (mid.x | 0)) | 0] + (px[((mid.y | 0) * w + (mid.x | 0)) | 0] < 128 ? -68 : 50) * strength);
+        const ix = (mid.y | 0) * w + (mid.x | 0);
+        const tickMark = _resolveSketchMark(px[ix], strength, 0.7, colorMode);
         paintSketchLine(o, w, h, mid.x, mid.y, tickAng, tickLen, halfW * 0.85, tickMark, Math.min(0.85, opacity * 0.55), seed, 5183);
       }
     }
+    }  // end pass 1
 
-    // ── PASS 2: Tonal mass-boundary chains ──
-    // Compute a coarse gradient on the gray-luma field at a wider block
-    // (so we pick up where the LIT-vs-SHADOW PLANES meet, not edge-filter
-    // noise) and trace those as broader, looser sketch lines. These are
-    // the "form" lines — cheekbone arc, the back of a cup, the horizon
-    // between sky and land — that a painter draws to commit major masses.
-    if (gray && structure > 0.05) {
+    // ── PASS 2: Tonal mass-boundary chains (interior form lines) ──
+    if (pass2Mul > 0.01 && gray && structure > 0.05) {
       const massBlock = Math.max(3, Math.round(spacing * 0.85));
       const grayMag = new Float32Array(w * h);
       const grayAng = new Float32Array(w * h);
@@ -1165,8 +1240,8 @@ const DitherAlgorithms = (() => {
         }
       }
       const gNorm = 1 / Math.max(16, _advFieldStats(grayMag) * 0.55);
-      const massStride = Math.max(3, seedStride * 2);
-      const massMinMag = Math.max(0.22, 0.36 - strength * 0.10);
+      const massStride = Math.max(3, Math.round(seedStride * 2 * detailSpacingMul));
+      const massMinMag = Math.max(0.16, (0.36 - strength * 0.10) * detailThreshMul);
       const massSeeds = [];
       for (let y = massStride; y < h - massStride; y += massStride) {
         for (let x = massStride; x < w - massStride; x += massStride) {
@@ -1177,14 +1252,14 @@ const DitherAlgorithms = (() => {
         }
       }
       massSeeds.sort((a, b) => b.m - a.m);
-      const maxMassChains = Math.max(4, Math.floor(massSeeds.length * Math.min(1, strength * structure * 0.75)));
+      const maxMassChains = Math.max(4, Math.floor(massSeeds.length * Math.min(1, strength * structure * 0.75) * detailCountMul * pass2Mul));
       const massVisited = new Uint8Array(w * h);
       const massSuppressR = Math.max(3, Math.round(suppressR * 1.45));
       const massHalfW = halfW * (1.05 + structure * 0.45);
       const massChainOpts = {
         maxLen: maxChainLen * 1.55,
         stepSize: 1.7,
-        minMag: Math.max(0.15, massMinMag * 0.55),
+        minMag: Math.max(0.10, massMinMag * 0.55),
         lookAhead: 3
       };
       let massDrawn = 0;
@@ -1194,7 +1269,16 @@ const DitherAlgorithms = (() => {
         const chain = _traceContourChain(s.x, s.y, grayMag, grayAng, gNorm, w, h, massChainOpts);
         if (chain.length < 6) continue;
         _suppressChain(massVisited, chain, massSuppressR, w, h);
-        _renderSketchChain(o, px, w, h, chain, massHalfW, strength * (0.85 + formBias * 0.25), opacity * (0.78 + formBias * 0.22), jitter * (1 + formBias * 0.4), seed ^ 0x9e37 ^ (si * 0x4cf | 0), Math.min(1.2, lineFeel + 0.18));
+        _renderSketchChain(
+          o, px, w, h, chain, massHalfW,
+          strength * (0.85 + formBias * 0.25),
+          opacity * (0.78 + formBias * 0.22),
+          jitter * (1 + formBias * 0.4),
+          seed ^ 0x9e37 ^ (si * 0x4cf | 0),
+          Math.min(1.2, lineFeel + 0.18),
+          colorMode,
+          angularOutline
+        );
         massDrawn++;
       }
     }
@@ -2900,6 +2984,23 @@ const DitherAlgorithms = (() => {
       {value:'hybrid',label:'Hybrid sketch'}
     ],default:'angular'},
     {id:'constructionLines',label:'Construction Lines',min:0,max:1,step:.05,default:.5},
+    {id:'constructionScope',label:'Sketch Scope',type:'select',options:[
+      {value:'both',label:'Outline + form lines'},
+      {value:'external',label:'Outline only (silhouette)'},
+      {value:'internal',label:'Form lines only (interior)'},
+      {value:'outline-bias',label:'Mostly outline'},
+      {value:'form-bias',label:'Mostly form lines'}
+    ],default:'both'},
+    {id:'constructionLineColor',label:'Line Color',type:'select',options:[
+      {value:'auto',label:'Auto (contrast vs canvas)'},
+      {value:'dark',label:'Dark charcoal'},
+      {value:'light',label:'Chalk on dark'},
+      {value:'source',label:'Match source tone'},
+      {value:'complement',label:'Push toward complement'},
+      {value:'ink',label:'Ink (max contrast)'}
+    ],default:'auto'},
+    {id:'constructionDetail',label:'Sketch Detail',min:0.1,max:1,step:.05,default:.5},
+    {id:'constructionAngularOutline',label:'Angular Outline',type:'checkbox',default:false},
     {id:'blockInStrength',label:'Broad Block-In',min:0,max:1.5,step:.05,default:.72},
     {id:'edgeFinish',label:'Soft ↔ Hard Edges',min:-1,max:1,step:.05,default:.25},
     // — Core shape —
@@ -3265,6 +3366,10 @@ const DitherAlgorithms = (() => {
       paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, {
         strength: constructionLines,
         style: constructionStyle,
+        scope: p.constructionScope || 'both',
+        colorMode: p.constructionLineColor || 'auto',
+        detailLevel: (p.constructionDetail != null) ? p.constructionDetail : 0.5,
+        angularOutline: !!p.constructionAngularOutline,
         detailDrive: Math.min(1, detailAware / 2),
         lineScale: (0.9 + canvasScale * 0.2) * reconConstruction.scale,
         spacing: Math.max(5, underpaintBlock * 0.52),
@@ -7130,6 +7235,23 @@ const DitherAlgorithms = (() => {
       {value:'hybrid',label:'Hybrid sketch'}
     ],default:'angular'},
     {id:'constructionLines',label:'Construction Lines',min:0,max:1,step:.05,default:.5},
+    {id:'constructionScope',label:'Sketch Scope',type:'select',options:[
+      {value:'both',label:'Outline + form lines'},
+      {value:'external',label:'Outline only (silhouette)'},
+      {value:'internal',label:'Form lines only (interior)'},
+      {value:'outline-bias',label:'Mostly outline'},
+      {value:'form-bias',label:'Mostly form lines'}
+    ],default:'both'},
+    {id:'constructionLineColor',label:'Line Color',type:'select',options:[
+      {value:'auto',label:'Auto (contrast vs canvas)'},
+      {value:'dark',label:'Dark charcoal'},
+      {value:'light',label:'Chalk on dark'},
+      {value:'source',label:'Match source tone'},
+      {value:'complement',label:'Push toward complement'},
+      {value:'ink',label:'Ink (max contrast)'}
+    ],default:'auto'},
+    {id:'constructionDetail',label:'Sketch Detail',min:0.1,max:1,step:.05,default:.5},
+    {id:'constructionAngularOutline',label:'Angular Outline',type:'checkbox',default:false},
     {id:'blockInStrength',label:'Broad Block-In',min:0,max:1.5,step:.05,default:.68},
     {id:'edgeFinish',label:'Soft ↔ Hard Edges',min:-1,max:1,step:.05,default:.2},
     // — Core (same defaults as legacy) —
@@ -7468,6 +7590,10 @@ const DitherAlgorithms = (() => {
       paintConstructionSketch(o, px, w, h, edgeMag, edgeAng, detail, toneGuide, {
         strength: constructionLines,
         style: constructionStyle,
+        scope: p.constructionScope || 'both',
+        colorMode: p.constructionLineColor || 'auto',
+        detailLevel: (p.constructionDetail != null) ? p.constructionDetail : 0.5,
+        angularOutline: !!p.constructionAngularOutline,
         detailDrive: Math.min(1, detailAware / 2),
         lineScale: (0.85 + canvasScale * 0.18) * reconConstruction.scale,
         spacing: Math.max(5, underpaintBlock * 0.50),
