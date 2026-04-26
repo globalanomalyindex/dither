@@ -1305,8 +1305,14 @@ const DitherAlgorithms = (() => {
   // so all three channels paint the same regions in the same order — only
   // the deposited color differs per channel.
 
-  // Quick capsule brush stamp — half-length × half-width capsule rotated to
-  // `ang`, with radial falloff and end taper. Single-channel alpha blend.
+  // ── Bayer-dithered crisp stamp ──
+  // The atomic mark of the region builder. Pixels inside the capsule are
+  // either set crisply to `sampleV` or skipped — never alpha-blended into
+  // gradients. The decision is per-pixel: Bayer threshold at (nx,ny)
+  // compared against effective alpha (radial falloff × stroke alpha).
+  // Falloff is sharpened so the inner ~60% is solid coverage and the
+  // outer 40% is dithered grain. That's what gives the marks the
+  // characteristic DITHER crispness instead of the blurry alpha blend.
   function _ditherCapsule(o, w, h, cx, cy, hl, hw, ang, sampleV, alpha) {
     if (alpha <= 0.02 || hw < 0.4) return;
     const cosA = Math.cos(ang), sinA = Math.sin(ang);
@@ -1330,47 +1336,76 @@ const DitherAlgorithms = (() => {
           const endF = 1 - (aAbs - hl * 0.7) / (hl * 0.3 + 0.01);
           fall *= Math.max(0, endF);
         }
+        // Sharpen — inner ~60% solid, outer 40% dithered.
+        fall = Math.min(1, fall * 1.7);
         const a = fall * alpha;
         if (a <= 0.02) continue;
-        const oi = ny * w + nx;
-        o[oi] = Math.round(sampleV * a + o[oi] * (1 - a));
+        // Bayer dither — crisp paint, no smooth gradient blur.
+        if (_advBayerAt(nx, ny) < a) {
+          o[ny * w + nx] = sampleV;
+        }
       }
     }
   }
 
-  // Downsampled connected-component segmentation on the gray-luma field.
+  // Single-pixel Bayer-dithered scribble — used for accent flicks and
+  // refinement strokes. Just a tighter capsule, same dither logic.
+  function _ditherScribbleSegment(o, w, h, x0, y0, x1, y1, halfW, sampleV, alpha) {
+    const dx = x1 - x0, dy = y1 - y0;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len < 0.5) return;
+    const ang = Math.atan2(dy, dx);
+    _ditherCapsule(o, w, h, (x0 + x1) * 0.5, (y0 + y1) * 0.5, len * 0.5, halfW, ang, sampleV, alpha);
+  }
+
+  // Downsampled connected-component segmentation on the gray-luma field
+  // with EDGE-AWARE merging — strong-edge cells are barriers so the bird
+  // silhouette doesn't merge into a wall of similar luma. That was the
+  // big perceptual bug in the previous version: a cockatiel against a
+  // light wall got grouped with the wall and painted as one big region.
+  //
   // Returns regions[] with bbox, area, centroid, mean luma + the labels
   // grid + scale factor for converting to/from full-canvas coords.
-  function _ditherRegionSegment(gray, w, h, bands) {
+  function _ditherRegionSegment(gray, edgeMag, w, h, bands) {
     bands = Math.max(3, Math.min(10, bands || 6));
-    // Cap the segmentation grid at ~150px max dimension. BFS work is
-    // O(dw*dh); we want it negligible vs the actual painting cost.
+    // Cap the segmentation grid at ~150px max dimension so BFS work is
+    // negligible vs painting cost.
     const target = 150;
     const scale = Math.max(1, Math.ceil(Math.max(w, h) / target));
     const dw = Math.max(2, Math.floor(w / scale));
     const dh = Math.max(2, Math.floor(h / scale));
     const N = dw * dh;
-    // Downsampled luma — average over scale × scale block.
     const dgray = new Uint8Array(N);
+    const dedge = new Float32Array(N);
     for (let dy = 0; dy < dh; dy++) {
       const y0 = dy * scale, y1 = Math.min(h, y0 + scale);
       for (let dx = 0; dx < dw; dx++) {
         const x0 = dx * scale, x1 = Math.min(w, x0 + scale);
-        let sum = 0, n = 0;
+        let lumaSum = 0, lumaN = 0, edgeMax = 0;
         for (let y = y0; y < y1; y++) {
-          for (let x = x0; x < x1; x++) { sum += gray[y * w + x]; n++; }
+          for (let x = x0; x < x1; x++) {
+            lumaSum += gray[y * w + x];
+            lumaN++;
+            if (edgeMag) {
+              const e = edgeMag[y * w + x];
+              if (e > edgeMax) edgeMax = e;
+            }
+          }
         }
-        dgray[dy * dw + dx] = Math.round(sum / Math.max(1, n));
+        dgray[dy * dw + dx] = Math.round(lumaSum / Math.max(1, lumaN));
+        dedge[dy * dw + dx] = edgeMax;
       }
     }
-    // Quantize to value bands.
     const banded = new Uint8Array(N);
     for (let i = 0; i < N; i++) {
       banded[i] = Math.min(bands - 1, Math.floor(dgray[i] * bands / 256));
     }
-    // BFS connected component labelling.
+    // Edge-barrier threshold: cells with strong edges (silhouettes) act
+    // as walls between regions. Tuned so the bird boundary blocks merge
+    // with the wall but soft tonal gradients within a region still merge.
+    const edgeBarrier = 90;
     const labels = new Int32Array(N);
-    const regions = [null]; // labels start at 1
+    const regions = [null];
     const qX = new Int32Array(N), qY = new Int32Array(N);
     for (let y = 0; y < dh; y++) {
       for (let x = 0; x < dw; x++) {
@@ -1398,17 +1433,42 @@ const DitherAlgorithms = (() => {
           if (cx > r.maxX) r.maxX = cx;
           if (cy < r.minY) r.minY = cy;
           if (cy > r.maxY) r.maxY = cy;
-          if (cx > 0)      { const ni = ci - 1;  if (labels[ni] === 0 && banded[ni] === band) { labels[ni] = id; qX[qT] = cx - 1; qY[qT] = cy; qT++; } }
-          if (cx < dw - 1) { const ni = ci + 1;  if (labels[ni] === 0 && banded[ni] === band) { labels[ni] = id; qX[qT] = cx + 1; qY[qT] = cy; qT++; } }
-          if (cy > 0)      { const ni = ci - dw; if (labels[ni] === 0 && banded[ni] === band) { labels[ni] = id; qX[qT] = cx; qY[qT] = cy - 1; qT++; } }
-          if (cy < dh - 1) { const ni = ci + dw; if (labels[ni] === 0 && banded[ni] === band) { labels[ni] = id; qX[qT] = cx; qY[qT] = cy + 1; qT++; } }
+          // Connectivity: same band AND no strong-edge barrier between us.
+          // (Either the source cell or the candidate cell having a high
+          // edge is enough to block the merge — keeps the silhouette
+          // intact whichever side it lands on after downsampling.)
+          const blocked = dedge[ci] >= edgeBarrier;
+          if (cx > 0) {
+            const ni = ci - 1;
+            if (labels[ni] === 0 && banded[ni] === band && !blocked && dedge[ni] < edgeBarrier) {
+              labels[ni] = id; qX[qT] = cx - 1; qY[qT] = cy; qT++;
+            }
+          }
+          if (cx < dw - 1) {
+            const ni = ci + 1;
+            if (labels[ni] === 0 && banded[ni] === band && !blocked && dedge[ni] < edgeBarrier) {
+              labels[ni] = id; qX[qT] = cx + 1; qY[qT] = cy; qT++;
+            }
+          }
+          if (cy > 0) {
+            const ni = ci - dw;
+            if (labels[ni] === 0 && banded[ni] === band && !blocked && dedge[ni] < edgeBarrier) {
+              labels[ni] = id; qX[qT] = cx; qY[qT] = cy - 1; qT++;
+            }
+          }
+          if (cy < dh - 1) {
+            const ni = ci + dw;
+            if (labels[ni] === 0 && banded[ni] === band && !blocked && dedge[ni] < edgeBarrier) {
+              labels[ni] = id; qX[qT] = cx; qY[qT] = cy + 1; qT++;
+            }
+          }
         }
         r.cx = r.sumX / r.area;
         r.cy = r.sumY / r.area;
         r.meanLuma = r.sumLuma / r.area;
       }
     }
-    return { labels, regions, banded, scale, dw, dh, w, h };
+    return { labels, regions, banded, dgray, dedge, scale, dw, dh, w, h };
   }
 
   // Classify each region into a stroke vocabulary and order the agendas:
@@ -1475,67 +1535,141 @@ const DitherAlgorithms = (() => {
     return { fx: dx * seg.scale + half, fy: dy * seg.scale + half };
   }
 
-  // Background: 2-4 long sweeping strokes spanning the bbox along its
-  // major axis. Each stroke samples luma from a different anchor within
-  // the region, so big flat-but-not-uniform regions (skies, walls) get
-  // subtle color variation across the sweeps.
+  // Pick K "color choices" for a region — anchor pixels sampled from
+  // within the region. The painter dips the brush K times, then uses
+  // those K colors throughout the region. Real painters don't re-dip
+  // the brush for every stroke.
+  function _ditherRegionColors(region, seg, px, w, h, count, seed, salt) {
+    const anchors = _ditherRegionAnchors(region, seg.labels, seg.dw, count, seed, salt);
+    const colors = [];
+    for (let i = 0; i < anchors.length; i++) {
+      const a = anchors[i];
+      const { fx, fy } = _ditherFull(seg, a.dx, a.dy);
+      const sx = Math.max(0, Math.min(w - 1, fx | 0));
+      const sy = Math.max(0, Math.min(h - 1, fy | 0));
+      colors.push(px[sy * w + sx]);
+    }
+    if (colors.length === 0) {
+      // Fallback to centroid sample.
+      const { fx, fy } = _ditherFull(seg, region.cx, region.cy);
+      const sx = Math.max(0, Math.min(w - 1, Math.round(fx)));
+      const sy = Math.max(0, Math.min(h - 1, Math.round(fy)));
+      colors.push(px[sy * w + sx]);
+    }
+    return colors;
+  }
+
+  // ── BACKGROUND ── 2-3 broad fills that establish the region's tone.
+  // Uses a SINGLE committed color (the dominant region tone) with very
+  // small luma jitter per stroke. No source-sampling per pixel, so the
+  // result reads as paint, not as "filtered source." Fills are huge
+  // capsules sized to span the bbox along its major axis.
   function _ditherAgendaBackground(o, px, region, seg, w, h, opts) {
     const seed = opts.seed | 0;
-    const { fx: cfx, fy: cfy } = _ditherFull(seg, region.cx, region.cy);
     const fbw = (region.maxX - region.minX + 1) * seg.scale;
     const fbh = (region.maxY - region.minY + 1) * seg.scale;
     const horizontal = fbw >= fbh;
     const sweepLen = (horizontal ? fbw : fbh);
-    const stripWidth = (horizontal ? fbh : fbw) / 3.2;
-    const strokeCount = 2 + Math.floor(_advHash01(seed, region.id, 0, 7501) * 3); // 2..4
-    const anchors = _ditherRegionAnchors(region, seg.labels, seg.dw, strokeCount, seed, 1);
+    const stripWidth = Math.max(8, (horizontal ? fbh : fbw) / 2.6);
+    const strokeCount = 2 + Math.floor(_advHash01(seed, region.id, 0, 7501) * 2); // 2..3
+    // Pull a small palette (1-2 colors) for this region. Painter dipped
+    // once, maybe twice. Each stroke uses one of those.
+    const palette = _ditherRegionColors(region, seg, px, w, h, 2, seed, 1);
+    const baseTone = palette[0];
     for (let s = 0; s < strokeCount; s++) {
       const t = strokeCount === 1 ? 0.5 : (s + 0.5) / strokeCount;
-      let cx, cy, ang;
-      if (horizontal) {
-        cx = cfx;
-        cy = (region.minY * seg.scale) + fbh * t;
-        ang = (_advHash01(seed, region.id, s, 7502) - 0.5) * 0.16;
-      } else {
-        cx = (region.minX * seg.scale) + fbw * t;
-        cy = cfy;
-        ang = Math.PI * 0.5 + (_advHash01(seed, region.id, s, 7502) - 0.5) * 0.16;
+      const fx = horizontal
+        ? (region.minX * seg.scale) + fbw * 0.5
+        : (region.minX * seg.scale) + fbw * t;
+      const fy = horizontal
+        ? (region.minY * seg.scale) + fbh * t
+        : (region.minY * seg.scale) + fbh * 0.5;
+      const ang = (horizontal ? 0 : Math.PI * 0.5)
+        + (_advHash01(seed, region.id, s, 7502) - 0.5) * 0.14;
+      // Color choice: alternate between palette[0] and palette[1] if both
+      // exist, with ±10 luma jitter per stroke (paint mixed slightly).
+      let color = palette[s % palette.length];
+      const jitter = Math.round((_advHash01(seed, region.id, s, 7503) - 0.5) * 20);
+      color = Math.max(0, Math.min(255, color + jitter));
+      _ditherCapsule(o, w, h, fx, fy, sweepLen * 0.58, stripWidth, ang, color, opts.opacity * 0.96);
+    }
+    // Optional broken streak — gives the wall some painterly texture
+    // beyond pure flat fill.
+    if (_advHash01(seed, region.id, 0, 7510) < 0.55) {
+      const streakCount = 2 + Math.floor(_advHash01(seed, region.id, 0, 7511) * 3);
+      for (let s = 0; s < streakCount; s++) {
+        const anchors = _ditherRegionAnchors(region, seg.labels, seg.dw, 1, seed, 3 + s);
+        if (!anchors.length) continue;
+        const { fx, fy } = _ditherFull(seg, anchors[0].dx, anchors[0].dy);
+        const ang = (horizontal ? 0 : Math.PI * 0.5)
+          + (_advHash01(seed, region.id, s, 7512) - 0.5) * 0.20;
+        const len = sweepLen * (0.20 + _advHash01(seed, region.id, s, 7513) * 0.30);
+        const wid = stripWidth * (0.30 + _advHash01(seed, region.id, s, 7514) * 0.30);
+        const streakColor = Math.max(0, Math.min(255, baseTone + Math.round((_advHash01(seed, region.id, s, 7515) - 0.5) * 30)));
+        _ditherCapsule(o, w, h, fx, fy, len, wid, ang, streakColor, opts.opacity * 0.7);
       }
-      const a = anchors[s] || { dx: region.cx | 0, dy: region.cy | 0 };
-      const { fx, fy } = _ditherFull(seg, a.dx, a.dy);
-      const sx = Math.max(0, Math.min(w - 1, fx | 0));
-      const sy = Math.max(0, Math.min(h - 1, fy | 0));
-      const sampleV = px[sy * w + sx];
-      _ditherCapsule(o, w, h, cx, cy, sweepLen * 0.55, stripWidth, ang, sampleV, opts.opacity * 0.92);
     }
   }
 
-  // Blob: scattered medium dabs, form-following angle. Density scales
-  // with sqrt(area) so big blobs get many dabs and small ones get a
-  // handful — feels like a painter laying in a color mass.
+  // ── BLOB (subject mass) ── A real painter blocking in a form:
+  //   1. Flat mass fill with the dominant region color (broad coverage)
+  //   2. Broken-color dabs sampled from local source — variation
+  //   3. Form-following directional strokes if there's any aspect
+  // The mass-fill is what gives the cockatiel body its color identity;
+  // the broken-color dabs add organic variation; the directional strokes
+  // describe the form. All Bayer-dithered, no alpha-gradient blur.
   function _ditherAgendaBlob(o, px, region, seg, w, h, edgeAng, opts) {
     const seed = opts.seed | 0;
-    const dabSize = Math.max(3, Math.round(Math.sqrt(region.area * seg.scale * seg.scale) * 0.07));
-    const dabCount = Math.max(3, Math.round(Math.sqrt(region.area) * 1.4 * (opts.density || 1)));
-    const anchors = _ditherRegionAnchors(region, seg.labels, seg.dw, dabCount, seed, 2);
-    for (let d = 0; d < anchors.length; d++) {
-      const a = anchors[d];
-      const subX = Math.floor(_advHash01(seed, region.id, d, 7603) * seg.scale);
-      const subY = Math.floor(_advHash01(seed, region.id, d, 7604) * seg.scale);
+    const fbw = (region.maxX - region.minX + 1) * seg.scale;
+    const fbh = (region.maxY - region.minY + 1) * seg.scale;
+    const aspect = Math.max(fbw, fbh) / Math.max(1, Math.min(fbw, fbh));
+    const palette = _ditherRegionColors(region, seg, px, w, h, 3, seed, 2);
+    const dominant = palette[0];
+
+    // ── Pass 1: Mass fill — establishes the form's color identity.
+    // 1-2 large strokes covering most of the bbox.
+    const massCount = 1 + Math.floor(_advHash01(seed, region.id, 0, 7601) * 2);
+    for (let m = 0; m < massCount; m++) {
+      const massCx = (region.minX * seg.scale) + fbw * (0.35 + _advHash01(seed, region.id, m, 7602) * 0.30);
+      const massCy = (region.minY * seg.scale) + fbh * (0.35 + _advHash01(seed, region.id, m, 7603) * 0.30);
+      const massAng = aspect > 1.4
+        ? (fbw >= fbh ? 0 : Math.PI * 0.5) + (_advHash01(seed, region.id, m, 7604) - 0.5) * 0.4
+        : _advHash01(seed, region.id, m, 7604) * Math.PI;
+      const massHL = Math.max(fbw, fbh) * 0.42;
+      const massHW = Math.min(fbw, fbh) * (0.32 + _advHash01(seed, region.id, m, 7605) * 0.18);
+      _ditherCapsule(o, w, h, massCx, massCy, massHL, massHW, massAng, dominant, opts.opacity * 0.94);
+    }
+
+    // ── Pass 2: Broken-color dabs — sample local source for variation.
+    const dabSize = Math.max(2, Math.round(Math.sqrt(region.area * seg.scale * seg.scale) * 0.06));
+    const dabCount = Math.max(4, Math.round(Math.sqrt(region.area) * 1.6 * (opts.density || 1)));
+    const dabAnchors = _ditherRegionAnchors(region, seg.labels, seg.dw, dabCount, seed, 4);
+    for (let d = 0; d < dabAnchors.length; d++) {
+      const a = dabAnchors[d];
+      const subX = Math.floor(_advHash01(seed, region.id, d, 7610) * seg.scale);
+      const subY = Math.floor(_advHash01(seed, region.id, d, 7611) * seg.scale);
       const fx = Math.max(0, Math.min(w - 1, a.dx * seg.scale + subX));
       const fy = Math.max(0, Math.min(h - 1, a.dy * seg.scale + subY));
-      const sampleV = px[fy * w + fx];
+      // Mix between local source sample and a chosen palette color so
+      // the dab feels deliberate (painter's color choice) rather than
+      // noisy pixel sampling.
+      const localV = px[fy * w + fx];
+      const paletteV = palette[d % palette.length];
+      const mixT = 0.35 + _advHash01(seed, region.id, d, 7612) * 0.40;
+      const dabColor = Math.round(localV * mixT + paletteV * (1 - mixT));
       const ang = edgeAng[fy * w + fx] + Math.PI * 0.5
-        + (_advHash01(seed, region.id, d, 7605) - 0.5) * 0.6;
-      const sz = dabSize * (0.6 + _advHash01(seed, region.id, d, 7606) * 0.85);
-      _ditherCapsule(o, w, h, fx, fy, sz * 1.4, sz * 0.55, ang, sampleV, opts.opacity);
+        + (_advHash01(seed, region.id, d, 7613) - 0.5) * 0.7;
+      const sz = dabSize * (0.7 + _advHash01(seed, region.id, d, 7614) * 0.7);
+      _ditherCapsule(o, w, h, fx, fy, sz * 1.5, sz * 0.55, ang, dabColor, opts.opacity * 0.85);
     }
   }
 
-  // Thin region: directional strokes along the bbox major axis. Stroke
-  // count scales with the long-axis length; minor axis sets stroke width.
-  // Form-following nudge per stroke so a curved thin region (a crest, a
-  // finger) gets organic angle variation as it traverses.
+  // ── THIN (crest, fingers, branches) ──
+  // Walk along the bbox's major axis with directional strokes. Each
+  // stroke uses a chosen palette color and a form-follow-blended angle
+  // so curved thin features (a crest's S-curve) bend naturally. Adds
+  // small angular flicks at random positions for character — that's
+  // the "scribbles in yellow" feel.
   function _ditherAgendaThin(o, px, region, seg, w, h, edgeAng, opts) {
     const seed = opts.seed | 0;
     const bw = region.maxX - region.minX + 1;
@@ -1543,59 +1677,72 @@ const DitherAlgorithms = (() => {
     const horizontal = bw >= bh;
     const longSpan = (horizontal ? bw : bh) * seg.scale;
     const shortSpan = (horizontal ? bh : bw) * seg.scale;
-    const strokeCount = Math.max(2, Math.round(longSpan / Math.max(4, shortSpan * 1.2)));
+    const palette = _ditherRegionColors(region, seg, px, w, h, 2, seed, 5);
+    const strokeCount = Math.max(3, Math.round(longSpan / Math.max(4, shortSpan * 1.0)));
     const stepLong = longSpan / Math.max(1, strokeCount);
     for (let s = 0; s < strokeCount; s++) {
       const t = (s + 0.5) / strokeCount;
-      const dx = horizontal
-        ? region.minX + bw * t
-        : region.minX + bw * 0.5;
-      const dy = horizontal
-        ? region.minY + bh * 0.5
-        : region.minY + bh * t;
+      const dx = horizontal ? region.minX + bw * t : region.minX + bw * 0.5;
+      const dy = horizontal ? region.minY + bh * 0.5 : region.minY + bh * t;
       const idx = (dy | 0) * seg.dw + (dx | 0);
       if (idx < 0 || idx >= seg.labels.length || seg.labels[idx] !== region.id) continue;
       const { fx, fy } = _ditherFull(seg, dx, dy);
       const sx = Math.max(0, Math.min(w - 1, fx | 0));
       const sy = Math.max(0, Math.min(h - 1, fy | 0));
-      const sampleV = px[sy * w + sx];
-      // Use the form-following angle at the sample so curved thin
-      // features bend naturally with the gradient.
       const formAng = edgeAng[sy * w + sx] + Math.PI * 0.5;
       const targetAng = horizontal ? 0 : Math.PI * 0.5;
+      // Blend form-follow with target axis — curved thins still trace
+      // the curve while staying overall aligned with their long axis.
       const ang = formAng * 0.55 + targetAng * 0.45
-        + (_advHash01(seed, region.id, s, 7702) - 0.5) * 0.18;
-      const hl = stepLong * 0.6;
-      const hw = Math.max(1.5, shortSpan * 0.45);
-      _ditherCapsule(o, w, h, fx, fy, hl, hw, ang, sampleV, opts.opacity * 0.95);
+        + (_advHash01(seed, region.id, s, 7702) - 0.5) * 0.20;
+      const hl = stepLong * 0.62;
+      const hw = Math.max(1.3, shortSpan * 0.42);
+      // Color: palette + small jitter from local source for texture.
+      const palV = palette[s % palette.length];
+      const localV = px[sy * w + sx];
+      const color = Math.round(palV * 0.65 + localV * 0.35);
+      _ditherCapsule(o, w, h, fx, fy, hl, hw, ang, color, opts.opacity * 0.96);
+    }
+    // Tiny angular flick at one random position — adds the "energetic
+    // line drawing" feel a painter brings to thin features.
+    if (strokeCount >= 3 && _advHash01(seed, region.id, 0, 7710) < 0.55) {
+      const flickT = 0.2 + _advHash01(seed, region.id, 0, 7711) * 0.6;
+      const dx = horizontal ? region.minX + bw * flickT : region.minX + bw * 0.5;
+      const dy = horizontal ? region.minY + bh * 0.5 : region.minY + bh * flickT;
+      const { fx, fy } = _ditherFull(seg, dx, dy);
+      const flickAng = (horizontal ? Math.PI * 0.5 : 0) + (_advHash01(seed, region.id, 0, 7712) - 0.5) * 0.4;
+      const flickLen = stepLong * 0.45;
+      _ditherCapsule(o, w, h, fx, fy, flickLen, Math.max(1, shortSpan * 0.30), flickAng, palette[0], opts.opacity * 0.85);
     }
   }
 
-  // Accent: 1-2 small dabs near the centroid. Used for tiny features
-  // (eye highlight, beak tip, small color note).
+  // ── ACCENT (eye, beak tip, color note) ──
+  // Single bold dab at the centroid using the brightest/most saturated
+  // sample from within the region. Optional perpendicular tick. Tiny
+  // regions get the painter's full attention — these are the highlights
+  // that bring the painting to life.
   function _ditherAgendaAccent(o, px, region, seg, w, h, edgeAng, opts) {
     const seed = opts.seed | 0;
     const { fx, fy } = _ditherFull(seg, region.cx, region.cy);
     const sx = Math.max(0, Math.min(w - 1, Math.round(fx)));
     const sy = Math.max(0, Math.min(h - 1, Math.round(fy)));
     const sampleV = px[sy * w + sx];
-    const sz = Math.max(2, Math.round(Math.sqrt(region.area * seg.scale * seg.scale) * 0.18));
+    const sz = Math.max(2, Math.round(Math.sqrt(region.area * seg.scale * seg.scale) * 0.20));
     const ang = edgeAng[sy * w + sx] + Math.PI * 0.5
       + (_advHash01(seed, region.id, 0, 7703) - 0.5) * 0.5;
-    _ditherCapsule(o, w, h, fx, fy, sz * 1.1, sz * 0.7, ang, sampleV, opts.opacity);
-    // Optional second tick for energy.
-    if (_advHash01(seed, region.id, 0, 7704) < 0.4) {
+    _ditherCapsule(o, w, h, fx, fy, sz * 1.15, sz * 0.75, ang, sampleV, opts.opacity);
+    if (_advHash01(seed, region.id, 0, 7704) < 0.40) {
       const offX = (_advHash01(seed, region.id, 0, 7705) - 0.5) * sz * 1.4;
       const offY = (_advHash01(seed, region.id, 0, 7706) - 0.5) * sz * 1.4;
-      _ditherCapsule(o, w, h, fx + offX, fy + offY, sz * 0.7, sz * 0.5, ang + Math.PI * 0.5, sampleV, opts.opacity * 0.65);
+      _ditherCapsule(o, w, h, fx + offX, fy + offY, sz * 0.7, sz * 0.5, ang + Math.PI * 0.5, sampleV, opts.opacity * 0.7);
     }
   }
 
-  // Refinement pass: walk the downsampled label grid, find pixels on
-  // region borders, occasionally blend a small "wet" stroke straddling
-  // the border using the AVERAGE of both regions' colors. This gives
-  // the "the painter pulls background color and refines the form" look
-  // without softening the whole canvas.
+  // ── REFINEMENT ── walk the label grid, find borders, drop short
+  // border strokes that PULL color from the neighbor region into ours.
+  // This is the "painter takes some background color and refines the
+  // form" move — softens hard region boundaries without softening the
+  // whole image. Bayer-dithered like everything else.
   function _ditherRefineRegionEdges(o, px, seg, w, h, opts) {
     const seed = (opts.seed | 0) ^ 0x4242;
     const { dw, dh, scale, labels } = seg;
@@ -1620,22 +1767,44 @@ const DitherAlgorithms = (() => {
         const sy2 = Math.max(0, Math.min(h - 1, ofy | 0));
         const myC = px[sy1 * w + sx1];
         const otherC = px[sy2 * w + sx2];
-        const blend = Math.round((myC + otherC) * 0.5);
-        const ang = Math.atan2(ofy - fy, ofx - fx) + Math.PI * 0.5
-          + (_advHash01(seed, x, y, 7802) - 0.5) * 0.6;
-        const sz = Math.max(2, Math.round(scale * 0.85));
-        _ditherCapsule(o, w, h, (fx + ofx) * 0.5, (fy + ofy) * 0.5, sz * 1.3, sz * 0.55, ang, blend, 0.55);
+        // Mix favoring the OTHER region's color (we're "pulling" their
+        // color in), not 50/50.
+        const blend = Math.round(myC * 0.35 + otherC * 0.65);
+        const ang = Math.atan2(ofy - fy, ofx - fx)
+          + (_advHash01(seed, x, y, 7802) - 0.5) * 0.5;
+        const sz = Math.max(2, Math.round(scale * 0.95));
+        _ditherCapsule(o, w, h, (fx + ofx) * 0.5, (fy + ofy) * 0.5, sz * 1.4, sz * 0.55, ang, blend, 0.78);
       }
     }
   }
 
-  // Top-level orchestrator. Run after the underpaint base is laid down.
+  // Compute average luma of a buffer — used to pick the canvas tone for
+  // each channel when the region builder starts from scratch.
+  function _ditherChannelMean(px) {
+    let sum = 0;
+    const stride = Math.max(1, ((px.length) / 4096) | 0);
+    let n = 0;
+    for (let i = 0; i < px.length; i += stride) { sum += px[i]; n++; }
+    return Math.round(sum / Math.max(1, n));
+  }
+
+  // Top-level orchestrator. Wipes `o` to a per-channel-average tonal
+  // canvas (so we BUILD FROM SCRATCH instead of painting translucent
+  // marks over the source), then segments / plans / executes the
+  // primitive sequences for each region, then refines edges.
   // gray must be the luminance map (single Uint8Array); on a per-channel
   // pipeline, pass toneGuide.fields.gray.value so all three channels
   // segment + plan identically.
-  function paintRegionAware(o, px, w, h, gray, edgeAng, sh, opts) {
+  function paintRegionAware(o, px, w, h, gray, edgeMag, edgeAng, sh, opts) {
     opts = opts || {};
-    const seg = _ditherRegionSegment(gray, w, h, opts.bands || 6);
+    // Reset to a flat tonal canvas — the painter's prepared ground.
+    // Per-channel average means each R/G/B starts at its mean tone, so
+    // the recombined RGB ground is roughly the average color of the
+    // image — a neutral painter's prep, not a bleed-through of source.
+    const tone = (opts.canvasTone != null) ? opts.canvasTone : _ditherChannelMean(px);
+    o.fill(tone);
+
+    const seg = _ditherRegionSegment(gray, edgeMag, w, h, opts.bands || 6);
     const agendas = _ditherRegionPlan(seg, opts.seed | 0);
     for (let a = 0; a < agendas.length; a++) {
       const ag = agendas[a];
@@ -3916,7 +4085,7 @@ const DitherAlgorithms = (() => {
       const grayBuf = (toneGuide && toneGuide.fields && toneGuide.fields.gray && toneGuide.fields.gray.value)
         ? toneGuide.fields.gray.value
         : px;
-      paintRegionAware(o, px, w, h, grayBuf, edgeAng, sh, {
+      paintRegionAware(o, px, w, h, grayBuf, edgeMag, edgeAng, sh, {
         seed: seedI,
         bands: (p.regionBands != null) ? p.regionBands : 6,
         opacity: 0.92,
@@ -8169,7 +8338,7 @@ const DitherAlgorithms = (() => {
       const grayBuf = (toneGuide && toneGuide.fields && toneGuide.fields.gray && toneGuide.fields.gray.value)
         ? toneGuide.fields.gray.value
         : px;
-      paintRegionAware(o, px, w, h, grayBuf, edgeAng, sh, {
+      paintRegionAware(o, px, w, h, grayBuf, edgeMag, edgeAng, sh, {
         seed: seedI,
         bands: (p.regionBands != null) ? p.regionBands : 6,
         opacity: 0.90,
