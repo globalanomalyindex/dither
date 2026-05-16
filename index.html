@@ -15,8 +15,8 @@
   <title>DITHER / TECHNICAL SPECIMEN</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=61">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=63">
 </head>
 <body>
   <div id="app">
@@ -790,11 +790,11 @@
     </div>
   </div>
 
-  <script src="dither.js?v=61"></script>
-  <script src="engine.js?v=61"></script>
-  <script src="grain.js?v=61"></script>
-  <script src="paintstroke.js?v=61"></script>
-  <script src="app.js?v=61"></script>
+  <script src="dither.js?v=62"></script>
+  <script src="engine.js?v=62"></script>
+  <script src="grain.js?v=62"></script>
+  <script src="paintstroke.js?v=62"></script>
+  <script src="app.js?v=62"></script>
   <script>
     // Range fill — paint the slider track up to the current value so the
     // hi-vis signal color reads as a filled segment, not just a thumb.
@@ -816,6 +816,135 @@
       const mo = new MutationObserver(() => initAll());
       mo.observe(document.body, { childList: true, subtree: true });
       initAll();
+    })();
+
+    // Collapsible sidebar sections — the original layout fans out every
+    // section flat, which makes the page feel overwhelming. We wrap each
+    // section's body in a single element so we can max-height animate it,
+    // add a chevron toggle to every section header, and start a handful
+    // of advanced sections collapsed by default. The wrapper is added
+    // post-load so dynamic content (params, brushes, swatches) still
+    // targets IDs correctly — IDs survive nesting.
+    (() => {
+      const COLLAPSE_BY_DEFAULT = new Set([
+        'tone lock', 'wet paint', 'pen / stylus', 'layer', 'tool options'
+      ]);
+      const init = () => {
+        document.querySelectorAll('.sidebar-section').forEach(sec => {
+          if (sec.dataset.collapseReady) return;
+          sec.dataset.collapseReady = '1';
+          const header = sec.querySelector('.section-header');
+          if (!header) return;
+          // Wrap everything after the header
+          const body = document.createElement('div');
+          body.className = 'sidebar-section-body';
+          const after = Array.from(sec.children).filter(c => c !== header);
+          after.forEach(n => body.appendChild(n));
+          sec.appendChild(body);
+          // Add chevron + clickable area on header
+          const chevron = document.createElement('span');
+          chevron.className = 'section-toggle';
+          chevron.setAttribute('aria-hidden', 'true');
+          chevron.textContent = '▾';
+          header.appendChild(chevron);
+          header.style.cursor = 'pointer';
+          header.addEventListener('click', (e) => {
+            // Don't collapse when clicking interactive controls in the header
+            if (e.target.closest('button, input, select, .btn-dice')) return;
+            sec.classList.toggle('collapsed');
+          });
+          // Default-collapsed sections
+          const h2text = (sec.querySelector('h2')?.textContent || '').trim().toLowerCase();
+          if (COLLAPSE_BY_DEFAULT.has(h2text)) sec.classList.add('collapsed');
+        });
+      };
+      // Init on DOM ready, then re-run when new sections appear (tab swap)
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+      else init();
+      new MutationObserver(() => init()).observe(document.body, { childList: true, subtree: true });
+    })();
+
+    // Algorithm search — the algorithm list is ~50 entries grouped into
+    // 12 categories. A filter input at the top makes it scannable.
+    (() => {
+      const wireSearch = () => {
+        const algoSection = Array.from(document.querySelectorAll('.sidebar-section h2'))
+          .find(h => h.textContent.trim().toLowerCase() === 'algorithms')?.closest('.sidebar-section');
+        if (!algoSection || algoSection.dataset.searchReady) return;
+        algoSection.dataset.searchReady = '1';
+        const body = algoSection.querySelector('.sidebar-section-body') || algoSection;
+        const hint = body.querySelector('.sidebar-hint');
+        const searchWrap = document.createElement('div');
+        searchWrap.className = 'algo-search-wrap';
+        searchWrap.innerHTML = '<span class="algo-search-glyph">⌕</span><input type="search" class="algo-search-input" placeholder="Filter algorithms…" autocomplete="off" spellcheck="false">';
+        if (hint) hint.after(searchWrap); else body.insertBefore(searchWrap, body.firstChild);
+        const input = searchWrap.querySelector('input');
+        input.addEventListener('input', () => {
+          const q = input.value.trim().toLowerCase();
+          const items = body.querySelectorAll('.algo-item');
+          items.forEach(it => {
+            const name = it.querySelector('.algo-name')?.textContent?.toLowerCase() || '';
+            it.style.display = (!q || name.includes(q)) ? '' : 'none';
+          });
+          // Hide categories that have no visible items
+          body.querySelectorAll('.algo-category').forEach(cat => {
+            const visible = Array.from(cat.querySelectorAll('.algo-item')).some(it => it.style.display !== 'none');
+            cat.style.display = (!q || visible) ? '' : 'none';
+          });
+        });
+      };
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireSearch);
+      else wireSearch();
+      new MutationObserver(() => wireSearch()).observe(document.body, { childList: true, subtree: true });
+    })();
+
+    // Pixel ripple — fires when DITHER or GRAIN starts a render so the
+    // user gets a satisfying piece of feedback that the pipeline is
+    // working. NOT fired for PAINTSTROKE because that re-renders many
+    // times per second as the user paints — a ripple would strobe.
+    // Trigger: bound to clicks on common kick-off controls + a global
+    // dither-render-start custom event the engine can dispatch later.
+    (() => {
+      let cooldown = 0;
+      window.triggerDitherRipple = () => {
+        const tab = document.body.classList.contains('tab-paintstroke') ? null : 'go';
+        if (!tab) return;
+        const now = performance.now();
+        if (now - cooldown < 220) return; // throttle so rapid changes don't overlap
+        cooldown = now;
+        const wrap = document.getElementById('canvas-wrapper');
+        if (!wrap) return;
+        const r = document.createElement('div');
+        r.className = 'render-ripple';
+        // Tint by active tab signal
+        const tint = document.body.classList.contains('tab-grain') ? '#E84393' : '#FF5E1A';
+        r.style.setProperty('--ripple-color', tint);
+        wrap.appendChild(r);
+        r.addEventListener('animationend', () => r.remove(), { once: true });
+        // Safety: clean up even if animationend is missed
+        setTimeout(() => r.remove(), 1200);
+      };
+      // Fire on common render-triggering controls
+      const triggerSelectors = [
+        '#btn-randomize-all', '#btn-bake',
+        '.algo-item', '.btn-dice',
+        '#style-preset', '#color-mode',
+        '.tone-lock-label', '.tone-lock-chip',
+        '.paint-tool-btn'  // (no-op when on paint tab — guarded above)
+      ];
+      document.addEventListener('click', (e) => {
+        if (document.body.classList.contains('tab-paintstroke')) return;
+        if (triggerSelectors.some(s => e.target.closest(s))) {
+          window.triggerDitherRipple();
+        }
+      }, true);
+      // Fire on slider commits in dither/grain
+      document.addEventListener('change', (e) => {
+        if (document.body.classList.contains('tab-paintstroke')) return;
+        if (e.target.matches('input[type="range"], input[type="checkbox"], select')) {
+          window.triggerDitherRipple();
+        }
+      }, true);
     })();
   </script>
 </body>

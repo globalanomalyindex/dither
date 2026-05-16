@@ -156,6 +156,17 @@ body.tab-dither { --tab-signal: var(--tab-dither); --tab-signal-glow: rgba(255,9
 body.tab-grain  { --tab-signal: var(--tab-grain);  --tab-signal-glow: rgba(232,67,147,0.30); --tab-signal-tint: rgba(232,67,147,0.10); }
 body.tab-paintstroke  { --tab-signal: var(--tab-paint);  --tab-signal-glow: rgba(109,237,240,0.30); --tab-signal-tint: rgba(109,237,240,0.08); }
 
+/* Custom pixel-art display face — used for the "image" hero word and a
+   handful of other special-moment accents. Pixelated by design, so we
+   keep auto kerning off and let the file's bitmap glyphs render crisp. */
+@font-face {
+  font-family: 'AstheticPixel';
+  src: url('fonts/AstheticPixel-Regular.otf') format('opentype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* ── 02 · RESET & BASE ───────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
@@ -616,13 +627,32 @@ button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--tab-signal), 0
   text-align: center;
 }
 .drop-zone-display em {
-  font-family: var(--font-serif);
-  font-style: italic;
+  font-family: 'AstheticPixel', var(--font-mono);
+  font-style: normal;
   font-weight: 400;
-  color: var(--signal);
-  font-size: 78px;
+  font-size: 96px;
   line-height: 0.9;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
+  image-rendering: pixelated;
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: grayscale;
+  font-smooth: never;
+  animation: hero-color-cycle 9s steps(1) infinite;
+  text-shadow:
+    0 0 24px var(--hero-glow, var(--signal-glow)),
+    0 0 48px var(--hero-glow, var(--signal-glow));
+}
+
+/* Multi-color cycle — moves through the three tab signals + a couple
+   extra hues so the moment never feels static. The shadow color tracks
+   each step via --hero-glow so the bloom matches the letter color. */
+@keyframes hero-color-cycle {
+  0%   { color: #FF5E1A; --hero-glow: rgba(255,94,26,0.45);   /* amber */ }
+  20%  { color: #6DEDF0; --hero-glow: rgba(109,237,240,0.45); /* cyan */ }
+  40%  { color: #E84393; --hero-glow: rgba(232,67,147,0.45);  /* magenta */ }
+  60%  { color: #B79CFF; --hero-glow: rgba(183,156,255,0.45); /* violet */ }
+  80%  { color: #FFD60A; --hero-glow: rgba(255,214,10,0.45);  /* yellow */ }
+  100% { color: #FF5E1A; --hero-glow: rgba(255,94,26,0.45);   /* amber */ }
 }
 .drop-zone-line-3 {
   font-family: var(--font-mono);
@@ -1019,6 +1049,125 @@ button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--tab-signal), 0
 }
 
 .sub-controls { margin-top: 10px; }
+
+/* Collapsible sections ── click the header to fold/unfold. Default-open;
+   default-closed sections get .collapsed in JS. */
+.section-toggle {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--paper-muted);
+  margin-left: 8px;
+  display: inline-block;
+  transition: transform var(--t-fast), color var(--t-fast);
+  transform-origin: center 60%;
+  user-select: none;
+  line-height: 1;
+}
+.sidebar-section .section-header:hover .section-toggle { color: var(--tab-signal); }
+.sidebar-section.collapsed .section-toggle { transform: rotate(-90deg); color: var(--tab-signal); }
+.sidebar-section .section-header { transition: padding var(--t-fast); }
+.sidebar-section.collapsed .section-header { margin-bottom: 0; }
+
+.sidebar-section-body {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 280ms var(--ease), opacity 200ms var(--ease);
+  overflow: hidden;
+}
+.sidebar-section-body > * {
+  min-height: 0;
+  overflow: hidden;
+}
+/* For the wrapped inner content, we need to allow it to grow naturally.
+   The grid-template-rows trick handles smooth height animation: 1fr (open)
+   ⇄ 0fr (collapsed). Inner wrapper is a single div so this works. */
+.sidebar-section.collapsed .sidebar-section-body {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Algorithm search input — sits above the category list */
+.algo-search-wrap {
+  position: relative;
+  margin: 0 0 12px;
+}
+.algo-search-glyph {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--paper-muted);
+  font-size: 13px;
+  pointer-events: none;
+  font-family: var(--font-mono);
+}
+.algo-search-input {
+  width: 100%;
+  padding: 9px 12px 9px 32px;
+  background: var(--ink-000);
+  border: 1px solid var(--rule);
+  border-radius: var(--r-1);
+  color: var(--paper);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  outline: none;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+.algo-search-input::placeholder {
+  color: var(--paper-muted);
+  letter-spacing: 0.08em;
+}
+.algo-search-input:focus {
+  border-color: var(--tab-signal);
+  background: var(--ink-100);
+  box-shadow: 0 0 0 1px var(--tab-signal);
+}
+.algo-search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px; height: 12px;
+  background: var(--paper-muted);
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2 2L10 10M10 2L2 10' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E") center/contain no-repeat;
+  cursor: pointer;
+}
+
+/* Pixel ripple ── appears over the canvas as a render kicks off. The
+   stepped radial gradient + image-rendering:pixelated gives the chunky
+   pixel-art edge. Color is set from JS via --ripple-color so it tracks
+   the active tab signal. */
+.render-ripple {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 5;
+  transform: translate(-50%, -50%) scale(1);
+  background:
+    radial-gradient(circle at center,
+      var(--ripple-color, var(--signal)) 0%,
+      var(--ripple-color, var(--signal)) 38%,
+      transparent 40%,
+      transparent 52%,
+      var(--ripple-color, var(--signal)) 54%,
+      var(--ripple-color, var(--signal)) 60%,
+      transparent 62%,
+      transparent 76%,
+      var(--ripple-color, var(--signal)) 78%,
+      var(--ripple-color, var(--signal)) 84%,
+      transparent 86%);
+  filter: blur(0.2px);
+  image-rendering: pixelated;
+  mix-blend-mode: screen;
+  animation: pixel-ripple 700ms steps(14) forwards;
+}
+@keyframes pixel-ripple {
+  0%   { width: 6px;   height: 6px;   opacity: 0.0; }
+  10%  { opacity: 0.95; }
+  100% { width: 220vmax; height: 220vmax; opacity: 0; }
+}
 
 /* ── 10 · FORM CONTROLS ──────────────────────────────────────────────── */
 .param-group { margin-bottom: 14px; }
@@ -2790,5 +2939,5 @@ body.processing #btn-apply-algorithm {
   .cb-draw-top, .cb-sample-top { flex-direction: column; }
   .cb-slots { grid-template-columns: 1fr; }
   .drop-zone-display { font-size: 44px; }
-  .drop-zone-display em { font-size: 54px; }
+  .drop-zone-display em { font-size: 64px; }
 }
