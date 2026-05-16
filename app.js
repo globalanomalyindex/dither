@@ -1015,6 +1015,9 @@
     setImageInfo(width, height, file.name);
     dropZone.style.display = 'none';
     workspace.classList.remove('hidden');
+    // Dim the cursor-reactive dot field while an image is loaded so it
+    // doesn't compete with the canvas. CSS cross-fades the opacity.
+    document.body.classList.add('has-image');
     $('btn-export').disabled = false;
     $('btn-bake').disabled = false;
     $('btn-reset').disabled = false;

@@ -15,10 +15,11 @@
   <title>DITHER / TECHNICAL SPECIMEN</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=63">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Archivo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=64">
 </head>
 <body>
+  <canvas id="dot-field" aria-hidden="true"></canvas>
   <div id="app">
     <header>
       <div class="brand">
@@ -30,27 +31,20 @@
         </div>
         <div class="brand-wordmark">
           <span class="brand-name">DITHER</span>
-          <span class="brand-meta">REV.0061 · TECHNICAL SPECIMEN</span>
         </div>
       </div>
       <div class="tab-group" role="tablist">
-        <button class="tab-btn active" data-tab="dither"><span class="tab-idx">01</span><span class="tab-name">DITHER</span></button>
-        <button class="tab-btn" data-tab="grain"><span class="tab-idx">02</span><span class="tab-name">GRAIN</span></button>
-        <button class="tab-btn" data-tab="paintstroke"><span class="tab-idx">03</span><span class="tab-name">PAINT</span></button>
+        <button class="tab-btn active" data-tab="dither">Dither</button>
+        <button class="tab-btn" data-tab="grain">Grain</button>
+        <button class="tab-btn" data-tab="paintstroke">Paint</button>
       </div>
       <div class="header-actions">
         <button id="btn-randomize-all" class="btn-fun" title="Randomize everything">
-          <span class="btn-glyph">⤬</span><span>Shuffle</span>
+          <span class="btn-glyph">✦</span><span>Shuffle</span>
         </button>
-        <button id="btn-upload" class="btn-primary">
-          <span class="btn-glyph">↗</span><span>Upload</span>
-        </button>
-        <button id="btn-bake" class="btn-bake" disabled title="Bake current edits into the image">
-          <span class="btn-glyph">●</span><span>Bake</span>
-        </button>
-        <button id="btn-export" class="btn-secondary" disabled>
-          <span class="btn-glyph">↧</span><span>Export</span>
-        </button>
+        <button id="btn-upload" class="btn-primary">Upload</button>
+        <button id="btn-bake" class="btn-bake" disabled title="Bake current edits into the image">Bake</button>
+        <button id="btn-export" class="btn-secondary" disabled>Export</button>
         <button id="btn-reset" class="btn-ghost" disabled>Reset</button>
         <span class="undo-redo-group">
           <button id="btn-undo" class="btn-icon" disabled title="Undo (Alt+Z)">↶</button>
@@ -61,33 +55,11 @@
 
     <main>
       <div id="drop-zone" class="drop-zone">
-        <div class="drop-zone-grid" aria-hidden="true"></div>
-        <div class="drop-zone-bracket drop-zone-bracket-tl" aria-hidden="true"></div>
-        <div class="drop-zone-bracket drop-zone-bracket-tr" aria-hidden="true"></div>
-        <div class="drop-zone-bracket drop-zone-bracket-bl" aria-hidden="true"></div>
-        <div class="drop-zone-bracket drop-zone-bracket-br" aria-hidden="true"></div>
         <div class="drop-zone-content">
-          <div class="drop-zone-tag">[ 00 ] / INPUT MODULE / AWAITING SOURCE</div>
-          <div class="drop-zone-display">
-            <span class="drop-zone-line-1">DROP</span>
-            <span class="drop-zone-line-2"><em>image</em></span>
-            <span class="drop-zone-line-3">to ingest</span>
-          </div>
-          <div class="drop-zone-pattern" aria-hidden="true">
-            <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
-          </div>
-          <div class="drop-zone-actions">
-            <button class="drop-zone-cta" type="button" onclick="document.getElementById('btn-upload').click()">
-              <span class="drop-zone-cta-arrow">↗</span>
-              <span>Browse files</span>
-            </button>
-            <span class="drop-zone-spec">PNG · JPG · WEBP · BMP · ANY SIZE</span>
-          </div>
-        </div>
-        <div class="drop-zone-footer" aria-hidden="true">
-          <span>EXT · IMG · BUFFER</span>
-          <span>DRAG / DROP</span>
-          <span>CH:A · STATE:IDLE</span>
+          <h1 class="drop-zone-display">
+            drop <em>image</em>
+          </h1>
+          <p class="drop-zone-hint">or click anywhere to browse</p>
         </div>
       </div>
 
@@ -95,33 +67,17 @@
         <div class="canvas-container">
           <div class="canvas-header">
             <div class="canvas-header-left">
-              <span class="canvas-header-tag">VIEWPORT</span>
               <span id="image-info" class="image-info"></span>
             </div>
             <div class="zoom-controls">
-              <span class="canvas-header-tag">ZOOM</span>
-              <button id="btn-fit" class="btn-icon" title="Fit to view">FIT</button>
+              <button id="btn-fit" class="btn-icon" title="Fit to view">Fit</button>
               <button id="btn-1x" class="btn-icon" title="100%">1:1</button>
               <span id="zoom-level" class="zoom-label">100%</span>
             </div>
           </div>
           <div id="canvas-wrapper" class="canvas-wrapper">
-            <div class="canvas-crosshair canvas-crosshair-h" aria-hidden="true"></div>
-            <div class="canvas-crosshair canvas-crosshair-v" aria-hidden="true"></div>
-            <div class="canvas-corner canvas-corner-tl" aria-hidden="true"></div>
-            <div class="canvas-corner canvas-corner-tr" aria-hidden="true"></div>
-            <div class="canvas-corner canvas-corner-bl" aria-hidden="true"></div>
-            <div class="canvas-corner canvas-corner-br" aria-hidden="true"></div>
             <div id="canvas-alpha-badge" class="canvas-alpha-badge hidden">Transparency</div>
             <canvas id="canvas-preview"></canvas>
-          </div>
-          <div class="canvas-statusbar">
-            <span class="status-cell"><span class="status-dot"></span>READY</span>
-            <span class="status-cell">PIPELINE · LIVE</span>
-            <span class="status-cell">COLOR · sRGB</span>
-            <span class="status-cell">DEPTH · 8-BIT</span>
-            <span class="status-cell status-cell-flex"></span>
-            <span class="status-cell">DITHER v.0061</span>
           </div>
         </div>
 
@@ -790,11 +746,11 @@
     </div>
   </div>
 
-  <script src="dither.js?v=62"></script>
-  <script src="engine.js?v=62"></script>
-  <script src="grain.js?v=62"></script>
-  <script src="paintstroke.js?v=62"></script>
-  <script src="app.js?v=62"></script>
+  <script src="dither.js?v=64"></script>
+  <script src="engine.js?v=64"></script>
+  <script src="grain.js?v=64"></script>
+  <script src="paintstroke.js?v=64"></script>
+  <script src="app.js?v=64"></script>
   <script>
     // Range fill — paint the slider track up to the current value so the
     // hi-vis signal color reads as a filled segment, not just a thumb.
@@ -898,51 +854,212 @@
       new MutationObserver(() => wireSearch()).observe(document.body, { childList: true, subtree: true });
     })();
 
-    // Pixel ripple — fires when DITHER or GRAIN starts a render so the
-    // user gets a satisfying piece of feedback that the pipeline is
-    // working. NOT fired for PAINTSTROKE because that re-renders many
-    // times per second as the user paints — a ripple would strobe.
-    // Trigger: bound to clicks on common kick-off controls + a global
-    // dither-render-start custom event the engine can dispatch later.
+    // ── Cursor-reactive dot field ────────────────────────────────────
+    // The whole-app background. A grid of dots that scales and brightens
+    // toward the cursor, breathes slowly when idle, and lets a handful of
+    // colored dots drift their hue over minutes. Pauses itself when the
+    // tab is hidden or the page is fully obscured (workspace dims it).
     (() => {
+      const canvas = document.getElementById('dot-field');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      let w = 0, h = 0;
+      let mx = -9999, my = -9999;
+      let pmx = -9999, pmy = -9999;
+      let lastMove = 0;
+      let raf = null;
+
+      const SPACING = 22;
+      const BASE_R = 0.9;
+      const MAX_R = 4.2;
+      const INFLUENCE = 160;
+      // A handful of dots are 'colored' — index → hue offset.
+      // We seed it lazily after the first resize so the pattern follows
+      // the grid count, not the viewport.
+      let colored = new Map();
+      const HUES = [22, 200, 320, 270, 50]; // amber, cyan, magenta, violet, yellow
+
+      const resize = () => {
+        const r = canvas.getBoundingClientRect();
+        w = Math.max(1, r.width);
+        h = Math.max(1, r.height);
+        canvas.width  = Math.floor(w * dpr);
+        canvas.height = Math.floor(h * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        // re-seed the sparse colored dots based on the grid that fits
+        colored.clear();
+        const cols = Math.ceil(w / SPACING) + 1;
+        const rows = Math.ceil(h / SPACING) + 1;
+        const total = cols * rows;
+        // ~2.5% of dots are colored — enough to feel alive, not festive
+        const n = Math.max(12, Math.floor(total * 0.025));
+        for (let i = 0; i < n; i++) {
+          const idx = Math.floor(Math.random() * total);
+          colored.set(idx, HUES[i % HUES.length] + (Math.random() * 40 - 20));
+        }
+      };
+
+      const draw = (t) => {
+        ctx.clearRect(0, 0, w, h);
+        const time = t * 0.001;
+        const idle = Math.min(1, (t - lastMove) / 2000); // 0..1 as cursor goes quiet
+        const cols = Math.ceil(w / SPACING) + 1;
+        let idx = 0;
+        for (let y = SPACING * 0.5; y < h + SPACING; y += SPACING) {
+          for (let x = SPACING * 0.5; x < w + SPACING; x += SPACING, idx++) {
+            const dx = x - mx, dy = y - my;
+            const dist = Math.hypot(dx, dy);
+            const prox = Math.max(0, 1 - dist / INFLUENCE);
+            // soften the proximity falloff a touch for a velvety field
+            const e = prox * prox * (3 - 2 * prox);
+
+            // gentle breath wave — phase varies across grid so the field
+            // doesn't pulse as one slab
+            const wave = 0.5 + 0.5 * Math.sin(time * 1.2 + (x * 0.012) + (y * 0.009));
+            const breath = (idle * 0.35 + 0.10) * wave; // breathes more strongly when idle
+
+            const r = BASE_R + e * (MAX_R - BASE_R) + breath * 0.45;
+            const baseAlpha = 0.10 + breath * 0.10;
+            const alpha = Math.min(1, baseAlpha + e * 0.85);
+
+            const hue = colored.get(idx);
+            if (hue !== undefined) {
+              const driftHue = (hue + time * 6) % 360;
+              const sat = 70 - idle * 15;
+              const lig = 55 + e * 20;
+              ctx.fillStyle = `hsla(${driftHue}, ${sat}%, ${lig}%, ${Math.min(1, alpha + 0.15)})`;
+            } else {
+              ctx.fillStyle = `rgba(242, 240, 232, ${alpha})`;
+            }
+            ctx.beginPath();
+            ctx.arc(x, y, r, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+        raf = requestAnimationFrame(draw);
+      };
+
+      const start = () => { if (!raf) raf = requestAnimationFrame(draw); };
+      const stop  = () => { if (raf) { cancelAnimationFrame(raf); raf = null; } };
+
+      window.addEventListener('resize', resize);
+      document.addEventListener('mousemove', (e) => {
+        mx = e.clientX; my = e.clientY;
+        // small jitter check before re-priming "active" timing
+        if (Math.abs(mx - pmx) + Math.abs(my - pmy) > 1) lastMove = performance.now();
+        pmx = mx; pmy = my;
+      }, { passive: true });
+      document.addEventListener('mouseleave', () => { mx = my = -9999; });
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) stop(); else start();
+      });
+
+      resize();
+      start();
+    })();
+
+    // ── Bayer-dither ripple ──────────────────────────────────────────
+    // When DITHER or GRAIN starts a render, snapshot the current canvas,
+    // compute its Bayer-8x8 black-and-white dithered twin, lay it over
+    // the live canvas, and animate a radial clip from center so it looks
+    // like the dithering is sweeping across the image. NOT fired on the
+    // paintstroke tab — that re-renders constantly as the user paints.
+    (() => {
+      // Standard 8×8 Bayer matrix (normalized 0–1)
+      const BAYER = (() => {
+        const m = [
+          [ 0,32, 8,40, 2,34,10,42],
+          [48,16,56,24,50,18,58,26],
+          [12,44, 4,36,14,46, 6,38],
+          [60,28,52,20,62,30,54,22],
+          [ 3,35,11,43, 1,33, 9,41],
+          [51,19,59,27,49,17,57,25],
+          [15,47, 7,39,13,45, 5,37],
+          [63,31,55,23,61,29,53,21]
+        ];
+        // /64 to keep on [0,1)
+        return m.map(row => row.map(v => v / 64));
+      })();
+
       let cooldown = 0;
       window.triggerDitherRipple = () => {
-        const tab = document.body.classList.contains('tab-paintstroke') ? null : 'go';
-        if (!tab) return;
+        if (document.body.classList.contains('tab-paintstroke')) return;
         const now = performance.now();
-        if (now - cooldown < 220) return; // throttle so rapid changes don't overlap
+        if (now - cooldown < 280) return;
         cooldown = now;
-        const wrap = document.getElementById('canvas-wrapper');
-        if (!wrap) return;
-        const r = document.createElement('div');
-        r.className = 'render-ripple';
-        // Tint by active tab signal
-        const tint = document.body.classList.contains('tab-grain') ? '#E84393' : '#FF5E1A';
-        r.style.setProperty('--ripple-color', tint);
-        wrap.appendChild(r);
-        r.addEventListener('animationend', () => r.remove(), { once: true });
-        // Safety: clean up even if animationend is missed
-        setTimeout(() => r.remove(), 1200);
+
+        const src = document.getElementById('canvas-preview');
+        if (!src || !src.width || !src.height) return;
+
+        // Snapshot current pixels and dither them
+        const overlay = document.createElement('canvas');
+        overlay.width = src.width;
+        overlay.height = src.height;
+        const octx = overlay.getContext('2d');
+        octx.drawImage(src, 0, 0);
+        let img;
+        try { img = octx.getImageData(0, 0, overlay.width, overlay.height); }
+        catch (_) { return; /* tainted canvas — bail silently */ }
+
+        const data = img.data;
+        const W = overlay.width;
+        const H = overlay.height;
+        for (let y = 0; y < H; y++) {
+          const row = BAYER[y & 7];
+          for (let x = 0; x < W; x++) {
+            const i = (y * W + x) << 2;
+            const lum = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+            // Pure 1-bit Bayer threshold = brutal but readable.
+            // Compare luminance/255 to the matrix sample.
+            const out = lum / 255 > row[x & 7] ? 245 : 14;
+            data[i] = data[i+1] = data[i+2] = out;
+            // keep alpha intact for transparent images
+          }
+        }
+        octx.putImageData(img, 0, 0);
+
+        // Match the live canvas's transform so the overlay sits exactly on top
+        overlay.className = 'bayer-ripple-overlay';
+        const cs = window.getComputedStyle(src);
+        overlay.style.left = src.style.left || cs.left;
+        overlay.style.top = src.style.top || cs.top;
+        overlay.style.width = src.style.width || (W + 'px');
+        overlay.style.height = src.style.height || (H + 'px');
+        overlay.style.transform = cs.transform;
+        overlay.style.transformOrigin = cs.transformOrigin;
+        src.parentNode.appendChild(overlay);
+
+        // Start with a tiny clip-path circle, then expand. CSS handles
+        // the easing + a soft tail fade.
+        overlay.style.clipPath = 'circle(0% at 50% 50%)';
+        overlay.getBoundingClientRect(); // flush
+        requestAnimationFrame(() => {
+          overlay.classList.add('bayer-ripple-open');
+        });
+        setTimeout(() => overlay.classList.add('bayer-ripple-fade'), 360);
+        setTimeout(() => overlay.remove(), 1100);
       };
-      // Fire on common render-triggering controls
+
+      // Fire on common render-triggering controls (excludes paintstroke)
       const triggerSelectors = [
         '#btn-randomize-all', '#btn-bake',
         '.algo-item', '.btn-dice',
         '#style-preset', '#color-mode',
-        '.tone-lock-label', '.tone-lock-chip',
-        '.paint-tool-btn'  // (no-op when on paint tab — guarded above)
+        '.tone-lock-label', '.tone-lock-chip'
       ];
       document.addEventListener('click', (e) => {
         if (document.body.classList.contains('tab-paintstroke')) return;
         if (triggerSelectors.some(s => e.target.closest(s))) {
-          window.triggerDitherRipple();
+          // Defer one frame so the engine kicks off and updates the canvas
+          // before we snapshot — gives a more satisfying "look at this" moment.
+          setTimeout(() => window.triggerDitherRipple(), 32);
         }
       }, true);
-      // Fire on slider commits in dither/grain
       document.addEventListener('change', (e) => {
         if (document.body.classList.contains('tab-paintstroke')) return;
         if (e.target.matches('input[type="range"], input[type="checkbox"], select')) {
-          window.triggerDitherRipple();
+          setTimeout(() => window.triggerDitherRipple(), 32);
         }
       }, true);
     })();
