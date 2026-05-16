@@ -568,35 +568,29 @@ button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--tab-signal), 0
   text-align: center;
   margin: 0;
   display: inline-flex;
-  align-items: baseline;
-  gap: 0.18em;
+  align-items: center;
+  gap: 0.22em;
 }
-.drop-zone-display em {
-  font-family: 'AstheticPixel', var(--font-display);
-  font-style: normal;
-  font-weight: 400;
-  /* No font-size override: inherits from .drop-zone-display so the
-     pixel face sits at the same optical size as the bold sans. */
-  letter-spacing: 0;
+.drop-zone-word { display: inline-block; }
+.drop-zone-image {
+  display: inline-flex;
+  align-items: center;
+  /* Height set to optical x/cap height of the surrounding sans so the
+     canvas baseline reads with the word. Width is driven by canvas
+     aspect-ratio once JS measures the rendered text. */
+  height: 0.86em;
+}
+.drop-zone-image canvas {
+  display: block;
+  height: 100%;
+  width: auto;
+  /* Default aspect until JS measures the real one; "image" in
+     AstheticPixel is roughly 3.2:1 at the size we render it. */
+  aspect-ratio: 3.2 / 1;
   image-rendering: pixelated;
-  -webkit-font-smoothing: none;
-  -moz-osx-font-smoothing: grayscale;
-  font-smooth: never;
-  /* Color cycles only — no glow, no halo, no bloom. */
-  animation: hero-color-cycle 9s steps(1) infinite;
-  /* tiny vertical nudge so the pixel font's baseline aligns with the sans */
-  position: relative;
-  top: 0.02em;
 }
-
-@keyframes hero-color-cycle {
-  0%   { color: #FF5E1A; } /* amber */
-  20%  { color: #6DEDF0; } /* cyan */
-  40%  { color: #E84393; } /* magenta */
-  60%  { color: #B79CFF; } /* violet */
-  80%  { color: #FFD60A; } /* yellow */
-  100% { color: #FF5E1A; }
-}
+/* (legacy .drop-zone-display em removed — hero is rendered by JS into
+   #hero-canvas below) */
 /* Hint text under the headline — small and quiet */
 .drop-zone .drop-zone-hint {
   font-family: var(--font-sans);
@@ -734,17 +728,20 @@ button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--tab-signal), 0
 }
 
 .sidebar-section {
-  padding: 18px 22px 20px;
+  /* Bottom padding lives in .sidebar-section-inner so it collapses with the
+     body when the section is folded. Section itself only owns the top inset
+     and side padding so the section header always has clean breathing room. */
+  padding: 14px 22px 0;
   border-bottom: 1px solid var(--rule);
   position: relative;
 }
 
-/* Section header: index + name + dice */
+/* Section header: name + optional dice button + chevron toggle */
 .section-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 14px;
+  margin-bottom: 0; /* gap to body lives on .sidebar-section-inner padding-top */
   gap: 10px;
 }
 
@@ -771,39 +768,47 @@ button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--tab-signal), 0
 
 .sub-controls { margin-top: 10px; }
 
-/* Collapsible sections ── click the header to fold/unfold. Default-open;
-   default-closed sections get .collapsed in JS. */
+/* Collapsible sections ──
+   Structure:  .sidebar-section
+                 ├─ .section-header
+                 └─ .sidebar-section-body  (grid container, animates 1fr↔0fr)
+                      └─ .sidebar-section-inner  (single grid child)
+
+   The inner child owns all visible padding-top/bottom; when the body
+   collapses, that padding goes with it so collapsed sections shrink to
+   just the header. Without the inner wrapper, multiple children would
+   spill into implicit auto-rows that don't collapse. */
 .section-toggle {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 11px;
   color: var(--paper-muted);
   margin-left: 8px;
   display: inline-block;
-  transition: transform var(--t-fast), color var(--t-fast);
-  transform-origin: center 60%;
+  transition: transform var(--t-base), color var(--t-fast);
+  transform-origin: center 55%;
   user-select: none;
   line-height: 1;
 }
+.sidebar-section .section-header { padding: 4px 0; }
 .sidebar-section .section-header:hover .section-toggle { color: var(--tab-signal); }
 .sidebar-section.collapsed .section-toggle { transform: rotate(-90deg); color: var(--tab-signal); }
-.sidebar-section .section-header { transition: padding var(--t-fast); }
-.sidebar-section.collapsed .section-header { margin-bottom: 0; }
 
 .sidebar-section-body {
   display: grid;
   grid-template-rows: 1fr;
-  transition: grid-template-rows 280ms var(--ease), opacity 200ms var(--ease);
+  transition: grid-template-rows 280ms var(--ease);
   overflow: hidden;
 }
-.sidebar-section-body > * {
+.sidebar-section-body > .sidebar-section-inner {
   min-height: 0;
   overflow: hidden;
+  padding-top: 12px;
+  padding-bottom: 18px;
+  transition: opacity 200ms var(--ease);
+  opacity: 1;
 }
-/* For the wrapped inner content, we need to allow it to grow naturally.
-   The grid-template-rows trick handles smooth height animation: 1fr (open)
-   ⇄ 0fr (collapsed). Inner wrapper is a single div so this works. */
-.sidebar-section.collapsed .sidebar-section-body {
-  grid-template-rows: 0fr;
+.sidebar-section.collapsed .sidebar-section-body { grid-template-rows: 0fr; }
+.sidebar-section.collapsed .sidebar-section-body > .sidebar-section-inner {
   opacity: 0;
   pointer-events: none;
 }

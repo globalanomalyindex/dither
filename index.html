@@ -16,7 +16,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Archivo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=64">
+  <link rel="stylesheet" href="style.css?v=65">
 </head>
 <body>
   <canvas id="dot-field" aria-hidden="true"></canvas>
@@ -57,7 +57,10 @@
       <div id="drop-zone" class="drop-zone">
         <div class="drop-zone-content">
           <h1 class="drop-zone-display">
-            drop <em>image</em>
+            <span class="drop-zone-word">drop</span>
+            <span class="drop-zone-image">
+              <canvas id="hero-canvas" aria-label="image"></canvas>
+            </span>
           </h1>
           <p class="drop-zone-hint">or click anywhere to browse</p>
         </div>
@@ -746,11 +749,11 @@
     </div>
   </div>
 
-  <script src="dither.js?v=64"></script>
-  <script src="engine.js?v=64"></script>
-  <script src="grain.js?v=64"></script>
-  <script src="paintstroke.js?v=64"></script>
-  <script src="app.js?v=64"></script>
+  <script src="dither.js?v=65"></script>
+  <script src="engine.js?v=65"></script>
+  <script src="grain.js?v=65"></script>
+  <script src="paintstroke.js?v=65"></script>
+  <script src="app.js?v=65"></script>
   <script>
     // Range fill — paint the slider track up to the current value so the
     // hi-vis signal color reads as a filled segment, not just a thumb.
@@ -774,13 +777,14 @@
       initAll();
     })();
 
-    // Collapsible sidebar sections — the original layout fans out every
-    // section flat, which makes the page feel overwhelming. We wrap each
-    // section's body in a single element so we can max-height animate it,
-    // add a chevron toggle to every section header, and start a handful
-    // of advanced sections collapsed by default. The wrapper is added
-    // post-load so dynamic content (params, brushes, swatches) still
-    // targets IDs correctly — IDs survive nesting.
+    // Collapsible sidebar sections — wrap each section's children below the
+    // header into a TWO-LEVEL structure so the height collapses cleanly:
+    //   .sidebar-section-body  (the animated grid container, grid-template-rows 1fr↔0fr)
+    //     .sidebar-section-inner  (single grid child holding all content + bottom padding)
+    // Without the inner wrapper, multiple direct children would flow into
+    // implicit auto-rows that don't shrink — leaving leftover height after
+    // collapse. With one child, the grid track is the only thing that needs
+    // to collapse, and the inner's own padding-bottom goes with it.
     (() => {
       const COLLAPSE_BY_DEFAULT = new Set([
         'tone lock', 'wet paint', 'pen / stylus', 'layer', 'tool options'
@@ -791,13 +795,14 @@
           sec.dataset.collapseReady = '1';
           const header = sec.querySelector('.section-header');
           if (!header) return;
-          // Wrap everything after the header
           const body = document.createElement('div');
           body.className = 'sidebar-section-body';
+          const inner = document.createElement('div');
+          inner.className = 'sidebar-section-inner';
           const after = Array.from(sec.children).filter(c => c !== header);
-          after.forEach(n => body.appendChild(n));
+          after.forEach(n => inner.appendChild(n));
+          body.appendChild(inner);
           sec.appendChild(body);
-          // Add chevron + clickable area on header
           const chevron = document.createElement('span');
           chevron.className = 'section-toggle';
           chevron.setAttribute('aria-hidden', 'true');
@@ -805,16 +810,13 @@
           header.appendChild(chevron);
           header.style.cursor = 'pointer';
           header.addEventListener('click', (e) => {
-            // Don't collapse when clicking interactive controls in the header
             if (e.target.closest('button, input, select, .btn-dice')) return;
             sec.classList.toggle('collapsed');
           });
-          // Default-collapsed sections
           const h2text = (sec.querySelector('h2')?.textContent || '').trim().toLowerCase();
           if (COLLAPSE_BY_DEFAULT.has(h2text)) sec.classList.add('collapsed');
         });
       };
-      // Init on DOM ready, then re-run when new sections appear (tab swap)
       if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
       else init();
       new MutationObserver(() => init()).observe(document.body, { childList: true, subtree: true });
@@ -828,7 +830,7 @@
           .find(h => h.textContent.trim().toLowerCase() === 'algorithms')?.closest('.sidebar-section');
         if (!algoSection || algoSection.dataset.searchReady) return;
         algoSection.dataset.searchReady = '1';
-        const body = algoSection.querySelector('.sidebar-section-body') || algoSection;
+        const body = algoSection.querySelector('.sidebar-section-inner') || algoSection.querySelector('.sidebar-section-body') || algoSection;
         const hint = body.querySelector('.sidebar-hint');
         const searchWrap = document.createElement('div');
         searchWrap.className = 'algo-search-wrap';
@@ -852,6 +854,226 @@
       if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireSearch);
       else wireSearch();
       new MutationObserver(() => wireSearch()).observe(document.body, { childList: true, subtree: true });
+    })();
+
+    // ── Hero canvas: "image" rendered through DITHER's own algorithms ──
+    // We rasterize the word "image" in AstheticPixel once to get a pixel
+    // mask, then every frame redraw it using a moving Bayer 8x8 mask to
+    // modulate per-pixel visibility, a 5-color palette interpolated by
+    // position + time, and a subtle wave displacement. The word IS the
+    // product demonstrating itself: discrete, algorithmic, digital perfect.
+    // Pauses on tab switch and respects prefers-reduced-motion.
+    (() => {
+      const canvas = document.getElementById('hero-canvas');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d', { alpha: true });
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const TEXT = 'image';
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+      // 8×8 Bayer matrix, normalized to [0,1)
+      const BAYER = [
+        [ 0,32, 8,40, 2,34,10,42],
+        [48,16,56,24,50,18,58,26],
+        [12,44, 4,36,14,46, 6,38],
+        [60,28,52,20,62,30,54,22],
+        [ 3,35,11,43, 1,33, 9,41],
+        [51,19,59,27,49,17,57,25],
+        [15,47, 7,39,13,45, 5,37],
+        [63,31,55,23,61,29,53,21]
+      ].map(r => r.map(v => v / 64));
+
+      // DITHER's full character palette — 5 hues + paper white
+      const PALETTE = [
+        [255, 94,  26], // amber
+        [109, 237, 240], // cyan
+        [232, 67,  147], // magenta
+        [183, 156, 255], // violet
+        [255, 214, 10], // yellow
+        [242, 240, 232], // paper
+      ];
+
+      let cells = null;   // [{nx, ny}] normalized 0..1 within the word
+      let aspect = 3.2;
+      let dispW = 0, dispH = 0, cellPx = 0;
+      let raf = null;
+      let t0 = performance.now();
+
+      const buildMask = () => {
+        // Render the word at a fixed high-res size into an offscreen
+        // canvas, then sample on a coarse grid to get a chunky pixel mask
+        // (the AstheticPixel glyphs are already chunky — we just choose
+        // the resolution that makes them look intentional).
+        const off = document.createElement('canvas');
+        const fontPx = 256;
+        off.width  = fontPx * TEXT.length * 1.2;
+        off.height = fontPx * 1.5;
+        const o = off.getContext('2d');
+        o.font = `400 ${fontPx}px AstheticPixel, monospace`;
+        o.textBaseline = 'alphabetic';
+        o.fillStyle = '#fff';
+        o.fillText(TEXT, 0, fontPx * 1.1);
+        const img = o.getImageData(0, 0, off.width, off.height);
+        const data = img.data;
+
+        // Tight bounding box of non-transparent pixels
+        let minX = off.width, maxX = 0, minY = off.height, maxY = 0;
+        for (let y = 0; y < off.height; y++) {
+          for (let x = 0; x < off.width; x++) {
+            if (data[(y * off.width + x) * 4 + 3] > 16) {
+              if (x < minX) minX = x; if (x > maxX) maxX = x;
+              if (y < minY) minY = y; if (y > maxY) maxY = y;
+            }
+          }
+        }
+        const wPx = Math.max(1, maxX - minX + 1);
+        const hPx = Math.max(1, maxY - minY + 1);
+        aspect = wPx / hPx;
+
+        // Sample down to a chunky cell grid — gives ~30 cells across the
+        // height of the word. Each cell becomes one drawn pixel.
+        const CELLS_TALL = 28;
+        const cellSrc = Math.max(2, Math.floor(hPx / CELLS_TALL));
+        const out = [];
+        const ny_div = hPx;
+        const nx_div = wPx;
+        for (let y = 0; y < hPx; y += cellSrc) {
+          for (let x = 0; x < wPx; x += cellSrc) {
+            // Sample several pixels in the cell; require >50% filled to keep
+            const sx0 = minX + x;
+            const sy0 = minY + y;
+            const sxEnd = Math.min(off.width, sx0 + cellSrc);
+            const syEnd = Math.min(off.height, sy0 + cellSrc);
+            let hits = 0, total = 0;
+            for (let sy = sy0; sy < syEnd; sy++) {
+              for (let sx = sx0; sx < sxEnd; sx++) {
+                if (data[(sy * off.width + sx) * 4 + 3] > 16) hits++;
+                total++;
+              }
+            }
+            if (hits / total > 0.45) {
+              out.push({ nx: x / nx_div, ny: y / ny_div });
+            }
+          }
+        }
+        cells = out;
+        // Lock the canvas aspect-ratio CSS so the canvas frame matches
+        canvas.style.aspectRatio = aspect.toFixed(3) + ' / 1';
+      };
+
+      const resize = () => {
+        const r = canvas.getBoundingClientRect();
+        dispW = Math.max(1, r.width);
+        dispH = Math.max(1, r.height);
+        canvas.width  = Math.floor(dispW * dpr);
+        canvas.height = Math.floor(dispH * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        // Cell pixel size: divide canvas height by # vertical cells
+        const cellsTall = cells ? Math.max(1, ...cells.map(c => Math.floor(c.ny * 100))) : 28;
+        cellPx = dispH / 28;
+      };
+
+      const draw = () => {
+        if (!cells) return;
+        const now = performance.now();
+        const t = (now - t0) * 0.001;
+        ctx.clearRect(0, 0, dispW, dispH);
+
+        // Density floor is high so the word always reads. The shimmer
+        // pulse spikes density momentarily every ~3.4s for a "lock-in"
+        // moment where the word renders nearly solid before relaxing.
+        const baseDensity = 0.78 + 0.14 * Math.sin(t * 0.55);
+        const shimmerCycle = (t % 3.4) / 3.4;
+        const shimmer = shimmerCycle < 0.18
+          ? Math.pow(1 - shimmerCycle / 0.18, 2) * 0.30
+          : 0;
+        const density = Math.min(1.0, baseDensity + shimmer);
+
+        // Per-frame Bayer offset — keeps the pattern alive every frame
+        const bxOff = Math.floor(t * 11) & 7;
+        const byOff = Math.floor(t * 8.5) & 7;
+
+        // Color "sweep" — a phase that rolls across the word over time
+        // so each frame, a different region is showing different palette
+        // members. Faster than before so motion reads more clearly.
+        const colPhase = t * 0.35;
+
+        // A horizontal "scan" wave: cells near this x get a brightness
+        // boost. The scan sweeps left→right and loops.
+        const scanX = (t * 0.32) % 1.4 - 0.2; // -0.2 .. 1.2
+
+        for (let i = 0; i < cells.length; i++) {
+          const c = cells[i];
+
+          // Per-cell Bayer threshold → modulates whether we draw it
+          const ix = (Math.floor(c.nx * 112) + bxOff) & 7;
+          const iy = (Math.floor(c.ny * 40)  + byOff) & 7;
+          const thr = BAYER[iy][ix];
+          if (thr > density) continue;
+
+          // Color blend across 6-color palette
+          const idxF = (c.nx * 1.6 + colPhase) * PALETTE.length;
+          const i0 = ((idxF | 0) % PALETTE.length + PALETTE.length) % PALETTE.length;
+          const i1 = (i0 + 1) % PALETTE.length;
+          const k  = idxF - Math.floor(idxF);
+          const c0 = PALETTE[i0], c1 = PALETTE[i1];
+          let r = c0[0] + (c1[0] - c0[0]) * k;
+          let g = c0[1] + (c1[1] - c0[1]) * k;
+          let b = c0[2] + (c1[2] - c0[2]) * k;
+
+          // Scan boost: cells within scan radius get pushed toward paper-white
+          const scanDist = Math.abs(c.nx - scanX);
+          const scanBoost = Math.max(0, 1 - scanDist / 0.10);
+          if (scanBoost > 0) {
+            r = r + (255 - r) * scanBoost * 0.85;
+            g = g + (240 - g) * scanBoost * 0.85;
+            b = b + (232 - b) * scanBoost * 0.85;
+          }
+
+          // Subtle vertical wave displacement — letters breathe gently
+          const wave = Math.sin(c.nx * 6 - t * 1.8) * (cellPx * 0.14);
+
+          const drawX = c.nx * dispW;
+          const drawY = c.ny * dispH + wave;
+
+          // Cell size: denser cells (low Bayer threshold) draw slightly
+          // larger so the word feels weighted toward bright cells. Scan
+          // boost also enlarges briefly.
+          const densityWeight = Math.max(0, density - thr) * 0.45;
+          const s = cellPx * (1.04 + densityWeight + scanBoost * 0.25);
+
+          ctx.fillStyle = `rgb(${r|0},${g|0},${b|0})`;
+          ctx.fillRect(drawX, drawY, s, s);
+        }
+
+        if (!reduced) raf = requestAnimationFrame(draw);
+      };
+
+      const start = () => {
+        if (raf || reduced) {
+          // Even with reduced-motion, draw a static frame so the word still
+          // shows — just don't animate.
+          if (!raf && reduced) draw();
+          if (reduced) return;
+        }
+        raf = requestAnimationFrame(draw);
+      };
+      const stop = () => { if (raf) cancelAnimationFrame(raf); raf = null; };
+
+      // Wait for the pixel font to be available before we measure glyphs
+      const init = async () => {
+        try { await document.fonts.ready; } catch (_) {}
+        try { await document.fonts.load('400 64px AstheticPixel'); } catch (_) {}
+        buildMask();
+        resize();
+        start();
+      };
+
+      window.addEventListener('resize', () => { resize(); });
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) stop(); else start();
+      });
+      init();
     })();
 
     // ── Cursor-reactive dot field ────────────────────────────────────

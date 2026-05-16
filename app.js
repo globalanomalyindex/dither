@@ -1002,6 +1002,16 @@
   $('btn-upload').addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
 
+  // Clicking anywhere on the landing drop zone opens the file picker — the
+  // headline hint says "or click anywhere to browse" so honor that. Guard
+  // against clicks that originated inside the header (buttons, tabs); those
+  // bubble through the drop zone's container otherwise.
+  dropZone.addEventListener('click', (e) => {
+    // Header/buttons/tabs should keep their own behavior
+    if (e.target.closest('header, button, input, select, a')) return;
+    fileInput.click();
+  });
+
   document.body.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
   document.body.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
   document.body.addEventListener('drop', e => {
