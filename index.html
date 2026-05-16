@@ -12,56 +12,116 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-  <title>DITHER</title>
-  <link rel="stylesheet" href="style.css?v=60">
+  <title>DITHER / TECHNICAL SPECIMEN</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=61">
 </head>
 <body>
   <div id="app">
     <header>
-      <div class="tab-group">
-        <button class="tab-btn active" data-tab="dither">DITHER</button>
-        <button class="tab-btn" data-tab="grain">GRAIN</button>
-        <button class="tab-btn" data-tab="paintstroke">PAINTSTROKE</button>
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <span class="brand-mark-dot"></span>
+          <span class="brand-mark-dot"></span>
+          <span class="brand-mark-dot"></span>
+          <span class="brand-mark-dot"></span>
+        </div>
+        <div class="brand-wordmark">
+          <span class="brand-name">DITHER</span>
+          <span class="brand-meta">REV.0061 · TECHNICAL SPECIMEN</span>
+        </div>
+      </div>
+      <div class="tab-group" role="tablist">
+        <button class="tab-btn active" data-tab="dither"><span class="tab-idx">01</span><span class="tab-name">DITHER</span></button>
+        <button class="tab-btn" data-tab="grain"><span class="tab-idx">02</span><span class="tab-name">GRAIN</span></button>
+        <button class="tab-btn" data-tab="paintstroke"><span class="tab-idx">03</span><span class="tab-name">PAINT</span></button>
       </div>
       <div class="header-actions">
-        <button id="btn-randomize-all" class="btn-fun" title="Randomize everything">Shuffle</button>
-        <button id="btn-upload" class="btn-primary">Upload Image</button>
-        <button id="btn-bake" class="btn-bake" disabled title="Bake current edits into the image">Bake</button>
-        <button id="btn-export" class="btn-secondary" disabled>Export</button>
+        <button id="btn-randomize-all" class="btn-fun" title="Randomize everything">
+          <span class="btn-glyph">⤬</span><span>Shuffle</span>
+        </button>
+        <button id="btn-upload" class="btn-primary">
+          <span class="btn-glyph">↗</span><span>Upload</span>
+        </button>
+        <button id="btn-bake" class="btn-bake" disabled title="Bake current edits into the image">
+          <span class="btn-glyph">●</span><span>Bake</span>
+        </button>
+        <button id="btn-export" class="btn-secondary" disabled>
+          <span class="btn-glyph">↧</span><span>Export</span>
+        </button>
         <button id="btn-reset" class="btn-ghost" disabled>Reset</button>
         <span class="undo-redo-group">
-          <button id="btn-undo" class="btn-icon" disabled title="Undo (Alt+Z)">Undo</button>
-          <button id="btn-redo" class="btn-icon" disabled title="Redo (Alt+Shift+Z)">Redo</button>
+          <button id="btn-undo" class="btn-icon" disabled title="Undo (Alt+Z)">↶</button>
+          <button id="btn-redo" class="btn-icon" disabled title="Redo (Alt+Shift+Z)">↷</button>
         </span>
       </div>
     </header>
 
     <main>
       <div id="drop-zone" class="drop-zone">
+        <div class="drop-zone-grid" aria-hidden="true"></div>
+        <div class="drop-zone-bracket drop-zone-bracket-tl" aria-hidden="true"></div>
+        <div class="drop-zone-bracket drop-zone-bracket-tr" aria-hidden="true"></div>
+        <div class="drop-zone-bracket drop-zone-bracket-bl" aria-hidden="true"></div>
+        <div class="drop-zone-bracket drop-zone-bracket-br" aria-hidden="true"></div>
         <div class="drop-zone-content">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="17 8 12 3 7 8"/>
-            <line x1="12" y1="3" x2="12" y2="15"/>
-          </svg>
-          <p>Drop an image here or click Upload</p>
-          <span class="drop-zone-hint">PNG, JPG, WebP, BMP — any size</span>
+          <div class="drop-zone-tag">[ 00 ] / INPUT MODULE / AWAITING SOURCE</div>
+          <div class="drop-zone-display">
+            <span class="drop-zone-line-1">DROP</span>
+            <span class="drop-zone-line-2"><em>image</em></span>
+            <span class="drop-zone-line-3">to ingest</span>
+          </div>
+          <div class="drop-zone-pattern" aria-hidden="true">
+            <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+          </div>
+          <div class="drop-zone-actions">
+            <button class="drop-zone-cta" type="button" onclick="document.getElementById('btn-upload').click()">
+              <span class="drop-zone-cta-arrow">↗</span>
+              <span>Browse files</span>
+            </button>
+            <span class="drop-zone-spec">PNG · JPG · WEBP · BMP · ANY SIZE</span>
+          </div>
+        </div>
+        <div class="drop-zone-footer" aria-hidden="true">
+          <span>EXT · IMG · BUFFER</span>
+          <span>DRAG / DROP</span>
+          <span>CH:A · STATE:IDLE</span>
         </div>
       </div>
 
       <div id="workspace" class="workspace hidden">
         <div class="canvas-container">
           <div class="canvas-header">
-            <span id="image-info" class="image-info"></span>
+            <div class="canvas-header-left">
+              <span class="canvas-header-tag">VIEWPORT</span>
+              <span id="image-info" class="image-info"></span>
+            </div>
             <div class="zoom-controls">
-              <button id="btn-fit" class="btn-icon" title="Fit to view">Fit</button>
+              <span class="canvas-header-tag">ZOOM</span>
+              <button id="btn-fit" class="btn-icon" title="Fit to view">FIT</button>
               <button id="btn-1x" class="btn-icon" title="100%">1:1</button>
               <span id="zoom-level" class="zoom-label">100%</span>
             </div>
           </div>
           <div id="canvas-wrapper" class="canvas-wrapper">
+            <div class="canvas-crosshair canvas-crosshair-h" aria-hidden="true"></div>
+            <div class="canvas-crosshair canvas-crosshair-v" aria-hidden="true"></div>
+            <div class="canvas-corner canvas-corner-tl" aria-hidden="true"></div>
+            <div class="canvas-corner canvas-corner-tr" aria-hidden="true"></div>
+            <div class="canvas-corner canvas-corner-bl" aria-hidden="true"></div>
+            <div class="canvas-corner canvas-corner-br" aria-hidden="true"></div>
             <div id="canvas-alpha-badge" class="canvas-alpha-badge hidden">Transparency</div>
             <canvas id="canvas-preview"></canvas>
+          </div>
+          <div class="canvas-statusbar">
+            <span class="status-cell"><span class="status-dot"></span>READY</span>
+            <span class="status-cell">PIPELINE · LIVE</span>
+            <span class="status-cell">COLOR · sRGB</span>
+            <span class="status-cell">DEPTH · 8-BIT</span>
+            <span class="status-cell status-cell-flex"></span>
+            <span class="status-cell">DITHER v.0061</span>
           </div>
         </div>
 
@@ -730,10 +790,33 @@
     </div>
   </div>
 
-  <script src="dither.js?v=60"></script>
-  <script src="engine.js?v=60"></script>
-  <script src="grain.js?v=60"></script>
-  <script src="paintstroke.js?v=60"></script>
-  <script src="app.js?v=60"></script>
+  <script src="dither.js?v=61"></script>
+  <script src="engine.js?v=61"></script>
+  <script src="grain.js?v=61"></script>
+  <script src="paintstroke.js?v=61"></script>
+  <script src="app.js?v=61"></script>
+  <script>
+    // Range fill — paint the slider track up to the current value so the
+    // hi-vis signal color reads as a filled segment, not just a thumb.
+    // Pure CSS can't compute (val-min)/(max-min) so we set --p on the
+    // element and the stylesheet picks it up in the gradient stop.
+    (() => {
+      const updateFill = (el) => {
+        if (!el || el.type !== 'range') return;
+        const min = parseFloat(el.min) || 0;
+        const max = parseFloat(el.max) || 100;
+        const val = parseFloat(el.value);
+        const pct = max === min ? 0 : ((val - min) / (max - min)) * 100;
+        el.style.setProperty('--p', pct + '%');
+      };
+      const initAll = () => document.querySelectorAll('input[type="range"]').forEach(updateFill);
+      document.addEventListener('input',  (e) => updateFill(e.target), true);
+      document.addEventListener('change', (e) => updateFill(e.target), true);
+      // Re-scan after dynamic params are built (algorithm params, brush picker, etc.)
+      const mo = new MutationObserver(() => initAll());
+      mo.observe(document.body, { childList: true, subtree: true });
+      initAll();
+    })();
+  </script>
 </body>
 </html>

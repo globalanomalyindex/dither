@@ -3146,6 +3146,15 @@
   let activeTab = 'dither';
   const brushCursor = $('brush-cursor');
 
+  // Drive the per-tab signal color on <body> so CSS can swap accents
+  // for the entire sidebar+param surface in one go. The class is also
+  // what status indicators and section accents key off of.
+  const applyTabBodyClass = (tab) => {
+    document.body.classList.remove('tab-dither', 'tab-grain', 'tab-paintstroke');
+    document.body.classList.add('tab-' + tab);
+  };
+  applyTabBodyClass(activeTab);
+
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const tab = btn.dataset.tab;
@@ -3155,6 +3164,7 @@
       $('tab-dither').style.display = tab === 'dither' ? '' : 'none';
       $('tab-grain').style.display = tab === 'grain' ? '' : 'none';
       $('tab-paintstroke').style.display = tab === 'paintstroke' ? '' : 'none';
+      applyTabBodyClass(tab);
       // Show/hide brush cursor based on tab + canvas hover
       updateCursorVisibility();
       // Set canvas cursor
