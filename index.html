@@ -16,9 +16,16 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Archivo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=67">
+  <link rel="stylesheet" href="style.css?v=68">
 </head>
 <body>
+  <!-- Brand intro splash — plays once per page load. The DITHER wordmark
+       assembles itself in the same dithered visual language as the hero,
+       holds for a beat, then dithers back out. JS hides the splash when
+       the animation finishes (or on click to skip). -->
+  <div id="dither-intro" class="dither-intro" aria-hidden="true">
+    <canvas id="dither-intro-canvas"></canvas>
+  </div>
   <canvas id="dot-field" aria-hidden="true"></canvas>
   <div id="app">
     <header>
@@ -758,11 +765,11 @@
     </div>
   </div>
 
-  <script src="dither.js?v=67"></script>
-  <script src="engine.js?v=67"></script>
-  <script src="grain.js?v=67"></script>
-  <script src="paintstroke.js?v=67"></script>
-  <script src="app.js?v=67"></script>
+  <script src="dither.js?v=68"></script>
+  <script src="engine.js?v=68"></script>
+  <script src="grain.js?v=68"></script>
+  <script src="paintstroke.js?v=68"></script>
+  <script src="app.js?v=68"></script>
   <script>
     // Range fill — paint the slider track up to the current value so the
     // hi-vis signal color reads as a filled segment, not just a thumb.
@@ -863,6 +870,255 @@
       if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireSearch);
       else wireSearch();
       new MutationObserver(() => wireSearch()).observe(document.body, { childList: true, subtree: true });
+    })();
+
+    // ── Brand intro: "DITHER" dithers itself into existence ──────────
+    // Plays once per page load. The wordmark is rasterized into a chunky
+    // pixel mask, then animated through three phases:
+    //   0–700ms  : assemble — density ramps 0→1, pixels start scattered
+    //              from their target and snap to grid as density rises
+    //   700–1100 : lock — full density, the word reads bold and bright
+    //   1100–1550: dissolve — density drops with a horizontal scan wipe
+    // After 1550ms the splash fades out and is removed. Skippable on click.
+    (() => {
+      const wrap = document.getElementById('dither-intro');
+      const canvas = document.getElementById('dither-intro-canvas');
+      if (!wrap || !canvas) return;
+      const ctx = canvas.getContext('2d', { alpha: true });
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const TEXT = 'DITHER';
+      const DUR_ASSEMBLE = 700;
+      const DUR_LOCK     = 400;
+      const DUR_DISSOLVE = 450;
+      const TOTAL = DUR_ASSEMBLE + DUR_LOCK + DUR_DISSOLVE;
+
+      const BAYER = [
+        [ 0,32, 8,40, 2,34,10,42],
+        [48,16,56,24,50,18,58,26],
+        [12,44, 4,36,14,46, 6,38],
+        [60,28,52,20,62,30,54,22],
+        [ 3,35,11,43, 1,33, 9,41],
+        [51,19,59,27,49,17,57,25],
+        [15,47, 7,39,13,45, 5,37],
+        [63,31,55,23,61,29,53,21]
+      ].map(r => r.map(v => v / 64));
+
+      const PALETTE = [
+        [255, 94, 26],   [109, 237, 240],
+        [232, 67, 147],  [183, 156, 255],
+        [255, 214, 10],  [242, 240, 232]
+      ];
+
+      let cells = null;
+      let aspect = 4.5;
+      let dispW = 0, dispH = 0;
+      let cellPx = 6;
+      let raf = null;
+      let t0 = 0;
+      let finished = false;
+
+      const buildMask = () => {
+        const off = document.createElement('canvas');
+        const fontPx = 280;
+        off.width  = fontPx * TEXT.length * 0.72;
+        off.height = fontPx * 1.2;
+        const o = off.getContext('2d');
+        // The intro uses Archivo Black (heavy display) — NOT pixel font.
+        // We let the heavy grotesque be rasterized then sample it on a
+        // coarse grid so the result is chunky-pixel but the shapes are
+        // Swiss-bold confident.
+        o.font = `900 ${fontPx}px Archivo, sans-serif`;
+        o.textBaseline = 'alphabetic';
+        o.letterSpacing = '-0.04em';
+        o.fillStyle = '#fff';
+        o.fillText(TEXT, 0, fontPx * 0.95);
+        const img = o.getImageData(0, 0, off.width, off.height);
+        const data = img.data;
+        let minX = off.width, maxX = 0, minY = off.height, maxY = 0;
+        for (let y = 0; y < off.height; y++) {
+          for (let x = 0; x < off.width; x++) {
+            if (data[(y * off.width + x) * 4 + 3] > 16) {
+              if (x < minX) minX = x; if (x > maxX) maxX = x;
+              if (y < minY) minY = y; if (y > maxY) maxY = y;
+            }
+          }
+        }
+        const wPx = Math.max(1, maxX - minX + 1);
+        const hPx = Math.max(1, maxY - minY + 1);
+        aspect = wPx / hPx;
+        const CELLS_TALL = 22;
+        const cellSrc = Math.max(2, Math.floor(hPx / CELLS_TALL));
+        const out = [];
+        for (let y = 0; y < hPx; y += cellSrc) {
+          for (let x = 0; x < wPx; x += cellSrc) {
+            const sx0 = minX + x, sy0 = minY + y;
+            const sxEnd = Math.min(off.width, sx0 + cellSrc);
+            const syEnd = Math.min(off.height, sy0 + cellSrc);
+            let hits = 0, total = 0;
+            for (let sy = sy0; sy < syEnd; sy++) {
+              for (let sx = sx0; sx < sxEnd; sx++) {
+                if (data[(sy * off.width + sx) * 4 + 3] > 16) hits++;
+                total++;
+              }
+            }
+            if (hits / total > 0.42) {
+              // pre-roll a stable random offset per cell so each cell has
+              // its OWN scatter trajectory (assembly looks more organic)
+              out.push({
+                nx: x / wPx,
+                ny: y / hPx,
+                rx: (Math.random() * 2 - 1),
+                ry: (Math.random() * 2 - 1),
+                rd: Math.random()
+              });
+            }
+          }
+        }
+        cells = out;
+      };
+
+      const resize = () => {
+        const r = canvas.getBoundingClientRect();
+        dispW = Math.max(1, r.width);
+        dispH = Math.max(1, r.height);
+        canvas.width  = Math.floor(dispW * dpr);
+        canvas.height = Math.floor(dispH * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        // Fit the wordmark to roughly 80% width or 40% height
+        const targetW = dispW * 0.86;
+        const targetH = dispH * 0.42;
+        const fitW = targetH * aspect;
+        const fitH = targetW / aspect;
+        let wordW, wordH;
+        if (fitW <= targetW) { wordW = fitW; wordH = targetH; }
+        else                 { wordW = targetW; wordH = fitH; }
+        // 22 cells tall → cell size derived from wordH
+        cellPx = Math.max(2, wordH / 22);
+        // Cache word offsets used during draw
+        canvas.dataset.wordW = wordW;
+        canvas.dataset.wordH = wordH;
+      };
+
+      const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+      const easeInQuad   = (t) => t * t;
+
+      const draw = () => {
+        if (!cells) return;
+        const t = performance.now() - t0;
+        const wordW = parseFloat(canvas.dataset.wordW) || (dispW * 0.86);
+        const wordH = parseFloat(canvas.dataset.wordH) || (dispH * 0.42);
+        const ox = (dispW - wordW) / 2;
+        const oy = (dispH - wordH) / 2;
+        ctx.clearRect(0, 0, dispW, dispH);
+
+        // Phase 1: assemble — density ramps 0→1, scatter shrinks 1→0
+        // Phase 2: lock — density 1, scatter 0
+        // Phase 3: dissolve — density drops with scan-wipe (left→right)
+        let density, scatter, wipe;
+        if (t < DUR_ASSEMBLE) {
+          const p = easeOutCubic(t / DUR_ASSEMBLE);
+          density = p;
+          scatter = (1 - p) * 0.55; // initial scatter as fraction of word width
+          wipe = -1;
+        } else if (t < DUR_ASSEMBLE + DUR_LOCK) {
+          density = 1;
+          scatter = 0;
+          wipe = -1;
+        } else if (t < TOTAL) {
+          const p = easeInQuad((t - DUR_ASSEMBLE - DUR_LOCK) / DUR_DISSOLVE);
+          // Scan wipe sweeps from -0.15 to 1.15; cells past the wipe are gone
+          wipe = -0.15 + p * 1.3;
+          density = 1 - p * 0.85;
+          scatter = p * 0.20;
+        } else {
+          // Past TOTAL — fire fadeOut once, then stop
+          if (!finished) {
+            finished = true;
+            fadeOut();
+          }
+          return;
+        }
+
+        const tT = t * 0.001;
+        const colPhase = tT * 0.4;
+        const bxOff = Math.floor(tT * 14) & 7;
+        const byOff = Math.floor(tT * 11) & 7;
+
+        for (let i = 0; i < cells.length; i++) {
+          const c = cells[i];
+          // Wipe gate
+          if (wipe >= 0 && c.nx < wipe) continue;
+          // Bayer threshold against density
+          const ix = (Math.floor(c.nx * 160) + bxOff) & 7;
+          const iy = (Math.floor(c.ny * 40)  + byOff) & 7;
+          const thr = BAYER[iy][ix];
+          if (thr > density) continue;
+
+          // Scatter offset (in word-space units)
+          const sx = c.rx * scatter * wordW;
+          const sy = c.ry * scatter * wordH;
+
+          // Color blend across palette by horizontal position + time
+          const idxF = (c.nx * 1.6 + colPhase) * PALETTE.length;
+          const i0 = ((idxF | 0) % PALETTE.length + PALETTE.length) % PALETTE.length;
+          const i1 = (i0 + 1) % PALETTE.length;
+          const k  = idxF - Math.floor(idxF);
+          const c0 = PALETTE[i0], c1 = PALETTE[i1];
+          const r = c0[0] + (c1[0] - c0[0]) * k;
+          const g = c0[1] + (c1[1] - c0[1]) * k;
+          const b = c0[2] + (c1[2] - c0[2]) * k;
+
+          const drawX = ox + c.nx * wordW + sx;
+          const drawY = oy + c.ny * wordH + sy;
+          const s = cellPx * (1 + Math.max(0, density - thr) * 0.4);
+          ctx.fillStyle = `rgb(${r|0},${g|0},${b|0})`;
+          ctx.fillRect(drawX, drawY, s, s);
+        }
+
+        if (!finished) raf = requestAnimationFrame(draw);
+      };
+
+      const fadeOut = () => {
+        wrap.classList.add('dither-intro-fade');
+        setTimeout(() => wrap.remove(), 360);
+      };
+
+      const skip = () => {
+        if (raf) cancelAnimationFrame(raf);
+        finished = true;
+        fadeOut();
+      };
+
+      // Skip on click/keypress
+      wrap.addEventListener('click', skip);
+      window.addEventListener('keydown', skip, { once: true });
+
+      // Honor reduced motion: just briefly show then fade
+      if (reduced) {
+        wrap.classList.add('dither-intro-fade');
+        setTimeout(() => wrap.remove(), 400);
+        return;
+      }
+
+      const init = async () => {
+        try { await document.fonts.ready; } catch (_) {}
+        try { await document.fonts.load('900 64px Archivo'); } catch (_) {}
+        try {
+          buildMask();
+          resize();
+        } catch (e) {
+          // If glyph rasterization fails for any reason, just bail
+          // gracefully — the user shouldn't be stuck on a black splash.
+          console.error('intro setup error', e);
+          skip();
+          return;
+        }
+        t0 = performance.now();
+        raf = requestAnimationFrame(draw);
+      };
+      window.addEventListener('resize', resize);
+      init();
     })();
 
     // ── Motion character: universal button dither-flash + slider pulse ─

@@ -182,6 +182,29 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Intro splash — plays once on load, dithers "DITHER" into existence,
+   then fades out to reveal the app. Sits above everything else
+   (z-index: 9999) and dismissed on click/keypress. */
+.dither-intro {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: var(--ink-000);
+  display: block;
+  cursor: pointer;
+  opacity: 1;
+  transition: opacity 360ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.dither-intro canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  image-rendering: pixelated;
+}
+.dither-intro.dither-intro-fade { opacity: 0; pointer-events: none; }
+
 /* Cursor-reactive dot field — fixed behind everything, drawn by JS */
 #dot-field {
   position: fixed;
@@ -742,8 +765,12 @@ button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--tab-signal), 0
 .canvas-prompt.canvas-prompt-visible {
   opacity: 1;
   transform: translate(-50%, 0);
-  pointer-events: auto;
+  /* Container stays pointer-events: none even when visible so it doesn't
+     intercept marquee drags that start under it. Only the action button
+     and dismiss × override to accept clicks. */
 }
+.canvas-prompt-action,
+.canvas-prompt-dismiss { pointer-events: auto; }
 .canvas-prompt[data-tone="success"] { border-color: rgba(74, 222, 128, 0.45); }
 .canvas-prompt[data-tone="info"]    { border-color: var(--rule-strong); }
 .canvas-prompt[data-tone="action"]  { border-color: var(--signal); }
@@ -895,13 +922,19 @@ button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--tab-signal), 0
    collapses, that padding goes with it so collapsed sections shrink to
    just the header. Without the inner wrapper, multiple children would
    spill into implicit auto-rows that don't collapse. */
+/* Section fold motion ──
+   A snappy custom easing (slight overshoot on expand) on grid height,
+   combined with parallel opacity + translateY on the inner content so
+   the fold feels like the content is being PUSHED up/down by the chevron,
+   not a generic CSS slide. Stepped easing was the wrong move (made it
+   laggy). This curve has flair. */
 .section-toggle {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--paper-muted);
   margin-left: 8px;
   display: inline-block;
-  transition: transform var(--t-base), color var(--t-fast);
+  transition: transform 260ms cubic-bezier(0.5, 1.6, 0.4, 1), color 120ms var(--ease);
   transform-origin: center 55%;
   user-select: none;
   line-height: 1;
@@ -913,23 +946,37 @@ button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--tab-signal), 0
 .sidebar-section-body {
   display: grid;
   grid-template-rows: 1fr;
-  /* Stepped easing instead of smooth — gives the fold a deliberate,
-     digital cadence that matches DITHER's character. ~8 visible steps. */
-  transition: grid-template-rows 320ms steps(8, end);
+  /* Snappy expand with a touch of overshoot for character; collapse
+     gets a tighter curve so it doesn't feel like the content lingers. */
+  transition: grid-template-rows 320ms cubic-bezier(0.34, 1.18, 0.32, 1);
   overflow: hidden;
+}
+.sidebar-section.collapsed .sidebar-section-body {
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 220ms cubic-bezier(0.55, 0, 0.25, 1);
 }
 .sidebar-section-body > .sidebar-section-inner {
   min-height: 0;
   overflow: hidden;
   padding-top: 12px;
   padding-bottom: 18px;
-  transition: opacity 200ms var(--ease);
   opacity: 1;
+  transform: translateY(0);
+  filter: blur(0);
+  transition:
+    opacity 260ms cubic-bezier(0.34, 1.18, 0.32, 1) 40ms,
+    transform 320ms cubic-bezier(0.34, 1.18, 0.32, 1),
+    filter 220ms ease-out;
 }
-.sidebar-section.collapsed .sidebar-section-body { grid-template-rows: 0fr; }
 .sidebar-section.collapsed .sidebar-section-body > .sidebar-section-inner {
   opacity: 0;
+  transform: translateY(-10px);
+  filter: blur(2px);
   pointer-events: none;
+  transition:
+    opacity 160ms ease-in,
+    transform 180ms cubic-bezier(0.55, 0, 0.25, 1),
+    filter 160ms ease-in;
 }
 
 /* Algorithm search input — sits above the category list */
