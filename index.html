@@ -16,7 +16,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Archivo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=65">
+  <link rel="stylesheet" href="style.css?v=67">
 </head>
 <body>
   <canvas id="dot-field" aria-hidden="true"></canvas>
@@ -80,6 +80,15 @@
           </div>
           <div id="canvas-wrapper" class="canvas-wrapper">
             <div id="canvas-alpha-badge" class="canvas-alpha-badge hidden">Transparency</div>
+            <!-- Contextual coach banner — appears over the canvas when a tool
+                 needs a user instruction (e.g. Pickup marquee). Lives outside
+                 the transformed canvas so it doesn't pan/zoom with the image. -->
+            <div id="canvas-prompt" class="canvas-prompt hidden" role="status" aria-live="polite">
+              <span class="canvas-prompt-icon" aria-hidden="true"></span>
+              <span class="canvas-prompt-text"></span>
+              <button id="canvas-prompt-action" class="canvas-prompt-action" type="button" hidden></button>
+              <button id="canvas-prompt-dismiss" class="canvas-prompt-dismiss" type="button" aria-label="Dismiss" hidden>×</button>
+            </div>
             <canvas id="canvas-preview"></canvas>
           </div>
         </div>
@@ -749,11 +758,11 @@
     </div>
   </div>
 
-  <script src="dither.js?v=65"></script>
-  <script src="engine.js?v=65"></script>
-  <script src="grain.js?v=65"></script>
-  <script src="paintstroke.js?v=65"></script>
-  <script src="app.js?v=65"></script>
+  <script src="dither.js?v=67"></script>
+  <script src="engine.js?v=67"></script>
+  <script src="grain.js?v=67"></script>
+  <script src="paintstroke.js?v=67"></script>
+  <script src="app.js?v=67"></script>
   <script>
     // Range fill — paint the slider track up to the current value so the
     // hi-vis signal color reads as a filled segment, not just a thumb.
@@ -854,6 +863,117 @@
       if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireSearch);
       else wireSearch();
       new MutationObserver(() => wireSearch()).observe(document.body, { childList: true, subtree: true });
+    })();
+
+    // ── Motion character: universal button dither-flash + slider pulse ─
+    // Every button press radiates a stepped pixel ring from the exact
+    // click point (CSS pseudo-element + JS-set --cx/--cy). Currents to
+    // the button's foreground color. Sliders commit a small dither pulse
+    // at the thumb position on `change` — feedback that the value landed.
+    (() => {
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+      document.addEventListener('click', (e) => {
+        if (reduced.matches) return;
+        const btn = e.target.closest('button');
+        if (!btn || btn.disabled) return;
+        const rect = btn.getBoundingClientRect();
+        btn.style.setProperty('--cx', (e.clientX - rect.left) + 'px');
+        btn.style.setProperty('--cy', (e.clientY - rect.top)  + 'px');
+        btn.classList.remove('dither-flash');
+        // force reflow so the animation re-triggers on rapid clicks
+        void btn.offsetWidth;
+        btn.classList.add('dither-flash');
+        setTimeout(() => btn.classList.remove('dither-flash'), 380);
+      }, true);
+
+      // Slider commit pulse — only on `change` (mouseup), not every input
+      document.addEventListener('change', (e) => {
+        if (reduced.matches) return;
+        const el = e.target;
+        if (!el || el.type !== 'range') return;
+        const row = el.closest('.slider-row');
+        if (!row) return;
+        const min = parseFloat(el.min) || 0;
+        const max = parseFloat(el.max) || 100;
+        const val = parseFloat(el.value);
+        const pct = max === min ? 0 : ((val - min) / (max - min)) * 100;
+        // Map percent across the actual range track inside the row
+        const rowRect = row.getBoundingClientRect();
+        const elRect = el.getBoundingClientRect();
+        const thumbX = (elRect.left - rowRect.left) + (elRect.width * pct / 100);
+        const old = row.querySelector('.slider-pulse');
+        if (old) old.remove();
+        const pulse = document.createElement('span');
+        pulse.className = 'slider-pulse';
+        pulse.style.setProperty('--p', thumbX + 'px');
+        row.appendChild(pulse);
+        setTimeout(() => pulse.remove(), 340);
+      }, true);
+    })();
+
+    // ── Canvas-overlay coach prompt ─────────────────────────────────
+    // Floating banner anchored to the top of the viewport. Used by tools
+    // that need a one-shot user action (Pickup marquee, etc.) so the
+    // instruction lives WHERE THE WORK HAPPENS instead of being buried in
+    // the sidebar. Exposed as window.DitherPrompt.{show,update,hide}.
+    (() => {
+      const el = document.getElementById('canvas-prompt');
+      if (!el) return;
+      const iconEl = el.querySelector('.canvas-prompt-icon');
+      const textEl = el.querySelector('.canvas-prompt-text');
+      const actionEl = document.getElementById('canvas-prompt-action');
+      const dismissEl = document.getElementById('canvas-prompt-dismiss');
+      let currentAction = null;
+      let autoHideTimer = null;
+
+      const show = ({ text, action, icon = 'pickup', tone = 'info', dismissible = false, autoHide = 0 }) => {
+        if (autoHideTimer) { clearTimeout(autoHideTimer); autoHideTimer = null; }
+        textEl.textContent = text;
+        // Icon swaps via data-attr (CSS draws a small SVG glyph per kind)
+        el.dataset.icon = icon;
+        el.dataset.tone = tone;
+        if (action && action.label) {
+          actionEl.textContent = action.label;
+          actionEl.hidden = false;
+          currentAction = action.onClick;
+        } else {
+          actionEl.hidden = true;
+          currentAction = null;
+        }
+        dismissEl.hidden = !dismissible;
+        el.classList.remove('hidden');
+        // Reflow for animation
+        el.getBoundingClientRect();
+        el.classList.add('canvas-prompt-visible');
+        if (autoHide > 0) autoHideTimer = setTimeout(() => hide(), autoHide);
+      };
+
+      const update = (patch) => {
+        if (patch.text !== undefined) textEl.textContent = patch.text;
+        if (patch.icon !== undefined) el.dataset.icon = patch.icon;
+        if (patch.tone !== undefined) el.dataset.tone = patch.tone;
+        if (patch.action) {
+          actionEl.textContent = patch.action.label;
+          actionEl.hidden = false;
+          currentAction = patch.action.onClick;
+        } else if (patch.action === null) {
+          actionEl.hidden = true;
+          currentAction = null;
+        }
+        if (patch.dismissible !== undefined) dismissEl.hidden = !patch.dismissible;
+      };
+
+      const hide = () => {
+        el.classList.remove('canvas-prompt-visible');
+        if (autoHideTimer) { clearTimeout(autoHideTimer); autoHideTimer = null; }
+        setTimeout(() => el.classList.add('hidden'), 240);
+        currentAction = null;
+      };
+
+      actionEl.addEventListener('click', () => { if (currentAction) currentAction(); });
+      dismissEl.addEventListener('click', () => hide());
+
+      window.DitherPrompt = { show, update, hide };
     })();
 
     // ── Hero canvas: "image" rendered through DITHER's own algorithms ──

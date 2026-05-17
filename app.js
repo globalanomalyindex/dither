@@ -3182,6 +3182,8 @@
       updateCursorVisibility();
       // Set canvas cursor
       canvasWrapper.style.cursor = tab === 'paintstroke' ? 'none' : '';
+      // Coach prompt belongs to paintstroke flows — clear it when leaving
+      if (tab !== 'paintstroke' && window.DitherPrompt) window.DitherPrompt.hide();
     });
   });
 
@@ -3755,6 +3757,25 @@
     pickupSelectionMode = true;
     canvasWrapper.style.cursor = 'crosshair';
     if (brushCursor) brushCursor.style.display = 'none';
+    // Coach the user: instruction sits over the canvas where they're
+    // about to work, not in the sidebar.
+    if (window.DitherPrompt) {
+      window.DitherPrompt.show({
+        text: 'Drag a rectangle on the image to capture pixels',
+        icon: 'pickup',
+        tone: 'action',
+        dismissible: true
+      });
+    }
+  }
+
+  // Ensure the Tool Options section is expanded when a tool is selected
+  // that puts its primary CTA there (currently Pickup). Otherwise the
+  // re-sample button is hidden inside a collapsed section.
+  function expandToolOptions() {
+    const sec = Array.from(document.querySelectorAll('.sidebar-section h2'))
+      .find(h => h.textContent.trim().toLowerCase() === 'tool options')?.closest('.sidebar-section');
+    if (sec && sec.classList.contains('collapsed')) sec.classList.remove('collapsed');
   }
 
   document.querySelectorAll('.paint-tool-btn').forEach(btn => {
@@ -3763,9 +3784,25 @@
       btn.classList.add('selected');
       PaintEngine.setTool(btn.dataset.tool);
       buildToolOptions(btn.dataset.tool);
-      // Auto-enter marquee mode when selecting pickup without a stamp
-      if (btn.dataset.tool === 'pickup' && !PaintEngine.hasStamp()) {
-        enterPickupMarquee();
+      // Hide any lingering prompt from a previous tool
+      if (btn.dataset.tool !== 'pickup' && window.DitherPrompt) window.DitherPrompt.hide();
+      // Pickup is the only tool with an on-canvas action right now —
+      // auto-enter marquee mode (if no stamp captured) AND keep the
+      // Tool Options section open so the re-sample button is reachable.
+      if (btn.dataset.tool === 'pickup') {
+        expandToolOptions();
+        if (!PaintEngine.hasStamp()) {
+          enterPickupMarquee();
+        } else if (window.DitherPrompt) {
+          const sz = PaintEngine.getStampSize();
+          window.DitherPrompt.show({
+            text: `Picked up ${sz.w}×${sz.h} pixels — drag to paint`,
+            icon: 'check',
+            tone: 'success',
+            dismissible: true,
+            action: { label: 'Re-sample', onClick: () => enterPickupMarquee() }
+          });
+        }
       }
     });
   });
@@ -3887,11 +3924,33 @@
       // Preset buttons that set a coherent group of params at once
       const presetBtn = (label, key) => `<button class="pickup-preset-btn" data-preset="${key}">${label}</button>`;
 
-      container.innerHTML = `
-        <div class="param-group">
-          <button id="btn-pickup-select" class="btn-small">${hasStamp ? 'Re-select Pixels' : 'Select Pixels from Canvas'}</button>
-          ${hasStamp && stampSize ? `<span class="param-label" style="font-size:10px;opacity:0.6;margin-top:4px">${stampSize.w}×${stampSize.h}px captured — drag to paint</span>` : '<span class="param-label" style="font-size:10px;opacity:0.6;margin-top:4px">Draw a rectangle on the canvas to pick up pixels</span>'}
+      // Pickup source card — captured stamp thumbnail + status text + the
+      // prominent re-sample CTA. Sits at the TOP of the tool options so
+      // it's never buried below sliders.
+      const sourceCard = hasStamp && stampSize ? `
+        <div class="pickup-source pickup-source-ready">
+          <div class="pickup-source-thumb">
+            <canvas id="pickup-stamp-thumb" width="64" height="64"></canvas>
+          </div>
+          <div class="pickup-source-meta">
+            <div class="pickup-source-label">Pickup source</div>
+            <div class="pickup-source-dims"><span class="pickup-source-dot"></span>${stampSize.w}<span class="pickup-source-x">×</span>${stampSize.h} pixels</div>
+          </div>
+          <button id="btn-pickup-select" class="pickup-source-resample" type="button">Re-sample</button>
         </div>
+      ` : `
+        <div class="pickup-source pickup-source-empty">
+          <div class="pickup-source-thumb pickup-source-thumb-empty" aria-hidden="true"></div>
+          <div class="pickup-source-meta">
+            <div class="pickup-source-label">No source captured</div>
+            <div class="pickup-source-hint">Drag a rectangle on the image</div>
+          </div>
+          <button id="btn-pickup-select" class="pickup-source-resample" type="button">Capture</button>
+        </div>
+      `;
+
+      container.innerHTML = `
+        ${sourceCard}
         <div class="param-group">
           <span class="param-label">Presets</span>
           <div class="pickup-preset-grid">
@@ -3903,19 +3962,44 @@
             ${presetBtn('Liquid', 'liquid')}
           </div>
         </div>
-        <div class="param-section-divider">FIBERS</div>
+        <div class="param-section-divider">Fibers</div>
         ${sliderRow('Density', 'tool-opt-pickup-density', 0, 100, s.pickupFiberDensity, 'sparse → packed')}
         ${sliderRow('Length',  'tool-opt-pickup-length',  0, 100, s.pickupFiberLength,  'short → long')}
         ${sliderRow('Flow',    'tool-opt-pickup-flow',    0, 100, s.pickupFiberFlow,    'broken → solid')}
         ${sliderRow('Wander',  'tool-opt-pickup-wander',  0, 100, s.pickupFiberWander,  'straight → curl')}
         ${sliderRow('Variety', 'tool-opt-pickup-variety', 0, 100, s.pickupColorVariety, 'uniform → mixed')}
         ${sliderRow('Taper',   'tool-opt-pickup-taper',   0, 100, s.pickupFiberTaper,   'flat → tapered')}
-        <div class="param-section-divider">GRAIN</div>
+        <div class="param-section-divider">Grain</div>
         ${sliderRow('Jitter',    'tool-opt-pickup-jitter',    0, 100, s.pickupJitter)}
         ${sliderRow('Scatter',   'tool-opt-pickup-scatter',   0, 50,  s.pickupScatter)}
         ${sliderRow('Coherence', 'tool-opt-pickup-coherence', 0, 100, s.pickupCoherence)}
       `;
       $('btn-pickup-select').addEventListener('click', () => enterPickupMarquee());
+
+      // Render the captured stamp into the thumbnail canvas. We letterbox
+      // it preserving aspect — the source might be wide or tall.
+      if (hasStamp && stampSize) {
+        const thumb = $('pickup-stamp-thumb');
+        if (thumb && typeof PaintEngine.drawStampThumbnail === 'function') {
+          PaintEngine.drawStampThumbnail(thumb);
+        } else if (thumb && typeof PaintEngine.getStampImageData === 'function') {
+          const sd = PaintEngine.getStampImageData();
+          if (sd) {
+            const tctx = thumb.getContext('2d');
+            tctx.clearRect(0, 0, thumb.width, thumb.height);
+            const ratio = Math.min(thumb.width / sd.width, thumb.height / sd.height);
+            const dw = sd.width * ratio;
+            const dh = sd.height * ratio;
+            const dx = (thumb.width - dw) / 2;
+            const dy = (thumb.height - dh) / 2;
+            const tmp = document.createElement('canvas');
+            tmp.width = sd.width; tmp.height = sd.height;
+            tmp.getContext('2d').putImageData(sd, 0, 0);
+            tctx.imageSmoothingEnabled = false;
+            tctx.drawImage(tmp, dx, dy, dw, dh);
+          }
+        }
+      }
 
       // Slider wiring
       const wire = (id, setter) => {
@@ -4134,8 +4218,19 @@
       // Pickup tool: capture raw pixels as stamp
       if (wasPickup) {
         PaintEngine.capturePickupStamp(cx, cy, cw, ch);
-        // Update tool options to show stamp info
+        // Update tool options to show stamp info + the new thumbnail
         buildToolOptions('pickup');
+        // Confirmation banner with a Re-sample CTA right where the user is
+        const sz = PaintEngine.getStampSize();
+        if (sz && window.DitherPrompt) {
+          window.DitherPrompt.show({
+            text: `Picked up ${sz.w}×${sz.h} pixels — drag to paint`,
+            icon: 'check',
+            tone: 'success',
+            dismissible: true,
+            action: { label: 'Re-sample', onClick: () => enterPickupMarquee() }
+          });
+        }
         return;
       }
 

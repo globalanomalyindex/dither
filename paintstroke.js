@@ -1369,6 +1369,24 @@ const PaintEngine = (() => {
 
   function hasStamp() { return hasPickupStamp; }
   function getStampSize() { return pickupStamp ? { w: pickupStamp.w, h: pickupStamp.h } : null; }
+  function getStampImageData() { return pickupStamp ? pickupStamp.data : null; }
+  // Letterboxed thumbnail of the captured stamp into the supplied canvas.
+  function drawStampThumbnail(canvasEl) {
+    if (!pickupStamp || !canvasEl) return;
+    const tctx = canvasEl.getContext('2d');
+    tctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    const sd = pickupStamp.data;
+    const ratio = Math.min(canvasEl.width / sd.width, canvasEl.height / sd.height);
+    const dw = sd.width * ratio;
+    const dh = sd.height * ratio;
+    const dx = (canvasEl.width - dw) / 2;
+    const dy = (canvasEl.height - dh) / 2;
+    const tmp = document.createElement('canvas');
+    tmp.width = sd.width; tmp.height = sd.height;
+    tmp.getContext('2d').putImageData(sd, 0, 0);
+    tctx.imageSmoothingEnabled = false;
+    tctx.drawImage(tmp, dx, dy, dw, dh);
+  }
 
   // Nearest-neighbor texture sample with wrapping. Crisp — preserves
   // every dithered pixel from the source stamp exactly. No interpolation,
@@ -2094,6 +2112,7 @@ const PaintEngine = (() => {
     setWetLifetime, setWetEvolveRate, setShapeInfluence,
     selectBrush, getBrushes, getSelectedBrush, getBrushThumbnail,
     addBrush, extractBrushFromImage, capturePickupStamp, hasStamp, getStampSize,
+    getStampImageData, drawStampThumbnail,
     getSettings, updateActiveMask,
     getBrushCursorURL, invalidateCursorCache,
     // Cross-module brush access (for algorithms like palette-knife/impressionism)
