@@ -1126,6 +1126,10 @@
   }
 
   canvasWrapper.addEventListener('pointerdown', e => {
+    // The coach prompt is a child of the wrapper, so clicks on its buttons
+    // bubble here. Let them reach the buttons instead of starting a paint
+    // stroke / pan and capturing the pointer (which ate the button's click).
+    if (e.target && e.target.closest && e.target.closest('.canvas-prompt')) return;
     if (e.button !== 0 && e.pointerType === 'mouse') return;
     // Brush/pickup selection mode intercepts in capture phase — skip here
     if (brushSelectionMode || pickupSelectionMode) return;
@@ -4185,6 +4189,8 @@
 
   // Override mousedown to intercept marquee selection (brush maker OR pickup)
   canvasWrapper.addEventListener('mousedown', e => {
+    // Don't start a marquee when the press lands on the coach prompt's buttons.
+    if (e.target && e.target.closest && e.target.closest('.canvas-prompt')) return;
     if ((brushSelectionMode || pickupSelectionMode) && e.button === 0) {
       e.preventDefault();
       e.stopPropagation();

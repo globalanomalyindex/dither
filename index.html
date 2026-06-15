@@ -16,7 +16,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Archivo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=69">
+  <link rel="stylesheet" href="style.css?v=70">
 </head>
 <body>
   <!-- Brand intro splash — plays once per page load. The DITHER wordmark
@@ -765,11 +765,11 @@
     </div>
   </div>
 
-  <script src="dither.js?v=69"></script>
-  <script src="engine.js?v=69"></script>
-  <script src="grain.js?v=69"></script>
-  <script src="paintstroke.js?v=69"></script>
-  <script src="app.js?v=69"></script>
+  <script src="dither.js?v=70"></script>
+  <script src="engine.js?v=70"></script>
+  <script src="grain.js?v=70"></script>
+  <script src="paintstroke.js?v=70"></script>
+  <script src="app.js?v=70"></script>
   <script>
     // Range fill — paint the slider track up to the current value so the
     // hi-vis signal color reads as a filled segment, not just a thumb.
@@ -1182,9 +1182,11 @@
       let currentAction = null;
       let currentDismiss = null;
       let autoHideTimer = null;
+      let hideTimer = null;
 
       const show = ({ text, action, icon = 'pickup', tone = 'info', dismissible = false, autoHide = 0, onDismiss = undefined }) => {
         if (autoHideTimer) { clearTimeout(autoHideTimer); autoHideTimer = null; }
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
         textEl.textContent = text;
         // Icon swaps via data-attr (CSS draws a small SVG glyph per kind)
         el.dataset.icon = icon;
@@ -1224,7 +1226,7 @@
       const hide = () => {
         el.classList.remove('canvas-prompt-visible');
         if (autoHideTimer) { clearTimeout(autoHideTimer); autoHideTimer = null; }
-        setTimeout(() => el.classList.add('hidden'), 240);
+        hideTimer = setTimeout(() => { el.classList.add('hidden'); hideTimer = null; }, 240);
         currentAction = null;
         currentDismiss = null;
       };
