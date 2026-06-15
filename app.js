@@ -192,7 +192,7 @@
     const alphaText = alphaInfo.hasTransparency
       ? (alphaInfo.hasPartialTransparency ? ' • transparency' : ' • alpha mask')
       : '';
-    $('image-info').textContent = `${width} × ${height} — ${label}${alphaText}`;
+    $('image-info').textContent = `${width} × ${height} • ${label}${alphaText}`;
     updateCanvasTransparencyUI(alphaInfo);
   }
 
@@ -729,7 +729,7 @@
     if (rules.length === 0 && !banner) {
       const msg = document.createElement('div');
       msg.className = 'rules-empty';
-      msg.textContent = 'No rules yet — click "+ Add Rule" to shape how the algorithm responds to edges, tones, and detail.';
+      msg.textContent = 'No rules yet. Click "+ Add Rule" to shape how the algorithm responds to edges, tones, and detail.';
       panel.appendChild(msg);
     } else if (rules.length > 0 && banner) {
       banner.remove();
@@ -1126,6 +1126,10 @@
   }
 
   canvasWrapper.addEventListener('pointerdown', e => {
+    // The coach prompt is a child of the wrapper, so clicks on its buttons
+    // bubble here. Let them reach the buttons instead of starting a paint
+    // stroke / pan and capturing the pointer (which ate the button's click).
+    if (e.target && e.target.closest && e.target.closest('.canvas-prompt')) return;
     if (e.button !== 0 && e.pointerType === 'mouse') return;
     // Brush/pickup selection mode intercepts in capture phase — skip here
     if (brushSelectionMode || pickupSelectionMode) return;
@@ -1974,7 +1978,7 @@
               <label class="slider-row cb-master">
                 <input type="checkbox" class="cb-input" data-algo="${sel.id}" data-cb-path="enabled" ${cbOpen ? 'checked' : ''}>
                 <span class="param-label cb-master-label">${p.label}</span>
-                <span class="cb-master-hint">${cbOpen ? 'Active — tonal brush routing' : 'Off (uses single brush)'}</span>
+                <span class="cb-master-hint">${cbOpen ? 'Active: tonal brush routing' : 'Off (uses single brush)'}</span>
               </label>
               <div class="cb-body ${cbOpen ? '' : 'cb-disabled'}">
                 <div class="cb-thresholds">
@@ -2045,7 +2049,7 @@
               <div class="rules-list" data-algo="${sel.id}">
                 ${rules.map((r, idx) => renderRuleRow(sel.id, r, idx)).join('')}
               </div>
-              ${rules.length === 0 ? '<div class="rules-empty">No rules yet — click "+ Add Rule" to shape how the algorithm responds to edges, tones, and detail.</div>' : ''}
+              ${rules.length === 0 ? '<div class="rules-empty">No rules yet. Click "+ Add Rule" to shape how the algorithm responds to edges, tones, and detail.</div>' : ''}
             </div>
           `;
         } else {
@@ -2279,7 +2283,7 @@
             const body = e.target.closest('.cb-panel').querySelector('.cb-body');
             const hint = e.target.closest('.cb-panel').querySelector('.cb-master-hint');
             if (body) body.classList.toggle('cb-disabled', !input.checked);
-            if (hint) hint.textContent = input.checked ? 'Active — tonal brush routing' : 'Off (uses single brush)';
+            if (hint) hint.textContent = input.checked ? 'Active: tonal brush routing' : 'Off (uses single brush)';
             // Disable/enable the standard Brush Shape dropdown in the same
             // algo section — per-zone custom brushes override the single
             // brushShape, so surfacing that fact in the UI prevents users
@@ -3182,8 +3186,8 @@
       updateCursorVisibility();
       // Set canvas cursor
       canvasWrapper.style.cursor = tab === 'paintstroke' ? 'none' : '';
-      // Coach prompt belongs to paintstroke flows — clear it when leaving
-      if (tab !== 'paintstroke' && window.DitherPrompt) window.DitherPrompt.hide();
+      // Exit pickup mode and hide its prompt when leaving paintstroke tab
+      if (tab !== 'paintstroke') exitPickupMode();
     });
   });
 
@@ -3752,6 +3756,20 @@
   }
 
   // Tool selection
+  // Fully exit pickup marquee mode: clear the selection flags, hide the
+  // marquee box, restore the cursor, and dismiss the coach prompt. Single
+  // teardown path used by the prompt's X, the Escape key, and tool/tab
+  // switches, so the mode can never leak (previously hide() only hid the
+  // pill while the canvas stayed stuck in crosshair pickup mode).
+  function exitPickupMode() {
+    pickupSelectionMode = false;
+    marqueeActive = false;
+    if (brushMarquee) brushMarquee.style.display = 'none';
+    canvasWrapper.style.cursor = activeTab === 'paintstroke' ? 'none' : '';
+    if (activeTab === 'paintstroke' && brushCursor) brushCursor.style.display = 'block';
+    if (window.DitherPrompt) window.DitherPrompt.hide();
+  }
+
   function enterPickupMarquee() {
     if (!DitherEngine.getSourceSize()) return;
     pickupSelectionMode = true;
@@ -3764,10 +3782,22 @@
         text: 'Drag a rectangle on the image to capture pixels',
         icon: 'pickup',
         tone: 'action',
-        dismissible: true
+        dismissible: true,
+        onDismiss: exitPickupMode
       });
     }
   }
+
+  // Escape cancels pickup marquee mode without dragging. Guarded on
+  // pickupSelectionMode so it is a no-op everywhere else; stopPropagation
+  // keeps it from reaching the brush-picker modal's own Escape handler.
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && pickupSelectionMode) {
+      exitPickupMode();
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  });
 
   // Ensure the Tool Options section is expanded when a tool is selected
   // that puts its primary CTA there (currently Pickup). Otherwise the
@@ -3784,8 +3814,8 @@
       btn.classList.add('selected');
       PaintEngine.setTool(btn.dataset.tool);
       buildToolOptions(btn.dataset.tool);
-      // Hide any lingering prompt from a previous tool
-      if (btn.dataset.tool !== 'pickup' && window.DitherPrompt) window.DitherPrompt.hide();
+      // Exit pickup mode and hide its prompt when switching away from pickup
+      if (btn.dataset.tool !== 'pickup') exitPickupMode();
       // Pickup is the only tool with an on-canvas action right now —
       // auto-enter marquee mode (if no stamp captured) AND keep the
       // Tool Options section open so the re-sample button is reachable.
@@ -3796,7 +3826,7 @@
         } else if (window.DitherPrompt) {
           const sz = PaintEngine.getStampSize();
           window.DitherPrompt.show({
-            text: `Picked up ${sz.w}×${sz.h} pixels — drag to paint`,
+            text: `Picked up ${sz.w}×${sz.h} pixels. Drag to paint.`,
             icon: 'check',
             tone: 'success',
             dismissible: true,
@@ -4159,6 +4189,8 @@
 
   // Override mousedown to intercept marquee selection (brush maker OR pickup)
   canvasWrapper.addEventListener('mousedown', e => {
+    // Don't start a marquee when the press lands on the coach prompt's buttons.
+    if (e.target && e.target.closest && e.target.closest('.canvas-prompt')) return;
     if ((brushSelectionMode || pickupSelectionMode) && e.button === 0) {
       e.preventDefault();
       e.stopPropagation();
@@ -4224,7 +4256,7 @@
         const sz = PaintEngine.getStampSize();
         if (sz && window.DitherPrompt) {
           window.DitherPrompt.show({
-            text: `Picked up ${sz.w}×${sz.h} pixels — drag to paint`,
+            text: `Picked up ${sz.w}×${sz.h} pixels. Drag to paint.`,
             icon: 'check',
             tone: 'success',
             dismissible: true,
