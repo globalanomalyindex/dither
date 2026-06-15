@@ -16,7 +16,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Archivo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=68">
+  <link rel="stylesheet" href="style.css?v=69">
 </head>
 <body>
   <!-- Brand intro splash — plays once per page load. The DITHER wordmark
@@ -112,7 +112,7 @@
             </div>
             <div class="param-group">
               <select id="style-preset">
-                <option value="">— None —</option>
+                <option value="">(None)</option>
                 <option value="underpainting">Underpainting</option>
                 <option value="painterly">Painterly</option>
                 <option value="expressive">Expressive</option>
@@ -173,7 +173,7 @@
               </div>
               <div class="param-group">
                 <button id="btn-extract-palette" class="btn-small">Extract from Source</button>
-                <button id="btn-extract-ref" class="btn-small" style="margin-top:4px">Extract from Reference...</button>
+                <button id="btn-extract-ref" class="btn-small btn-extract-ref">Extract from Reference...</button>
                 <input type="file" id="ref-image-input" accept="image/*" style="display:none">
               </div>
               <div id="palette-swatches" class="palette-swatches"></div>
@@ -261,7 +261,7 @@
               <h2>Algorithms</h2>
               <button class="btn-dice" data-randomize="algorithms" title="Randomize algorithm">Dice</button>
             </div>
-            <p class="sidebar-hint">Select one or more — they chain in order. Drag to reorder.</p>
+            <p class="sidebar-hint">Select one or more, chain in order. Drag to reorder.</p>
 
             <div class="algo-category" data-cat="classic">
               <div class="algo-category-header">Classic Error Diffusion</div>
@@ -326,7 +326,7 @@
                 <h2>Grain Types</h2>
                 <button class="btn-dice" id="grain-randomize" title="Randomize grain">Dice</button>
               </div>
-              <p class="sidebar-hint">Select one or more — they chain in order. Drag to reorder.</p>
+              <p class="sidebar-hint">Select one or more, chain in order. Drag to reorder.</p>
 
               <div class="algo-category" data-cat="grain-film">
                 <div class="algo-category-header">Film</div>
@@ -361,14 +361,14 @@
             <div class="sidebar-section">
               <div class="section-header"><h2>Tool</h2></div>
               <div class="paint-tool-grid" id="paint-tool-grid">
-                <button class="paint-tool-btn selected" data-tool="smudge" title="Smudge — drag pixels with decay">Smudge</button>
-                <button class="paint-tool-btn" data-tool="push" title="Push — displace along stroke direction">Push</button>
-                <button class="paint-tool-btn" data-tool="scatter" title="Scatter — random displacement">Scatter</button>
-                <button class="paint-tool-btn" data-tool="swirl" title="Swirl — rotate around brush center">Swirl</button>
-                <button class="paint-tool-btn" data-tool="liquify" title="Liquify — smooth forward warp">Liquify</button>
-                <button class="paint-tool-btn" data-tool="blend" title="Blend — soften/blur within brush">Blend</button>
-                <button class="paint-tool-btn" data-tool="spread" title="Spread — directional stretch">Spread</button>
-                <button class="paint-tool-btn" data-tool="pickup" title="Pickup — paint with sampled pixels">Pickup</button>
+                <button class="paint-tool-btn selected" data-tool="smudge" title="Smudge: drag pixels with decay">Smudge</button>
+                <button class="paint-tool-btn" data-tool="push" title="Push: displace along stroke direction">Push</button>
+                <button class="paint-tool-btn" data-tool="scatter" title="Scatter: random displacement">Scatter</button>
+                <button class="paint-tool-btn" data-tool="swirl" title="Swirl: rotate around brush center">Swirl</button>
+                <button class="paint-tool-btn" data-tool="liquify" title="Liquify: smooth forward warp">Liquify</button>
+                <button class="paint-tool-btn" data-tool="blend" title="Blend: soften/blur within brush">Blend</button>
+                <button class="paint-tool-btn" data-tool="spread" title="Spread: directional stretch">Spread</button>
+                <button class="paint-tool-btn" data-tool="pickup" title="Pickup: paint with sampled pixels">Pickup</button>
               </div>
             </div>
 
@@ -403,7 +403,7 @@
             <!-- WET PAINT (live evolving stroke) -->
             <div class="sidebar-section">
               <div class="section-header"><h2>Wet Paint</h2></div>
-              <div class="param-help" style="margin-bottom:8px;">Previously-painted pixels keep evolving as the stroke continues — paint drips, bleeds, smears, and separates like real wet paint on a digital canvas.</div>
+              <div class="param-help" style="margin-bottom:8px;">Previously-painted pixels keep evolving as the stroke continues. Paint drips, bleeds, smears, and separates like real wet paint on a digital canvas.</div>
               <div class="param-group">
                 <span class="param-label">Drip (gravity)</span>
                 <div class="slider-row">
@@ -593,7 +593,7 @@
               <div class="section-header"><h2>Actions</h2></div>
               <div class="param-group">
                 <button id="btn-clear-strokes" class="btn-small" disabled>Clear All Strokes</button>
-                <span id="stroke-count" class="param-label" style="margin-left:8px;">0 strokes</span>
+                <span id="stroke-count" class="param-label">0 strokes</span>
               </div>
             </div>
 
@@ -659,7 +659,7 @@
   </div>
 
   <!-- Marquee overlay for brush selection -->
-  <div id="brush-marquee" style="display:none;position:fixed;border:2px dashed rgba(167,139,250,0.9);background:rgba(167,139,250,0.08);pointer-events:none;z-index:50;"></div>
+  <div id="brush-marquee" style="display:none;position:fixed;pointer-events:none;z-index:50;"></div>
 
   <!-- Export Modal -->
   <div id="export-modal" class="modal-overlay hidden">
@@ -698,7 +698,7 @@
               <input type="checkbox" id="export-print-ready">
               <span style="font-weight:600;">Print-ready</span>
             </label>
-            <p class="modal-hint" id="export-print-hint" style="display:none;">Lossless PNG tagged at 300 DPI, sRGB. For a 4&times;6" print at 300 DPI you want at least 1200&times;1800 px &mdash; bump the scale if the readout above is smaller.</p>
+            <p class="modal-hint" id="export-print-hint" style="display:none;">Lossless PNG tagged at 300 DPI, sRGB. For a 4&times;6" print at 300 DPI you want at least 1200&times;1800 px. Bump the scale if the readout above is smaller.</p>
           </div>
 
           <!-- File Format -->
@@ -751,7 +751,7 @@
           <!-- Filename -->
           <div class="modal-section">
             <h3>Filename</h3>
-            <input type="text" id="export-filename" placeholder="dithered" style="width:100%;padding:6px 8px;box-sizing:border-box;font-family:inherit;font-size:13px;background:#1a1a1a;border:1px solid #333;color:#eee;border-radius:3px;">
+            <input type="text" id="export-filename" class="text-input" placeholder="dithered">
             <p class="modal-hint" id="export-filename-preview"></p>
           </div>
 
@@ -765,11 +765,11 @@
     </div>
   </div>
 
-  <script src="dither.js?v=68"></script>
-  <script src="engine.js?v=68"></script>
-  <script src="grain.js?v=68"></script>
-  <script src="paintstroke.js?v=68"></script>
-  <script src="app.js?v=68"></script>
+  <script src="dither.js?v=69"></script>
+  <script src="engine.js?v=69"></script>
+  <script src="grain.js?v=69"></script>
+  <script src="paintstroke.js?v=69"></script>
+  <script src="app.js?v=69"></script>
   <script>
     // Range fill — paint the slider track up to the current value so the
     // hi-vis signal color reads as a filled segment, not just a thumb.
@@ -803,7 +803,7 @@
     // to collapse, and the inner's own padding-bottom goes with it.
     (() => {
       const COLLAPSE_BY_DEFAULT = new Set([
-        'tone lock', 'wet paint', 'pen / stylus', 'layer', 'tool options'
+        'adjustments', 'tone lock', 'wet paint', 'pen / stylus', 'layer', 'tool options'
       ]);
       const init = () => {
         document.querySelectorAll('.sidebar-section').forEach(sec => {
@@ -1180,9 +1180,10 @@
       const actionEl = document.getElementById('canvas-prompt-action');
       const dismissEl = document.getElementById('canvas-prompt-dismiss');
       let currentAction = null;
+      let currentDismiss = null;
       let autoHideTimer = null;
 
-      const show = ({ text, action, icon = 'pickup', tone = 'info', dismissible = false, autoHide = 0 }) => {
+      const show = ({ text, action, icon = 'pickup', tone = 'info', dismissible = false, autoHide = 0, onDismiss = undefined }) => {
         if (autoHideTimer) { clearTimeout(autoHideTimer); autoHideTimer = null; }
         textEl.textContent = text;
         // Icon swaps via data-attr (CSS draws a small SVG glyph per kind)
@@ -1196,6 +1197,7 @@
           actionEl.hidden = true;
           currentAction = null;
         }
+        currentDismiss = onDismiss || null;
         dismissEl.hidden = !dismissible;
         el.classList.remove('hidden');
         // Reflow for animation
@@ -1224,10 +1226,15 @@
         if (autoHideTimer) { clearTimeout(autoHideTimer); autoHideTimer = null; }
         setTimeout(() => el.classList.add('hidden'), 240);
         currentAction = null;
+        currentDismiss = null;
       };
 
       actionEl.addEventListener('click', () => { if (currentAction) currentAction(); });
-      dismissEl.addEventListener('click', () => hide());
+      dismissEl.addEventListener('click', () => {
+        const cb = currentDismiss;
+        hide();
+        if (cb) cb();
+      });
 
       window.DitherPrompt = { show, update, hide };
     })();
