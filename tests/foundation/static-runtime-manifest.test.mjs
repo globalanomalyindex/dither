@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   STATIC_RUNTIME_FILES,
+  createStaticRuntimeCopyPlan,
   validateStaticRuntimeManifest,
 } from "../../scripts/static-runtime-manifest.mjs";
 
@@ -32,4 +33,17 @@ test("the static runtime manifest resolves to repository-owned files", async () 
     const entryStat = await stat(entry);
     assert.equal(entryStat.isFile() || entryStat.isDirectory(), true);
   }
+});
+
+test("the build copy plan preserves repository-relative runtime paths", () => {
+  const plan = createStaticRuntimeCopyPlan("/repo", "/repo/dist");
+
+  assert.deepEqual(
+    plan.map(({ relativePath }) => relativePath),
+    REQUIRED_RUNTIME_ENTRIES,
+  );
+  assert.equal(plan[0].sourcePath, "/repo/index.html");
+  assert.equal(plan[0].destinationPath, "/repo/dist/index.html");
+  assert.equal(plan.at(-1).sourcePath, "/repo/fonts");
+  assert.equal(plan.at(-1).destinationPath, "/repo/dist/fonts");
 });
