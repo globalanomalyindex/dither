@@ -1,0 +1,14 @@
+# DITHER Risk Register
+
+| ID | Risk | Probability | Impact | Early signal | Mitigation | Owner plan | Status |
+|---|---|---:|---:|---|---|---|---|
+| RSK-001 | Modernization changes algorithm output without an intentional product decision. | High | Critical | Pixel differences after extraction or worker migration | Capture deterministic fixtures and invariants before refactoring engine paths. | Plans 1 and 2 | Open |
+| RSK-002 | Large global state produces hidden mode leaks during UI restructuring. | High | High | Pointer capture, Escape, tool switch, or tab switch leaves stale state | Introduce explicit state transitions and interaction regression tests before shell changes. | Plans 1 through 5 | Open |
+| RSK-003 | Visual polish increases decorative density and reduces task legibility. | Medium | High | More accents, labels, or motion without clearer state | Apply Exposed Logic and SIGNAL//BODY gates; require task and state rationale for every expressive element. | Plans 3 through 6 | Open |
+| RSK-004 | Development tooling creates runtime dependency or deployment fragility. | Medium | High | Built site requires Node or remote services after deployment | Keep `dist` fully static; verify third-party requests and run built-output smoke tests. | Plan 0 | In progress |
+| RSK-005 | Remote fonts contradict local-first privacy and fail offline. | High | Medium | Requests to `fonts.googleapis.com` or `fonts.gstatic.com` | Remove remote runtime font requests or commit properly licensed local assets with provenance. | Plan 0 | Open |
+| RSK-006 | Test coverage optimizes for selectors rather than real creative workflows. | Medium | High | Green tests while upload, bake, paint, or export still fails manually | Use user-path browser tests, output fixtures, manual checkpoints, and evidence review. | All plans | Open |
+| RSK-007 | Browser image sizes cause memory pressure or long main-thread tasks. | High | High | Slow slider response, tab freeze, or memory growth on representative files | Establish image-size fixtures, timing budgets, cancellation, and worker boundaries. | Plans 2 and 7 | Open |
+| RSK-008 | A broad rewrite makes review impossible and obscures regressions. | Medium | High | Large mixed PR with engine, shell, and visual changes | One branch per plan, small commits, protected contracts, and explicit checkpoints. | Program governance | Mitigated |
+| RSK-009 | Mobile expectations remain ambiguous and lead to a compromised desktop tool. | Medium | Medium | Essential controls clip or the product implies unsupported editing | Define supported viewport tiers and intentional limited modes. | Plan 6 | Open |
+| RSK-010 | Case-study claims exceed available evidence. | Medium | High | Statements use unmeasured outcomes or imply user research that did not occur | Maintain a claims ledger and cite repository or test evidence for every material claim. | Plan 7 | Open |
