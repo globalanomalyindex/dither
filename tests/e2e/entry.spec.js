@@ -1,6 +1,5 @@
 import { expect, test } from "@playwright/test";
 
-
 async function dismissIntro(page) {
   const intro = page.locator("#dither-intro");
   if (await intro.isVisible()) {
@@ -8,7 +7,6 @@ async function dismissIntro(page) {
   }
   await expect(intro).toBeHidden();
 }
-
 
 test("the entry screen exposes the current creative workflow", async ({ page }) => {
   const pageErrors = [];
@@ -25,7 +23,6 @@ test("the entry screen exposes the current creative workflow", async ({ page }) 
   await expect(page.getByText("or click anywhere to browse")).toBeVisible();
   await expect(pageErrors).toEqual([]);
 });
-
 
 test("the entry screen loads without third-party runtime requests", async ({
   page,

@@ -1,7 +1,6 @@
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
-
 export const STATIC_RUNTIME_FILES = Object.freeze([
   "index.html",
   "style.css",
@@ -13,7 +12,6 @@ export const STATIC_RUNTIME_FILES = Object.freeze([
   "fonts",
 ]);
 
-
 export function createStaticRuntimeCopyPlan(repositoryRoot, outputRoot) {
   return STATIC_RUNTIME_FILES.map((relativePath) => ({
     relativePath,
@@ -21,7 +19,6 @@ export function createStaticRuntimeCopyPlan(repositoryRoot, outputRoot) {
     destinationPath: resolve(outputRoot, relativePath),
   }));
 }
-
 
 export async function validateStaticRuntimeManifest(repositoryRoot) {
   const resolvedEntries = STATIC_RUNTIME_FILES.map((entry) =>

@@ -1,13 +1,5 @@
 import { createHash } from "node:crypto";
-import {
-  cp,
-  mkdir,
-  readdir,
-  readFile,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,10 +8,8 @@ import {
   validateStaticRuntimeManifest,
 } from "./static-runtime-manifest.mjs";
 
-
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputRoot = resolve(repositoryRoot, "dist");
-
 
 async function listFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -37,11 +27,12 @@ async function listFiles(directory) {
   return files;
 }
 
-
 async function createIntegrityEntry(absolutePath) {
   const contents = await readFile(absolutePath);
   const fileStat = await stat(absolutePath);
-  const repositoryRelativePath = relative(outputRoot, absolutePath).split(sep).join("/");
+  const repositoryRelativePath = relative(outputRoot, absolutePath)
+    .split(sep)
+    .join("/");
 
   return {
     bytes: fileStat.size,
@@ -49,7 +40,6 @@ async function createIntegrityEntry(absolutePath) {
     sha256: createHash("sha256").update(contents).digest("hex"),
   };
 }
-
 
 async function build() {
   await validateStaticRuntimeManifest(repositoryRoot);
@@ -79,6 +69,5 @@ async function build() {
 
   console.log(`Built ${integrity.length} runtime files in ${outputRoot}`);
 }
-
 
 await build();

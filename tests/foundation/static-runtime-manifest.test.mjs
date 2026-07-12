@@ -27,7 +27,10 @@ test("the static runtime manifest resolves to repository-owned files", async () 
   const resolvedEntries = await validateStaticRuntimeManifest(process.cwd());
 
   assert.equal(resolvedEntries.length, REQUIRED_RUNTIME_ENTRIES.length);
-  assert.equal(resolvedEntries.some((entry) => entry.includes("/Users/")), false);
+  assert.equal(
+    resolvedEntries.some((entry) => entry.includes("/Users/")),
+    false,
+  );
 
   for (const entry of resolvedEntries) {
     const entryStat = await stat(entry);

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
-
 const EXPECTED_DEV_DEPENDENCIES = {
   "@axe-core/playwright": "4.11.3",
   "@playwright/test": "1.61.1",
@@ -35,7 +34,6 @@ const REQUIRED_CONFIG_FILES = [
   "vite.config.mjs",
 ];
 
-
 test("the development toolchain is pinned and reproducible", () => {
   assert.equal(existsSync("package.json"), true, "package.json must exist");
   assert.equal(
@@ -53,10 +51,7 @@ test("the development toolchain is pinned and reproducible", () => {
   assert.deepEqual(packageJson.devDependencies, EXPECTED_DEV_DEPENDENCIES);
   assert.equal(packageLock.lockfileVersion, 3);
   assert.equal(packageLock.packages[""].name, packageJson.name);
-  assert.deepEqual(
-    packageLock.packages[""].devDependencies,
-    EXPECTED_DEV_DEPENDENCIES,
-  );
+  assert.deepEqual(packageLock.packages[""].devDependencies, EXPECTED_DEV_DEPENDENCIES);
 });
 
 test("the toolchain exposes every verification command", () => {
