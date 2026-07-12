@@ -99,6 +99,43 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  format-candidate:
+    name: Apply declared formatting once
+    if: github.event_name == 'push' && github.ref_name == 'agent/dither-00-verification-foundation'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out working branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/dither-00-verification-foundation
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pinned dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Apply formatting to the declared toolchain scope
+        run: npm run format
+
+      - name: Commit formatting changes when present
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts src tests *.config.mjs package.json tsconfig.json .prettierrc.json
+          git commit -m "style: apply repository formatting"
+          git push origin HEAD:agent/dither-00-verification-foundation
+
   toolchain:
     name: Toolchain verification
     runs-on: ubuntu-latest
