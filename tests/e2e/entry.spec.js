@@ -43,26 +43,24 @@ test("the entry screen loads without third-party runtime requests", async ({
   expect(thirdPartyRequests).toEqual([]);
 });
 
-test(
-  "the entry screen has no critical or serious automated accessibility violations",
-  async ({ page }, testInfo) => {
-    await page.goto("./");
-    await dismissIntro(page);
+test("the entry screen has no critical or serious automated accessibility violations", async ({
+  page,
+}, testInfo) => {
+  await page.goto("./");
+  await dismissIntro(page);
 
-    const results = await new AxeBuilder({ page })
-      .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
-      .analyze();
+  const results = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    .analyze();
 
-    await testInfo.attach("axe-entry-results", {
-      body: JSON.stringify(results, null, 2),
-      contentType: "application/json",
-    });
+  await testInfo.attach("axe-entry-results", {
+    body: JSON.stringify(results, null, 2),
+    contentType: "application/json",
+  });
 
-    const blockingViolations = results.violations.filter(
-      (violation) =>
-        violation.impact === "critical" || violation.impact === "serious",
-    );
+  const blockingViolations = results.violations.filter(
+    (violation) => violation.impact === "critical" || violation.impact === "serious",
+  );
 
-    expect(blockingViolations).toEqual([]);
-  },
-);
+  expect(blockingViolations).toEqual([]);
+});
