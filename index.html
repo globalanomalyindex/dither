@@ -37,10 +37,10 @@
           <span class="brand-name">DITHER</span>
         </div>
       </div>
-      <div class="tab-group" role="tablist">
-        <button class="tab-btn active" data-tab="dither">Dither</button>
-        <button class="tab-btn" data-tab="grain">Grain</button>
-        <button class="tab-btn" data-tab="paintstroke">Paint</button>
+      <div class="tab-group" role="tablist" aria-label="Creative mode">
+        <button id="tab-button-dither" class="tab-btn active" data-tab="dither" type="button" role="tab" aria-selected="true" aria-controls="tab-dither" tabindex="0">Dither</button>
+        <button id="tab-button-grain" class="tab-btn" data-tab="grain" type="button" role="tab" aria-selected="false" aria-controls="tab-grain" tabindex="-1">Grain</button>
+        <button id="tab-button-paintstroke" class="tab-btn" data-tab="paintstroke" type="button" role="tab" aria-selected="false" aria-controls="tab-paintstroke" tabindex="-1">Paint</button>
       </div>
       <div class="header-actions">
         <button id="btn-randomize-all" class="btn-fun" title="Randomize everything">
@@ -100,7 +100,7 @@
         <aside id="sidebar" class="sidebar">
 
           <!-- ═══ DITHER TAB ═══ -->
-          <div id="tab-dither" class="tab-content active">
+          <div id="tab-dither" class="tab-content active" role="tabpanel" aria-labelledby="tab-button-dither">
 
           <!-- STYLE PRESETS -->
           <div class="sidebar-section">
@@ -316,7 +316,7 @@
           </div><!-- /tab-dither -->
 
           <!-- ═══ GRAIN TAB ═══ -->
-          <div id="tab-grain" class="tab-content" style="display:none;">
+          <div id="tab-grain" class="tab-content" role="tabpanel" aria-labelledby="tab-button-grain" style="display:none;">
 
             <div class="sidebar-section">
               <div class="section-header">
@@ -352,7 +352,7 @@
           </div><!-- /tab-grain -->
 
           <!-- ═══ PAINTSTROKE TAB ═══ -->
-          <div id="tab-paintstroke" class="tab-content" style="display:none;">
+          <div id="tab-paintstroke" class="tab-content" role="tabpanel" aria-labelledby="tab-button-paintstroke" style="display:none;">
 
             <!-- TOOL SELECT -->
             <div class="sidebar-section">

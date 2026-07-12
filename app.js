@@ -3172,22 +3172,57 @@
   };
   applyTabBodyClass(activeTab);
 
-  document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const tab = btn.dataset.tab;
-      if (tab === activeTab) return;
-      activeTab = tab;
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-      $('tab-dither').style.display = tab === 'dither' ? '' : 'none';
-      $('tab-grain').style.display = tab === 'grain' ? '' : 'none';
-      $('tab-paintstroke').style.display = tab === 'paintstroke' ? '' : 'none';
+  const tabButtons = Array.from(document.querySelectorAll('.tab-btn'));
+  const tabPanelIds = ['dither', 'grain', 'paintstroke'];
+
+  const setActiveTab = (tab, { focus = false } = {}) => {
+    if (!tabPanelIds.includes(tab)) return;
+    const changed = tab !== activeTab;
+    activeTab = tab;
+
+    tabButtons.forEach(button => {
+      const isActive = button.dataset.tab === tab;
+      button.classList.toggle('active', isActive);
+      button.setAttribute('aria-selected', isActive ? 'true' : 'false');
+      button.tabIndex = isActive ? 0 : -1;
+    });
+
+    tabPanelIds.forEach(panelTab => {
+      $('tab-' + panelTab).style.display = panelTab === tab ? '' : 'none';
+    });
+
+    if (changed) {
       applyTabBodyClass(tab);
-      // Show/hide brush cursor based on tab + canvas hover
       updateCursorVisibility();
-      // Set canvas cursor
       canvasWrapper.style.cursor = tab === 'paintstroke' ? 'none' : '';
-      // Exit pickup mode and hide its prompt when leaving paintstroke tab
       if (tab !== 'paintstroke') exitPickupMode();
+    }
+
+    if (focus) {
+      const activeButton = tabButtons.find(button => button.dataset.tab === tab);
+      if (activeButton) activeButton.focus();
+    }
+  };
+
+  tabButtons.forEach((btn, index) => {
+    btn.addEventListener('click', () => setActiveTab(btn.dataset.tab));
+    btn.addEventListener('keydown', event => {
+      let nextIndex = null;
+      if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+        nextIndex = (index + 1) % tabButtons.length;
+      } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+        nextIndex = (index - 1 + tabButtons.length) % tabButtons.length;
+      } else if (event.key === 'Home') {
+        nextIndex = 0;
+      } else if (event.key === 'End') {
+        nextIndex = tabButtons.length - 1;
+      } else {
+        return;
+      }
+
+      event.preventDefault();
+      const nextButton = tabButtons[nextIndex];
+      setActiveTab(nextButton.dataset.tab, { focus: true });
     });
   });
 
