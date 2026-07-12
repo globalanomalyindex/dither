@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import { createRegistryInventory } from "../../scripts/inspect-dither-registry.mjs";
 
-
 describe("registry inventory", () => {
   it("normalizes ordered metadata and category totals", () => {
     const inventory = createRegistryInventory({
