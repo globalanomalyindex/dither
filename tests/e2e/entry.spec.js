@@ -9,6 +9,10 @@ async function dismissIntro(page) {
   await expect(intro).toBeHidden();
 }
 
+async function inlineDisplay(page, selector) {
+  return page.locator(selector).evaluate((element) => element.style.display);
+}
+
 test("the entry screen exposes the current creative workflow", async ({ page }) => {
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
@@ -52,18 +56,21 @@ test("creative mode tabs expose selection and keyboard movement", async ({ page 
   const paintTab = page.getByRole("tab", { name: "Paint" });
 
   await expect(ditherTab).toHaveAttribute("aria-selected", "true");
+  await expect(ditherTab).toHaveAttribute("aria-controls", "tab-dither");
   await expect(grainTab).toHaveAttribute("aria-selected", "false");
-  await expect(page.locator("#tab-dither")).toBeVisible();
+  expect(await inlineDisplay(page, "#tab-dither")).toBe("");
 
   await grainTab.click();
   await expect(ditherTab).toHaveAttribute("aria-selected", "false");
   await expect(grainTab).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator("#tab-grain")).toBeVisible();
+  expect(await inlineDisplay(page, "#tab-dither")).toBe("none");
+  expect(await inlineDisplay(page, "#tab-grain")).toBe("");
 
   await page.keyboard.press("ArrowRight");
   await expect(paintTab).toBeFocused();
   await expect(paintTab).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator("#tab-paintstroke")).toBeVisible();
+  expect(await inlineDisplay(page, "#tab-grain")).toBe("none");
+  expect(await inlineDisplay(page, "#tab-paintstroke")).toBe("");
 });
 
 test("the entry screen has no critical or serious automated accessibility violations", async ({
