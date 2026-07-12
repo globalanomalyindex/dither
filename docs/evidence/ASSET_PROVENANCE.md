@@ -13,8 +13,9 @@
 | Asset | Location or reference | Source | License | Modification | Purpose | Status |
 |---|---|---|---|---|---|---|
 | AstheticPixel font | `fonts/AstheticPixel-Regular.otf` | Not yet documented | Not yet documented | Unknown | Expressive pixel word treatment | Provenance required before release |
-| Archivo web font | Google Fonts link in baseline `index.html` | Google Fonts | Requires documentation | None | Primary sans-serif typography | Runtime dependency must be removed or intentionally documented |
-| JetBrains Mono web font | Google Fonts link in baseline `index.html` | Google Fonts | Requires documentation | None | Numeric and technical readouts | Runtime dependency must be removed or intentionally documented |
+| Archivo web font | Baseline Google Fonts link, removed in Plan 0 | Google Fonts | Not required for the current runtime because the asset is no longer requested | Removed | Former primary sans-serif typography | Removed from runtime |
+| JetBrains Mono web font | Baseline Google Fonts link, removed in Plan 0 | Google Fonts | Not required for the current runtime because the asset is no longer requested | Removed | Former numeric and technical readouts | Removed from runtime |
+| System sans-serif and mono stacks | `style.css` fallback stacks | User operating system | Platform supplied | None | Current primary typography after remote-font removal | Active; cross-platform fit audit remains open |
 | Existing interface glyphs | HTML text and CSS-drawn marks | Mixed original or system glyphs | Not applicable or not yet documented | Various | Controls and feedback | Audit for clarity and consistency |
 | Product screenshots | Not yet assembled | Actual DITHER builds only | Project-owned | Crop and annotation only | Case-study evidence | Open |
 | Curated editable sample | Not yet created | Must be project-owned or explicitly licensed | To be recorded | To be recorded | First-run exploration | Open for Plan 3 |
