@@ -44,3 +44,86 @@ jobs:
 
       - name: Run foundation contract tests
         run: node --test tests/foundation/*.test.mjs
+
+  lockfile-candidate:
+    name: Generate lockfile candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Generate package lock
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Upload package lock candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-lock-candidate
+          path: package-lock.json
+          if-no-files-found: error
+          retention-days: 1
+
+  toolchain:
+    name: Toolchain verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pinned dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run toolchain verification
+        run: npm run verify
+
+  browser-smoke:
+    name: Browser smoke verification
+    needs: toolchain
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pinned dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build static runtime
+        run: npm run build
+
+      - name: Run browser smoke tests
+        run: npm run test:e2e
+
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-evidence
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: warn
+          retention-days: 7
