@@ -24,20 +24,12 @@ test("legacy algorithm identity and parameter metadata are internally consistent
 
   assert.deepEqual(firstIds, secondIds);
   assert.equal(first.sourceSha256, second.sourceSha256);
-  assert.equal(
-    new Set(firstIds).size,
-    firstIds.length,
-    "algorithm IDs must be unique",
-  );
+  assert.equal(new Set(firstIds).size, firstIds.length, "algorithm IDs must be unique");
 
   for (const algorithm of first.algorithms) {
     assert.equal(typeof algorithm.id, "string");
     assert.notEqual(algorithm.id.trim(), "");
-    assert.equal(
-      typeof algorithm.name,
-      "string",
-      `missing name for ${algorithm.id}`,
-    );
+    assert.equal(typeof algorithm.name, "string", `missing name for ${algorithm.id}`);
     assert.notEqual(algorithm.name.trim(), "");
     assert.equal(
       typeof algorithm.category,
