@@ -45,6 +45,34 @@ jobs:
       - name: Run foundation contract tests
         run: node --test tests/foundation/*.test.mjs
 
+  legacy-registry-inventory:
+    name: Legacy registry inventory
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Generate read-only algorithm inventory
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          npm run inspect:algorithms > artifacts/dither-registry-inventory.json
+
+      - name: Upload algorithm inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: dither-registry-inventory
+          path: artifacts/dither-registry-inventory.json
+          if-no-files-found: error
+          retention-days: 7
+
   package-lock-drift:
     name: Package lock drift
     runs-on: ubuntu-latest
