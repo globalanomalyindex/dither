@@ -45,96 +45,25 @@ jobs:
       - name: Run foundation contract tests
         run: node --test tests/foundation/*.test.mjs
 
-  lockfile-candidate:
-    name: Verify or create package lock
-    if: github.event_name == 'push' && github.ref_name == 'agent/dither-00-verification-foundation'
-    permissions:
-      contents: write
+  package-lock-drift:
+    name: Package lock drift
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Check out working branch
+      - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          ref: agent/dither-00-verification-foundation
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
-      - name: Detect committed lockfile
-        id: lock-state
-        shell: bash
-        run: |
-          if git ls-files --error-unmatch package-lock.json >/dev/null 2>&1; then
-            echo "tracked=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "tracked=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Generate package lock
+      - name: Regenerate package lock metadata
         run: npm install --package-lock-only --ignore-scripts
 
-      - name: Verify committed lockfile is current
-        if: steps.lock-state.outputs.tracked == 'true'
+      - name: Verify package lock is current
         run: git diff --exit-code -- package-lock.json
-
-      - name: Commit generated lockfile
-        if: steps.lock-state.outputs.tracked == 'false'
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add package-lock.json
-          git commit -m "build: commit generated package lock"
-          git push origin HEAD:agent/dither-00-verification-foundation
-
-      - name: Upload package lock evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: package-lock-evidence
-          path: package-lock.json
-          if-no-files-found: error
-          retention-days: 1
-
-  format-candidate:
-    name: Apply declared formatting once
-    if: github.event_name == 'push' && github.ref_name == 'agent/dither-00-verification-foundation'
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - name: Check out working branch
-        uses: actions/checkout@v4
-        with:
-          ref: agent/dither-00-verification-foundation
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      - name: Install pinned dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Apply formatting to the declared toolchain scope
-        run: npm run format
-
-      - name: Commit formatting changes when present
-        shell: bash
-        run: |
-          if git diff --quiet; then
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add scripts src tests *.config.mjs package.json tsconfig.json .prettierrc.json
-          git commit -m "style: apply repository formatting"
-          git push origin HEAD:agent/dither-00-verification-foundation
 
   toolchain:
     name: Toolchain verification
@@ -157,49 +86,31 @@ jobs:
         run: npm run typecheck
 
       - name: Lint new toolchain files
-        shell: bash
-        run: |
-          mkdir -p artifacts
-          set +e
-          npx eslint scripts tests *.config.mjs --format json > artifacts/lint-report.json
-          status=$?
-          set -e
-          cat artifacts/lint-report.json
-          exit "$status"
-
-      - name: Upload lint diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: lint-diagnostics
-          path: artifacts/lint-report.json
-          if-no-files-found: error
-          retention-days: 1
+        run: npm run lint
 
       - name: Verify formatting
-        shell: bash
-        run: |
-          set +e
-          npx prettier --list-different scripts src tests *.config.mjs package.json tsconfig.json .prettierrc.json > artifacts/prettier-report.txt
-          status=$?
-          set -e
-          cat artifacts/prettier-report.txt
-          exit "$status"
-
-      - name: Upload formatting diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: formatting-diagnostics
-          path: artifacts/prettier-report.txt
-          if-no-files-found: error
-          retention-days: 1
+        run: npm run format:check
 
       - name: Run unit tests
         run: npm run test:unit
 
       - name: Build static runtime
         run: npm run build
+
+      - name: Verify deterministic build manifest
+        shell: bash
+        run: |
+          cp dist/build-manifest.json /tmp/build-manifest.json
+          npm run build
+          cmp /tmp/build-manifest.json dist/build-manifest.json
+
+      - name: Upload build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-evidence
+          path: dist/build-manifest.json
+          if-no-files-found: error
+          retention-days: 7
 
   browser-smoke:
     name: Browser smoke verification
