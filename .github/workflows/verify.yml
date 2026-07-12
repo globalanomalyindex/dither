@@ -140,7 +140,23 @@ jobs:
           retention-days: 1
 
       - name: Verify formatting
-        run: npm run format:check
+        shell: bash
+        run: |
+          set +e
+          npx prettier --list-different scripts src tests *.config.mjs package.json tsconfig.json .prettierrc.json > artifacts/prettier-report.txt
+          status=$?
+          set -e
+          cat artifacts/prettier-report.txt
+          exit "$status"
+
+      - name: Upload formatting diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formatting-diagnostics
+          path: artifacts/prettier-report.txt
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Run unit tests
         run: npm run test:unit
