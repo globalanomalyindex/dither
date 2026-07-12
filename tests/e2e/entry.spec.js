@@ -43,6 +43,29 @@ test("the entry screen loads without third-party runtime requests", async ({
   expect(thirdPartyRequests).toEqual([]);
 });
 
+test("creative mode tabs expose selection and keyboard movement", async ({ page }) => {
+  await page.goto("./");
+  await dismissIntro(page);
+
+  const ditherTab = page.getByRole("tab", { name: "Dither" });
+  const grainTab = page.getByRole("tab", { name: "Grain" });
+  const paintTab = page.getByRole("tab", { name: "Paint" });
+
+  await expect(ditherTab).toHaveAttribute("aria-selected", "true");
+  await expect(grainTab).toHaveAttribute("aria-selected", "false");
+  await expect(page.locator("#tab-dither")).toBeVisible();
+
+  await grainTab.click();
+  await expect(ditherTab).toHaveAttribute("aria-selected", "false");
+  await expect(grainTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#tab-grain")).toBeVisible();
+
+  await page.keyboard.press("ArrowRight");
+  await expect(paintTab).toBeFocused();
+  await expect(paintTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#tab-paintstroke")).toBeVisible();
+});
+
 test("the entry screen has no critical or serious automated accessibility violations", async ({
   page,
 }, testInfo) => {
