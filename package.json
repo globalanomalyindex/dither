@@ -9,10 +9,10 @@
     "npm": ">=10.9.0"
   },
   "scripts": {
-    "build": "vite build",
+    "build": "node scripts/build.mjs",
     "dev": "vite --host 127.0.0.1",
-    "format": "prettier --write scripts tests *.config.mjs package.json tsconfig.json .prettierrc.json",
-    "format:check": "prettier --check scripts tests *.config.mjs package.json tsconfig.json .prettierrc.json",
+    "format": "prettier --write scripts src tests *.config.mjs package.json tsconfig.json .prettierrc.json",
+    "format:check": "prettier --check scripts src tests *.config.mjs package.json tsconfig.json .prettierrc.json",
     "lint": "eslint scripts tests *.config.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "test": "npm run test:unit",
