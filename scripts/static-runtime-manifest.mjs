@@ -14,6 +14,15 @@ export const STATIC_RUNTIME_FILES = Object.freeze([
 ]);
 
 
+export function createStaticRuntimeCopyPlan(repositoryRoot, outputRoot) {
+  return STATIC_RUNTIME_FILES.map((relativePath) => ({
+    relativePath,
+    sourcePath: resolve(repositoryRoot, relativePath),
+    destinationPath: resolve(outputRoot, relativePath),
+  }));
+}
+
+
 export async function validateStaticRuntimeManifest(repositoryRoot) {
   const resolvedEntries = STATIC_RUNTIME_FILES.map((entry) =>
     resolve(repositoryRoot, entry),
