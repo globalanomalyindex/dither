@@ -9,24 +9,21 @@ async function dismissIntro(page) {
   await expect(intro).toBeHidden();
 }
 
-test(
-  "the entry screen exposes the current creative workflow",
-  async ({ page }) => {
-    const pageErrors = [];
-    page.on("pageerror", (error) => pageErrors.push(error.message));
+test("the entry screen exposes the current creative workflow", async ({ page }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
 
-    await page.goto("./");
-    await dismissIntro(page);
+  await page.goto("./");
+  await dismissIntro(page);
 
-    await expect(page).toHaveTitle("DITHER / TECHNICAL SPECIMEN");
-    await expect(page.getByRole("button", { name: "Upload" })).toBeEnabled();
-    await expect(page.getByRole("button", { name: "Export" })).toBeDisabled();
-    await expect(page.getByRole("button", { name: "Reset" })).toBeDisabled();
-    await expect(page.locator("#drop-zone")).toBeVisible();
-    await expect(page.getByText("or click anywhere to browse")).toBeVisible();
-    await expect(pageErrors).toEqual([]);
-  },
-);
+  await expect(page).toHaveTitle("DITHER / TECHNICAL SPECIMEN");
+  await expect(page.getByRole("button", { name: "Upload" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Export" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Reset" })).toBeDisabled();
+  await expect(page.locator("#drop-zone")).toBeVisible();
+  await expect(page.getByText("or click anywhere to browse")).toBeVisible();
+  await expect(pageErrors).toEqual([]);
+});
 
 test("the entry screen loads without third-party runtime requests", async ({
   page,
