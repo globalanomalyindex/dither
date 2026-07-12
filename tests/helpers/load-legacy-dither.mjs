@@ -4,13 +4,9 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
-const repositoryRoot = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "../..",
-);
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const defaultSourcePath = resolve(repositoryRoot, "dither.js");
-const TEST_EXPORT =
-  "\nglobalThis.__DITHER_TEST_REGISTRY__ = DitherAlgorithms;\n";
+const TEST_EXPORT = "\nglobalThis.__DITHER_TEST_REGISTRY__ = DitherAlgorithms;\n";
 
 export async function loadLegacyDitherRegistry(options = {}) {
   const sourcePath = options.sourcePath
