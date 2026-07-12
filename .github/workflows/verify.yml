@@ -116,8 +116,20 @@ jobs:
       - name: Install pinned dependencies
         run: npm ci --ignore-scripts
 
-      - name: Run toolchain verification
-        run: npm run verify
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint new toolchain files
+        run: npm run lint
+
+      - name: Verify formatting
+        run: npm run format:check
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Build static runtime
+        run: npm run build
 
   browser-smoke:
     name: Browser smoke verification
