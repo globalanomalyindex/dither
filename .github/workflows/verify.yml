@@ -28,8 +28,8 @@ jobs:
       - name: Run portable server contract tests
         run: python -m unittest tests/test_serve.py -v
 
-  static-runtime-contract:
-    name: Static runtime contract
+  foundation-contracts:
+    name: Foundation contracts
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -42,5 +42,5 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Run static runtime contract tests
-        run: node --test tests/foundation/static-runtime-manifest.test.mjs
+      - name: Run foundation contract tests
+        run: node --test tests/foundation/*.test.mjs
