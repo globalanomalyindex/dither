@@ -65,6 +65,52 @@ jobs:
       - name: Verify package lock is current
         run: git diff --exit-code -- package-lock.json
 
+  privacy-migration:
+    name: Remove remote runtime fonts once
+    if: github.event_name == 'push' && github.ref_name == 'agent/dither-00-verification-foundation'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out working branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/dither-00-verification-foundation
+
+      - name: Remove remote font links
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("index.html")
+          source = path.read_text(encoding="utf-8")
+          filtered = "".join(
+              line
+              for line in source.splitlines(keepends=True)
+              if "fonts.googleapis.com" not in line
+              and "fonts.gstatic.com" not in line
+          )
+
+          if filtered == source:
+              raise SystemExit(0)
+
+          path.write_text(filtered, encoding="utf-8")
+
+      - name: Commit privacy correction when present
+        shell: bash
+        run: |
+          if git diff --quiet -- index.html; then
+            exit 0
+          fi
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "fix: remove remote runtime font requests"
+          git push origin HEAD:agent/dither-00-verification-foundation
+
   toolchain:
     name: Toolchain verification
     runs-on: ubuntu-latest
