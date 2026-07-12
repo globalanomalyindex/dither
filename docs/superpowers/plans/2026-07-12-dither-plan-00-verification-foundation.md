@@ -831,7 +831,7 @@ git commit -m "docs: establish DITHER audit and design record"
 - Consumes: complete Plan 0 branch.
 - Produces: evidence-backed review checkpoint before Plan 1.
 
-- [ ] **Step 1: Run the complete clean verification sequence**
+- [x] **Step 1: Run the complete clean verification sequence**
 
 ```bash
 rm -rf node_modules dist playwright-report test-results
@@ -850,6 +850,8 @@ npm run test:e2e
 ```
 
 Expected: every command exits 0.
+
+Evidence: GitHub Actions executed the equivalent sequence from clean checkouts on commit `5d5b4254486e0b8976cabf92282ae4bfbe2b3c29`. Verify run `29207478623` completed successfully.
 
 - [x] **Step 2: Inspect the final branch diff**
 
@@ -880,7 +882,7 @@ rg "fonts\.googleapis\.com|fonts\.gstatic\.com|/Users/" . \
 
 Expected: lockfile has no drift and the search returns no active runtime or private-path occurrence outside historical documentation that explicitly describes the baseline.
 
-- [ ] **Step 4: Verify GitHub Actions on the final pull-request head**
+- [x] **Step 4: Verify GitHub Actions on the final pull-request head**
 
 Expected required results:
 
@@ -889,6 +891,8 @@ Expected required results:
 - Package lock drift: success
 - Toolchain verification: success
 - Browser smoke verification: success
+
+Verified read-only workflow: commit `5d5b4254486e0b8976cabf92282ae4bfbe2b3c29`, run `29207478623`.
 
 - [x] **Step 5: Update the draft pull request body with actual evidence**
 
@@ -937,7 +941,7 @@ Plan 0 can be presented for review only when:
 - [x] the entry surface has no critical or serious automated accessibility violation
 - [x] the README is accurate
 - [x] the design, findings, risks, decisions, claims, provenance, verification, and release records are committed
-- [ ] the final pull-request head has a fully green read-only workflow
+- [x] the final pull-request head has a fully green read-only workflow
 - [x] the final diff has completed verification and review
 
 ## Remaining Program Blockers After Plan 0
