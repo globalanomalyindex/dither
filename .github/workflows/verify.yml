@@ -1,0 +1,151 @@
+name: Verify
+
+on:
+  push:
+    branches:
+      - main
+      - agent/dither-00-verification-foundation
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  portable-server-contract:
+    name: Portable server contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run portable server contract tests
+        run: python -m unittest tests/test_serve.py -v
+
+  foundation-contracts:
+    name: Foundation contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run foundation contract tests
+        run: node --test tests/foundation/*.test.mjs
+
+  package-lock-drift:
+    name: Package lock drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Regenerate package lock metadata
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Verify package lock is current
+        run: git diff --exit-code -- package-lock.json
+
+  toolchain:
+    name: Toolchain verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pinned dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint new toolchain files
+        run: npm run lint
+
+      - name: Verify formatting
+        run: npm run format:check
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Build static runtime
+        run: npm run build
+
+      - name: Verify deterministic build manifest
+        shell: bash
+        run: |
+          cp dist/build-manifest.json /tmp/build-manifest.json
+          npm run build
+          cmp /tmp/build-manifest.json dist/build-manifest.json
+
+      - name: Upload build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-evidence
+          path: dist/build-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  browser-smoke:
+    name: Browser smoke verification
+    needs: toolchain
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pinned dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build static runtime
+        run: npm run build
+
+      - name: Run browser smoke tests
+        run: npm run test:e2e
+
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-evidence
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,13 @@
+# Dependency and build output
+node_modules/
+dist/
+coverage/
+
+# Browser test output
+playwright-report/
+test-results/
+
+# Local tooling
+.vite/
+*.log
+.DS_Store

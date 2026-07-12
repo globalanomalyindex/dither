@@ -1,0 +1,96 @@
+import AxeBuilder from "@axe-core/playwright";
+import { expect, test } from "@playwright/test";
+
+async function dismissIntro(page) {
+  const intro = page.locator("#dither-intro");
+  if (await intro.isVisible()) {
+    await intro.click();
+  }
+  await expect(intro).toBeHidden();
+}
+
+async function inlineDisplay(page, selector) {
+  return page.locator(selector).evaluate((element) => element.style.display);
+}
+
+test("the entry screen exposes the current creative workflow", async ({ page }) => {
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.goto("./");
+  await dismissIntro(page);
+
+  await expect(page).toHaveTitle("DITHER / TECHNICAL SPECIMEN");
+  await expect(page.getByRole("button", { name: "Upload" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Export" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Reset" })).toBeDisabled();
+  await expect(page.locator("#drop-zone")).toBeVisible();
+  await expect(page.getByText("or click anywhere to browse")).toBeVisible();
+  await expect(pageErrors).toEqual([]);
+});
+
+test("the entry screen loads without third-party runtime requests", async ({
+  page,
+}) => {
+  const thirdPartyRequests = [];
+
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.origin !== "http://127.0.0.1:4173") {
+      thirdPartyRequests.push(request.url());
+    }
+  });
+
+  await page.goto("./");
+  await dismissIntro(page);
+
+  expect(thirdPartyRequests).toEqual([]);
+});
+
+test("creative mode tabs expose selection and keyboard movement", async ({ page }) => {
+  await page.goto("./");
+  await dismissIntro(page);
+
+  const ditherTab = page.getByRole("tab", { name: "Dither" });
+  const grainTab = page.getByRole("tab", { name: "Grain" });
+  const paintTab = page.getByRole("tab", { name: "Paint" });
+
+  await expect(ditherTab).toHaveAttribute("aria-selected", "true");
+  await expect(ditherTab).toHaveAttribute("aria-controls", "tab-dither");
+  await expect(grainTab).toHaveAttribute("aria-selected", "false");
+  expect(await inlineDisplay(page, "#tab-dither")).toBe("");
+
+  await grainTab.click();
+  await expect(ditherTab).toHaveAttribute("aria-selected", "false");
+  await expect(grainTab).toHaveAttribute("aria-selected", "true");
+  expect(await inlineDisplay(page, "#tab-dither")).toBe("none");
+  expect(await inlineDisplay(page, "#tab-grain")).toBe("");
+
+  await page.keyboard.press("ArrowRight");
+  await expect(paintTab).toBeFocused();
+  await expect(paintTab).toHaveAttribute("aria-selected", "true");
+  expect(await inlineDisplay(page, "#tab-grain")).toBe("none");
+  expect(await inlineDisplay(page, "#tab-paintstroke")).toBe("");
+});
+
+test("the entry screen has no critical or serious automated accessibility violations", async ({
+  page,
+}, testInfo) => {
+  await page.goto("./");
+  await dismissIntro(page);
+
+  const results = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    .analyze();
+
+  await testInfo.attach("axe-entry-results", {
+    body: JSON.stringify(results, null, 2),
+    contentType: "application/json",
+  });
+
+  const blockingViolations = results.violations.filter(
+    (violation) => violation.impact === "critical" || violation.impact === "serious",
+  );
+
+  expect(blockingViolations).toEqual([]);
+});
