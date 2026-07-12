@@ -625,7 +625,7 @@ test("the entry screen has no critical or serious automated accessibility violat
 });
 ```
 
-- [ ] **Step 2: Run the browser suite and inspect axe evidence**
+- [x] **Step 2: Run the browser suite and inspect axe evidence**
 
 Run:
 
@@ -636,7 +636,7 @@ npm run test:e2e
 
 Expected: the test either passes with zero critical and serious violations or fails with exact rule identifiers, selectors, help URLs, and impact. The JSON attachment must be retained in browser evidence.
 
-- [ ] **Step 3: Fix only evidence-backed blocking defects**
+- [x] **Step 3: Fix only evidence-backed blocking defects**
 
 For each blocking violation:
 
@@ -648,7 +648,7 @@ For each blocking violation:
 
 Do not suppress rules globally. Do not convert a serious violation into a nonblocking status without manual evidence and a documented decision.
 
-- [ ] **Step 4: Verify the complete browser suite**
+- [x] **Step 4: Verify the complete browser suite**
 
 Run:
 
@@ -658,7 +658,9 @@ npm run test:e2e
 
 Expected: entry, privacy, and automated accessibility tests pass.
 
-- [ ] **Step 5: Commit**
+Evidence: the first axe run reported one critical `aria-required-children` violation on the creative-mode tablist. The corrected tab and tabpanel contract, roving focus regression, privacy test, entry test, and axe gate now pass together.
+
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/e2e/entry.spec.js index.html style.css docs/audits/FINDINGS_LEDGER.md docs/audits/VERIFICATION_MATRIX.md docs/releases/RELEASE_READINESS.md
@@ -849,7 +851,7 @@ npm run test:e2e
 
 Expected: every command exits 0.
 
-- [ ] **Step 2: Inspect the final branch diff**
+- [x] **Step 2: Inspect the final branch diff**
 
 ```bash
 git diff --check main...HEAD
@@ -866,7 +868,7 @@ Expected:
 - no private machine path
 - no generated output committed
 
-- [ ] **Step 3: Inspect dependency and runtime claims**
+- [x] **Step 3: Inspect dependency and runtime claims**
 
 ```bash
 npm install --package-lock-only --ignore-scripts
@@ -888,7 +890,7 @@ Expected required results:
 - Toolchain verification: success
 - Browser smoke verification: success
 
-- [ ] **Step 5: Update the draft pull request body with actual evidence**
+- [x] **Step 5: Update the draft pull request body with actual evidence**
 
 The pull request body must include:
 
@@ -902,7 +904,7 @@ The pull request body must include:
 - remaining program blockers
 - review checklist
 
-- [ ] **Step 6: Invoke verification and code-review skills**
+- [x] **Step 6: Invoke verification and code-review skills**
 
 Required skills:
 
@@ -911,7 +913,7 @@ Required skills:
 
 Expected: no completion claim is made before fresh evidence is inspected.
 
-- [ ] **Step 7: Commit any final evidence reconciliation**
+- [x] **Step 7: Commit any final evidence reconciliation**
 
 ```bash
 git add docs README.md .github tests scripts src package.json package-lock.json serve.py index.html
@@ -932,11 +934,11 @@ Plan 0 can be presented for review only when:
 - [x] the build integrity manifest is deterministic
 - [x] the entry surface loads without page errors
 - [x] the entry surface makes no third-party runtime requests
-- [ ] the entry surface has no critical or serious automated accessibility violation
+- [x] the entry surface has no critical or serious automated accessibility violation
 - [x] the README is accurate
 - [x] the design, findings, risks, decisions, claims, provenance, verification, and release records are committed
 - [ ] the final pull-request head has a fully green read-only workflow
-- [ ] the final diff has completed verification and review
+- [x] the final diff has completed verification and review
 
 ## Remaining Program Blockers After Plan 0
 
