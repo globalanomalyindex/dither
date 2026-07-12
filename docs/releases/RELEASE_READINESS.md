@@ -15,9 +15,10 @@ Plan 0 establishes the evidence system. Passing Plan 0 does not imply product co
 | Deterministic build | `npm run build` creates complete static output and integrity manifest | `dist/build-manifest.json` in CI | Passing on Plan 0 branch |
 | Runtime smoke | Built entry loads with no uncaught errors | Playwright | Passing on Plan 0 branch |
 | Privacy | Normal entry and primary workflows make no undisclosed third-party requests | Playwright request capture | Entry passing; primary workflow coverage remains open |
+| Entry accessibility | Entry has no critical or serious automated violations and creative-mode tabs expose correct state and keyboard behavior | Axe evidence and Playwright tab regression | Passing on Plan 0 branch |
 | Core workflow | Upload through export completes across supported modes | Playwright and manual matrix | Open |
 | Rendering fidelity | Representative seeded output fixtures pass | Golden-image suite | Open |
-| Accessibility | Keyboard, screen reader semantics, contrast, zoom, and reduced motion meet defined criteria | Automated and manual evidence | Open |
+| Full accessibility | Keyboard, screen reader semantics, contrast, zoom, and reduced motion meet defined criteria throughout the loaded product | Automated and manual evidence | Open |
 | Performance | Representative images meet documented latency and memory budgets | Performance artifacts | Open |
 | Responsive scope | Supported viewport tiers pass and limitations are documented | Viewport suite | Open |
 | Governance | License, contribution rules, asset provenance, and security posture are explicit | Root docs | Open |
