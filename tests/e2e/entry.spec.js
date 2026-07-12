@@ -9,21 +9,24 @@ async function dismissIntro(page) {
   await expect(intro).toBeHidden();
 }
 
-test("the entry screen exposes the current creative workflow", async ({ page }) => {
-  const pageErrors = [];
-  page.on("pageerror", (error) => pageErrors.push(error.message));
+test(
+  "the entry screen exposes the current creative workflow",
+  async ({ page }) => {
+    const pageErrors = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
 
-  await page.goto("./");
-  await dismissIntro(page);
+    await page.goto("./");
+    await dismissIntro(page);
 
-  await expect(page).toHaveTitle("DITHER / TECHNICAL SPECIMEN");
-  await expect(page.getByRole("button", { name: "Upload" })).toBeEnabled();
-  await expect(page.getByRole("button", { name: "Export" })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Reset" })).toBeDisabled();
-  await expect(page.locator("#drop-zone")).toBeVisible();
-  await expect(page.getByText("or click anywhere to browse")).toBeVisible();
-  await expect(pageErrors).toEqual([]);
-});
+    await expect(page).toHaveTitle("DITHER / TECHNICAL SPECIMEN");
+    await expect(page.getByRole("button", { name: "Upload" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "Export" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Reset" })).toBeDisabled();
+    await expect(page.locator("#drop-zone")).toBeVisible();
+    await expect(page.getByText("or click anywhere to browse")).toBeVisible();
+    await expect(pageErrors).toEqual([]);
+  },
+);
 
 test("the entry screen loads without third-party runtime requests", async ({
   page,
@@ -43,25 +46,26 @@ test("the entry screen loads without third-party runtime requests", async ({
   expect(thirdPartyRequests).toEqual([]);
 });
 
-test("the entry screen has no critical or serious automated accessibility violations", async ({
-  page,
-}, testInfo) => {
-  await page.goto("./");
-  await dismissIntro(page);
+test(
+  "the entry screen has no critical or serious automated accessibility violations",
+  async ({ page }, testInfo) => {
+    await page.goto("./");
+    await dismissIntro(page);
 
-  const results = await new AxeBuilder({ page })
-    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
-    .analyze();
+    const results = await new AxeBuilder({ page })
+      .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+      .analyze();
 
-  await testInfo.attach("axe-entry-results", {
-    body: JSON.stringify(results, null, 2),
-    contentType: "application/json",
-  });
+    await testInfo.attach("axe-entry-results", {
+      body: JSON.stringify(results, null, 2),
+      contentType: "application/json",
+    });
 
-  const blockingViolations = results.violations.filter(
-    (violation) =>
-      violation.impact === "critical" || violation.impact === "serious",
-  );
+    const blockingViolations = results.violations.filter(
+      (violation) =>
+        violation.impact === "critical" || violation.impact === "serious",
+    );
 
-  expect(blockingViolations).toEqual([]);
-});
+    expect(blockingViolations).toEqual([]);
+  },
+);
