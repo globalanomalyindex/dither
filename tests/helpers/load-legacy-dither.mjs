@@ -25,10 +25,12 @@ export async function loadLegacyDitherRegistry(options = {}) {
     timeout: options.timeoutMs ?? 10_000,
   });
 
-  const algorithms = context.__DITHER_TEST_REGISTRY__;
-  if (!Array.isArray(algorithms)) {
+  const exposedAlgorithms = context.__DITHER_TEST_REGISTRY__;
+  if (!Array.isArray(exposedAlgorithms)) {
     throw new TypeError("dither.js did not expose an algorithm array");
   }
+
+  const algorithms = Object.freeze(Array.from(exposedAlgorithms));
 
   return Object.freeze({
     algorithms,
