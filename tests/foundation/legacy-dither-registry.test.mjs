@@ -3,7 +3,6 @@ import test from "node:test";
 
 import { loadLegacyDitherRegistry } from "../helpers/load-legacy-dither.mjs";
 
-
 test("the legacy dither registry loads from the unmodified classic script", async () => {
   const registry = await loadLegacyDitherRegistry();
 
@@ -25,17 +24,37 @@ test("legacy algorithm identity and parameter metadata are internally consistent
 
   assert.deepEqual(firstIds, secondIds);
   assert.equal(first.sourceSha256, second.sourceSha256);
-  assert.equal(new Set(firstIds).size, firstIds.length, "algorithm IDs must be unique");
+  assert.equal(
+    new Set(firstIds).size,
+    firstIds.length,
+    "algorithm IDs must be unique",
+  );
 
   for (const algorithm of first.algorithms) {
     assert.equal(typeof algorithm.id, "string");
     assert.notEqual(algorithm.id.trim(), "");
-    assert.equal(typeof algorithm.name, "string", `missing name for ${algorithm.id}`);
+    assert.equal(
+      typeof algorithm.name,
+      "string",
+      `missing name for ${algorithm.id}`,
+    );
     assert.notEqual(algorithm.name.trim(), "");
-    assert.equal(typeof algorithm.category, "string", `missing category for ${algorithm.id}`);
+    assert.equal(
+      typeof algorithm.category,
+      "string",
+      `missing category for ${algorithm.id}`,
+    );
     assert.notEqual(algorithm.category.trim(), "");
-    assert.equal(typeof algorithm.apply, "function", `missing apply for ${algorithm.id}`);
-    assert.equal(Array.isArray(algorithm.params), true, `missing params for ${algorithm.id}`);
+    assert.equal(
+      typeof algorithm.apply,
+      "function",
+      `missing apply for ${algorithm.id}`,
+    );
+    assert.equal(
+      Array.isArray(algorithm.params),
+      true,
+      `missing params for ${algorithm.id}`,
+    );
 
     const parameterIds = algorithm.params.map((parameter) => parameter.id);
     assert.equal(
@@ -45,7 +64,11 @@ test("legacy algorithm identity and parameter metadata are internally consistent
     );
 
     for (const parameter of algorithm.params) {
-      assert.equal(typeof parameter.id, "string", `invalid parameter ID in ${algorithm.id}`);
+      assert.equal(
+        typeof parameter.id,
+        "string",
+        `invalid parameter ID in ${algorithm.id}`,
+      );
       assert.notEqual(parameter.id.trim(), "");
       structuredClone(parameter.default);
     }
